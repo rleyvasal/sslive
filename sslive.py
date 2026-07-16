@@ -1409,7 +1409,7 @@ async def _read_parent_slide_index() -> int | None:
 
 
 async def _parent_in_fullscreen() -> bool:
-    """True if the browser document (or iframe) is fullscreen."""
+    """True if document or the sslive iframe is fullscreen."""
     try:
         if js_eval is None and js_eval_a is None:
             return False
@@ -1418,19 +1418,37 @@ async def _parent_in_fullscreen() -> bool:
             "|| document.webkitFullscreenElement "
             "|| document.mozFullScreenElement);"
         )
-        res = _parse_js_eval_result(res)
-        return bool(res)
+        return bool(_parse_js_eval_result(res))
     except Exception:
         return False
 
 
-async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
-    """Slide edit → GPU → in-place UI → dialog sync → keep current slide.
+def _queue_dialog_sync(cell_id: str, source: str) -> None:
+    _SESSION.setdefault("pending_dialog_sync", {})[cell_id] = source
 
-    Fullscreen: leave the iframe alone after in-place push (already stable).
-    Preview: ``update_msg`` often recreates the output iframe from a *stale*
-    snapshot (slide 0). After sync we refresh the display handle on the saved
-    ``slide_index`` so the rebuilt preview opens on the correct slide.
+
+async def _flush_pending_dialog_sync(*, refocus: bool = True) -> int:
+    """Write queued slide sources into dialog cells (after leaving fullscreen)."""
+    pending = dict(_SESSION.get("pending_dialog_sync") or {})
+    if not pending:
+        return 0
+    _SESSION["pending_dialog_sync"] = {}
+    n = 0
+    for cid, src in pending.items():
+        if await write_back_cell(cid, src):
+            n += 1
+    if n and refocus:
+        refocus_presenter()
+    return n
+
+
+async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
+    """Slide edit → GPU → in-place output. Dialog sync is mode-aware.
+
+    **Fullscreen:** never ``update_msg`` / refocus — focusing the dialog exits FS.
+    Queue source and flush when the user leaves fullscreen (or ``sync_dialog``).
+
+    **Preview:** ``update_msg`` + refocus slide; never ``refresh_presenter`` (flash/reset).
     """
     if slide_index is not None:
         _SESSION["slide_index"] = int(slide_index)
@@ -1444,41 +1462,42 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
     result = _run_and_refresh(
         cell_id, source=source, full_refresh=False, quiet=True
     )
+    # Ensure in-place UI update (and again after any host thrash)
+    push_slide_result(cell_id, result, source=source)
 
-    # Re-read index after run (user may have been on slide N)
     idx = await _read_parent_slide_index()
     if idx is not None:
         _SESSION["slide_index"] = idx
 
     in_fs = await _parent_in_fullscreen()
-
-    # Dialog source sync (SolveIt may re-render preview / steal focus)
-    synced = await write_back_cell(cell_id, source)
+    synced = False
+    deferred = False
 
     if in_fs:
-        # Fullscreen path: do not rebuild iframe (would exit FS). In-place only.
-        push_slide_result(cell_id, result, source=source)
-        refocus_presenter()
+        _queue_dialog_sync(cell_id, source)
+        deferred = True
+        mode = "fullscreen"
+        # Do not write_back or refocus — both exit fullscreen on SolveIt
     else:
-        # Preview path: host often replaces iframe with stale slide-0 snapshot.
-        # Rebuild display handle at the *current* slide with updated deck state.
-        try:
-            refresh_presenter()
-        except Exception:
-            pass
+        synced = await write_back_cell(cell_id, source)
+        n = await _flush_pending_dialog_sync(refocus=False)
+        if n:
+            synced = True
         push_slide_result(cell_id, result, source=source)
         refocus_presenter()
+        mode = "preview"
 
     preview = ""
     if result.parts:
         p0 = result.parts[0]
         preview = (p0.text or p0.kind)[:60].replace("\n", " ")
+    extra = "deferred" if deferred else ("synced" if synced else "not synced")
     print(
         f"sslive: ▶ {cell_id} ok={result.ok} {result.duration_ms}ms"
         + (f" — {preview}" if preview else "")
-        + (f" · dialog={'synced' if synced else 'not synced'}")
+        + f" · dialog={extra}"
         + f" · slide={_SESSION.get('slide_index', 0)}"
-        + (f" · fullscreen" if in_fs else " · preview")
+        + f" · {mode}"
     )
     return result
 
@@ -1486,12 +1505,18 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
 async def sync_dialog() -> int:
     """Write current deck code sources into SolveIt dialog cells.
 
-    Call **after** presenting if you need dialog cells to match slide edits.
+    Also flushes sources queued during fullscreen Runs.
     May move focus in the SolveIt UI (host behavior).
     """
     deck = _SESSION.get("deck")
     if deck is None:
         raise RuntimeError("Call await slive() first")
+    pending = _SESSION.get("pending_dialog_sync") or {}
+    for cid, src in pending.items():
+        if cid in deck.cells:
+            _apply_source_to_deck(cid, src)
+    _SESSION["pending_dialog_sync"] = {}
+
     n = 0
     for cid in deck.ordered_code_ids:
         src = deck.cells[cid].source
@@ -1499,6 +1524,7 @@ async def sync_dialog() -> int:
             n += 1
             print(f"sslive: dialog sync {cid} ({len(src)} chars)")
     print(f"sslive: synced {n}/{len(deck.ordered_code_ids)} code cells → dialog")
+    refocus_presenter()
     return n
 
 
