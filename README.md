@@ -1,22 +1,17 @@
-# sslive
+# sslive **0.1.0** (working)
 
-RISE-like live GPU slides for [SolveIt](https://solve.it.com), driven by [gpudev](https://github.com/rleyvasal/gpudev) / CRAFT.
+RISE-like live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https://github.com/rleyvasal/gpudev) / CRAFT.
 
-## Goal
+## What works
 
-Edit and re-run code **on the slide** (like [RISE](https://rise.readthedocs.io/)), keep **one source** shared with the SolveIt dialog cell, execute on the **remote GPU**.
-
-```text
-Slide textarea (edit)
-      │  ▶ Run / Shift+Enter
-      ▼
-postMessage → SolveIt parent page queue
-      │  Python poll (js_eval)
-      ▼
-update_msg → SolveIt cell (unified source)
-      +
-CRAFT → GPU execute → refresh slide outputs
-```
+| Feature | Status |
+|---------|--------|
+| Edit code **in the slide** | ✅ |
+| ▶ Run / Shift+Enter on GPU (CRAFT) | ✅ |
+| Output updates under the cell | ✅ |
+| Sync source → SolveIt dialog cell | ✅ |
+| Stay on current slide in **fullscreen** | ✅ |
+| Preview mode keep-focus after Run | ⚠️ best-effort (see below) |
 
 ## Usage
 
@@ -30,35 +25,33 @@ CRAFT → GPU execute → refresh slide outputs
 await slive()
 ```
 
-1. Click the **slide iframe** so it has focus  
-2. **Edit** the code in the slide textarea  
-3. Press **▶ Run** or **Shift+Enter**  
-4. Source is written back to the SolveIt code cell and runs on the GPU  
+1. Click the **slide iframe**  
+2. Edit the code textarea  
+3. **▶ Run** or **Shift+Enter**  
+4. Output updates; dialog code cell source updates  
 
-If Run seems stuck (bridge):
-
-```python
-await pump_slide_runs()
+```text
+Slide edit → postMessage → Python bridge
+  → CRAFT GPU execute
+  → in-place output push
+  → update_msg (dialog source)
+  → refocus slide iframe
 ```
 
-### Fallback
+## Known limitation (preview focus)
 
-```python
-await run_cell_index(0)              # deck source → GPU
-await run_cell_index(0, reload_from_dialog=True)  # re-read dialog first
-await reload_deck()                  # rebuild after structural changes
-```
+After dialog write-back, SolveIt often **focuses the updated dialog cell** (same class of issue as HTMX live-preview swaps focusing dialog content). Fullscreen hides this; in **inline preview** we re-focus `#sslive-frame` after sync (blur active element + scrollIntoView + multi-tick focus). Host UI may still briefly steal focus; click the slide if needed.
 
-Requires `#| s` then `#` / `##` slides in the dialog.
+Optional: `await sync_dialog()` to push all deck sources later.
 
-Keep `slive` / `run_cell*` under **`%local`**.
+## Commands
 
-## Status
+| Call | Role |
+|------|------|
+| `await slive()` | Start presentation |
+| `await run_cell_index(i)` | Programmatic run |
+| `await pump_slide_runs()` | Drain stuck Run queue |
+| `await sync_dialog()` | Batch write sources to dialog |
+| `refocus_presenter()` | Manually return focus to slides |
 
-| Feature | Status |
-|---------|--------|
-| In-slide edit | yes (textarea) |
-| In-slide Run | yes (postMessage bridge) |
-| Sync to SolveIt cell | yes (`update_msg`) |
-| GPU execute | yes (CRAFT) |
-| Navigation | ←/→, f fullscreen |
+Keep driver cells under **`%local`**.

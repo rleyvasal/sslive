@@ -1,9 +1,11 @@
 """sslive — RISE-like live GPU slides for SolveIt.
 
+**Working version 0.1.0** — in-slide edit + Run on GPU + dialog source sync.
+
 Edit code **inside the slide**, hit ▶ Run / Shift+Enter:
-  → source syncs to the SolveIt dialog cell (one source of truth)
   → executes on CRAFT GPU
-  → slide outputs refresh
+  → updates slide output in place
+  → syncs source into the SolveIt dialog cell
 
 Usage::
 
@@ -29,6 +31,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
+
+__version__ = "0.1.0"
 
 # ── optional SolveIt / FastHTML imports (available inside SolveIt) ───────────
 try:
@@ -1142,7 +1146,7 @@ def _presenter_iframe_html(height: str = "720px", port: int | None = None) -> st
     )
     escaped = html_module.escape(html, quote=True)
     return (
-        f'<iframe srcdoc="{escaped}" '
+        f'<iframe id="sslive-frame" data-sslive="1" srcdoc="{escaped}" '
         f'style="width:100%;height:{height};border:none;background:#111;" '
         f'sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals" '
         f'allow="fullscreen"></iframe>'
@@ -1337,52 +1341,95 @@ def _run_and_refresh(
     return result
 
 
-async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
-    """Slide edit → GPU → in-place output → quiet dialog write-back → restore slide.
+def _refocus_presenter_js() -> str:
+    """JS to steal focus back from the dialog cell to the slide iframe.
 
-    SolveIt ``update_msg`` often re-renders the dialog and recreates the preview
-    iframe (focus jump, exit fullscreen, title slide). We:
-      1) keep slide_index
-      2) run GPU + push result in place (no print noise if possible)
-      3) write-back source to dialog (unified content)
-      4) re-paint presenter on the **same** slide index so a recreated iframe
-         still opens on the code slide with new source/outputs
+    SolveIt focuses the message updated by ``update_msg`` (same class of issue
+    as HTMX live-preview focus jumps). We blur that and focus #sslive-frame.
+    """
+    return r"""
+(function () {
+  function focusFrame() {
+    try {
+      var ae = document.activeElement;
+      if (ae && ae !== document.body && !(ae.id === 'sslive-frame' || ae.getAttribute('data-sslive') === '1')) {
+        try { ae.blur(); } catch (e) {}
+      }
+    } catch (e) {}
+    var ifr = document.getElementById('sslive-frame')
+      || document.querySelector('iframe[data-sslive="1"]')
+      || document.querySelector('iframe[srcdoc]');
+    if (!ifr) return false;
+    try { ifr.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' }); } catch (e) {
+      try { ifr.scrollIntoView(false); } catch (e2) {}
+    }
+    try { ifr.focus({ preventScroll: true }); } catch (e) {
+      try { ifr.focus(); } catch (e2) {}
+    }
+    try {
+      // return keyboard focus into the slide document when same-origin/srcdoc allows
+      if (ifr.contentWindow) ifr.contentWindow.focus();
+    } catch (e) {}
+    return true;
+  }
+  focusFrame();
+  requestAnimationFrame(function () {
+    focusFrame();
+    setTimeout(focusFrame, 0);
+    setTimeout(focusFrame, 50);
+    setTimeout(focusFrame, 150);
+    setTimeout(focusFrame, 400);
+  });
+})();
+"""
+
+
+def refocus_presenter() -> None:
+    """Best-effort: return focus to the slide iframe (preview mode)."""
+    if iife is None:
+        return
+    try:
+        iife(_refocus_presenter_js())
+    except Exception:
+        pass
+
+
+async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
+    """Slide edit → GPU → in-place output → dialog write-back → refocus slide.
+
+    Fullscreen already works well. Preview mode: SolveIt focuses the dialog
+    cell after ``update_msg``; we refocus the presenter iframe (no full
+    rebuild — that reset the deck to the title slide).
     """
     if slide_index is not None:
         _SESSION["slide_index"] = int(slide_index)
     _apply_source_to_deck(cell_id, source)
 
-    # Quiet: print() on the bridge task can re-render SolveIt cell outputs
-    # and recreate the iframe at slide 0.
     result = _run_and_refresh(
         cell_id, source=source, full_refresh=False, quiet=True
     )
 
-    # Unified source in dialog (user request). This may thrash the UI.
-    synced = await write_back_cell(cell_id, source)
-
-    # If SolveIt destroyed the iframe, rebuild on the correct slide with
-    # current deck source + outputs (not a stale title-only view).
+    # Keep slide index from parent if available
     try:
-        # Read slide index from parent if available
         if js_eval is not None or js_eval_a is not None:
-            try:
-                idx = await _call_js_eval(
-                    "return (window.__sslive_slide_index != null) "
-                    "? window.__sslive_slide_index : 0;"
-                )
-                idx = _parse_js_eval_result(idx)
-                if idx is not None:
-                    _SESSION["slide_index"] = int(idx)
-            except Exception:
-                pass
-        refresh_presenter()
-        # Re-publish result so a brand-new iframe picks it up via poll
-        push_slide_result(cell_id, result, source=source)
+            idx = await _call_js_eval(
+                "return (window.__sslive_slide_index != null) "
+                "? window.__sslive_slide_index : 0;"
+            )
+            idx = _parse_js_eval_result(idx)
+            if idx is not None:
+                _SESSION["slide_index"] = int(idx)
     except Exception:
         pass
 
-    # One short status line only (after UI restore)
+    # Unified source (may focus dialog cell — host behavior)
+    synced = await write_back_cell(cell_id, source)
+
+    # Do NOT refresh_presenter() here — rebuilds iframe, loses fullscreen,
+    # and often lands on the title slide. Instead: re-push result + refocus.
+    push_slide_result(cell_id, result, source=source)
+    refocus_presenter()
+
     preview = ""
     if result.parts:
         p0 = result.parts[0]
@@ -1881,6 +1928,7 @@ __all__ = [
     "pump_slide_runs",
     "deck_summary",
     "refresh_presenter",
+    "refocus_presenter",
     "render_output_html",
     "generate_presenter_html",
     "get_craft_exec_mgr",
