@@ -883,8 +883,14 @@ def generate_presenter_html(
       rescale();
     }})();
 
-    // restore slide without always selecting first code (keeps UX after rebuild)
-    showSlide(currentSlide, {{ selectFirst: true }});
+    // restore slide; if parent has a pending result, apply immediately
+    showSlide(currentSlide, {{ selectFirst: false }});
+    try {{
+      var pending = window.parent.__sslive_last_result;
+      if (pending && pending.type === 'sslive_result') applyRunResult(pending);
+    }} catch (e) {{}}
+    // re-select the code cell we care about
+    if (selectedCellId) selectCell(selectedCellId);
     """
 
     empty = ""
@@ -1258,7 +1264,7 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
     """Deliver GPU outputs to the live slide without rebuilding the iframe.
 
     Uses ``window.__sslive_last_result`` (iframe polls parent) + postMessage.
-    Never calls refresh_presenter (that resets slide index / fullscreen).
+    Never calls refresh_presenter from here.
     """
     deck = _SESSION.get("deck")
     theme = (deck.theme if deck else None) or THEME_DARK
@@ -1276,19 +1282,16 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
         "keep_focus": True,
         "source": source,
         "t": int(time.time() * 1000),
+        "slide_index": int(_SESSION.get("slide_index") or 0),
     }
-    # Store on parent for reliable polling from srcdoc iframe
     js = f"""
 (function() {{
   var msg = {json.dumps(payload)};
   window.__sslive_last_result = msg;
+  if (msg.slide_index != null) window.__sslive_slide_index = msg.slide_index;
   document.querySelectorAll('iframe').forEach(function(f) {{
     try {{ f.contentWindow.postMessage(msg, '*'); }} catch (e) {{}}
   }});
-  try {{
-    var ifr = document.querySelector('iframe');
-    if (ifr) ifr.focus();
-  }} catch (e) {{}}
 }})();
 """
     if iife is not None:
@@ -1296,8 +1299,7 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
             iife(js)
             return
         except Exception as e:
-            print(f"sslive: push_slide_result iife failed: {e}")
-    print("sslive: could not push result to slide UI (iife unavailable)")
+            _SESSION["_last_push_err"] = str(e)
 
 
 def _run_and_refresh(
@@ -1305,6 +1307,7 @@ def _run_and_refresh(
     *,
     source: str | None = None,
     full_refresh: bool = False,
+    quiet: bool = False,
 ) -> ExecResult:
     """Execute on GPU; update slide outputs in place (default) or full rebuild."""
     deck = _SESSION.get("deck")
@@ -1316,16 +1319,17 @@ def _run_and_refresh(
 
     echo = bool(_SESSION.get("echo_to_dialog", False))
     result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo)
-    preview = ""
-    if result.parts:
-        p0 = result.parts[0]
-        preview = (p0.text or p0.kind)[:80].replace("\n", " ")
-    print(
-        f"run_cell({cell_id!r}): ok={result.ok} parts={len(result.parts)} "
-        f"ms={result.duration_ms}"
-        + (f" — {preview}" if preview else "")
-        + (f" err={result.error}" if result.error else "")
-    )
+    if not quiet:
+        preview = ""
+        if result.parts:
+            p0 = result.parts[0]
+            preview = (p0.text or p0.kind)[:80].replace("\n", " ")
+        print(
+            f"run_cell({cell_id!r}): ok={result.ok} parts={len(result.parts)} "
+            f"ms={result.duration_ms}"
+            + (f" — {preview}" if preview else "")
+            + (f" err={result.error}" if result.error else "")
+        )
     if full_refresh:
         refresh_presenter()
     else:
@@ -1334,17 +1338,62 @@ def _run_and_refresh(
 
 
 async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
-    """Slide edit → GPU → in-place output only.
+    """Slide edit → GPU → in-place output → quiet dialog write-back → restore slide.
 
-    **Do not** call ``update_msg`` here. SolveIt's dialog write-back re-renders
-    the page, steals focus to the code cell, exits fullscreen, and rebuilds the
-    preview (title slide). Deck memory stays the live source during the talk;
-    call ``await sync_dialog()`` when you want to push sources into dialog cells.
+    SolveIt ``update_msg`` often re-renders the dialog and recreates the preview
+    iframe (focus jump, exit fullscreen, title slide). We:
+      1) keep slide_index
+      2) run GPU + push result in place (no print noise if possible)
+      3) write-back source to dialog (unified content)
+      4) re-paint presenter on the **same** slide index so a recreated iframe
+         still opens on the code slide with new source/outputs
     """
     if slide_index is not None:
         _SESSION["slide_index"] = int(slide_index)
     _apply_source_to_deck(cell_id, source)
-    return _run_and_refresh(cell_id, source=source, full_refresh=False)
+
+    # Quiet: print() on the bridge task can re-render SolveIt cell outputs
+    # and recreate the iframe at slide 0.
+    result = _run_and_refresh(
+        cell_id, source=source, full_refresh=False, quiet=True
+    )
+
+    # Unified source in dialog (user request). This may thrash the UI.
+    synced = await write_back_cell(cell_id, source)
+
+    # If SolveIt destroyed the iframe, rebuild on the correct slide with
+    # current deck source + outputs (not a stale title-only view).
+    try:
+        # Read slide index from parent if available
+        if js_eval is not None or js_eval_a is not None:
+            try:
+                idx = await _call_js_eval(
+                    "return (window.__sslive_slide_index != null) "
+                    "? window.__sslive_slide_index : 0;"
+                )
+                idx = _parse_js_eval_result(idx)
+                if idx is not None:
+                    _SESSION["slide_index"] = int(idx)
+            except Exception:
+                pass
+        refresh_presenter()
+        # Re-publish result so a brand-new iframe picks it up via poll
+        push_slide_result(cell_id, result, source=source)
+    except Exception:
+        pass
+
+    # One short status line only (after UI restore)
+    preview = ""
+    if result.parts:
+        p0 = result.parts[0]
+        preview = (p0.text or p0.kind)[:60].replace("\n", " ")
+    print(
+        f"sslive: ▶ {cell_id} ok={result.ok} {result.duration_ms}ms"
+        + (f" — {preview}" if preview else "")
+        + (f" · dialog={'synced' if synced else 'not synced'}")
+        + f" · slide={_SESSION.get('slide_index', 0)}"
+    )
+    return result
 
 
 async def sync_dialog() -> int:
@@ -1499,7 +1548,6 @@ async def _bridge_poll_loop() -> None:
                 if not cid:
                     continue
                 sidx = item.get("slide_index")
-                print(f"sslive: slide Run → {cid} ({len(source or '')} chars)")
                 try:
                     await _sync_and_run(
                         str(cid),
@@ -1560,16 +1608,15 @@ def _show_run_panel(deck: Deck) -> None:
     html = """
 <div style="font:14px system-ui;color:#e5e7eb;margin:10px 0;padding:12px 14px;
             background:#0b1220;border:1px solid #374151;border-radius:8px">
-  <b>RISE-style:</b> click the slide iframe → edit code →
-  <b>▶ Run</b> / <b>Shift+Enter</b> → runs on <b>GPU</b>, updates output in place.
+  <b>RISE-style:</b> edit code in the slide → <b>▶ Run</b> / <b>Shift+Enter</b>
+  → GPU + updates dialog cell source + restores this slide in the preview.
   <div style="margin-top:8px;font-size:12px;color:#9ca3af">
-    During the talk, the <b>slide is the live source</b> (auto dialog write-back is off —
-    it made SolveIt steal focus and reset the preview).
-    After presenting: <code>await sync_dialog()</code> to copy sources into dialog cells.
+    SolveIt may briefly move focus when syncing the dialog cell; the preview
+    should reopen on the <b>same slide</b> with new output (not the title).
   </div>
   <div style="margin-top:6px;font-size:12px;color:#9ca3af">
     Fallback: <code>await run_cell_index(0)</code>
-    · <code>await reload_deck()</code>
+    · <code>await sync_dialog()</code>
     · <code>await pump_slide_runs()</code>
   </div>
 </div>
@@ -1706,10 +1753,10 @@ async def slive(
     )
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
-    _SESSION["write_back"] = False  # never auto update_msg during present (kills fullscreen)
-    print("In-slide: edit code · ▶ Run / Shift+Enter · GPU (deck is live source)")
-    print("Navigate: ←/→ · f fullscreen — stays put; outputs update in place")
-    print("After talk (optional): await sync_dialog()  # push sources into SolveIt cells")
+    _SESSION["write_back"] = True  # sync dialog source; rebuild restores slide index
+    _SESSION["slide_index"] = 0
+    print("In-slide: edit · ▶ Run / Shift+Enter → GPU + dialog source sync")
+    print("After Run we restore the same slide (SolveIt may briefly exit fullscreen)")
 
     if embed:
         _show_presenter(port, height=height)
