@@ -56,7 +56,9 @@ Requires a note cell with exactly `#| s`, then `#` / `##` slide content below it
 
 **Important:** keep `slive` / `run_cell_*` under `%local`. Only slide *source strings* run on the GPU via CRAFT.
 
-`sstop()` stops the local presenter server.
+**Embedding:** uses FastHTML `JupyUvi` + `HTMX(..., host=None)` like pcviz — iframe `src` is same-origin `/sslive` (SolveIt proxies to the kernel server). Do **not** use raw `http://127.0.0.1:...` from the browser on cloud SolveIt.
+
+`sstop()` stops the local presenter server. If you had an older sslive run, call `sstop()` once before `await slive()` again.
 
 ## Local reference
 

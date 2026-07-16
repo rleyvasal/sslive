@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import html as html_module
 import inspect
-import io
 import json
+import os
 import re
 import socket
 import threading
@@ -858,27 +858,43 @@ def _do_execute(cell_id: str) -> tuple[str, dict[str, str], int]:
     return html, headers, 200 if result.ok or result.parts else 500
 
 
+def _in_solveit() -> bool:
+    return bool(os.environ.get("IN_SOLVEIT"))
+
+
+def _presenter_page():
+    """HTML document for the live deck (served at / and /sslive)."""
+    deck = _SESSION.get("deck") or Deck()
+    ex = _SESSION.get("executor") or LiveExecutor()
+    ok, msg = ex.kernel_ok()
+    label = f"gpu · {msg}"
+    html = generate_presenter_html(deck, backend_label=label)
+    if HTMLResponse is not None:
+        return HTMLResponse(html)
+    return html
+
+
 def _ensure_live_server() -> int:
-    """Start singleton FastHTML+JupyUvi (or uvicorn) server. Returns port."""
+    """Start singleton FastHTML + JupyUvi server (pcviz-style). Returns port."""
     if _SESSION.get("server") is not None and _SESSION.get("port"):
         return int(_SESSION["port"])
 
     if FastHTML is None:
         raise RuntimeError("fasthtml not available — install python-fasthtml in SolveIt")
 
-    port = _pick_port(8100, 50)
+    # Prefer 8000 band like pcviz (SolveIt convention); fall through if busy
+    try:
+        port = _pick_port(8000, 50)
+    except RuntimeError:
+        port = _pick_port(8100, 50)
+
+    # default_hdrs/htmx + notebook CORS when IN_NOTEBOOK (SolveIt sets this)
     app = FastHTML(hdrs=())
 
-    @app.get("/")
-    def home():
-        deck = _SESSION.get("deck") or Deck()
-        ex = _SESSION.get("executor") or LiveExecutor()
-        ok, msg = ex.kernel_ok()
-        label = f"gpu · {msg}" if ok else f"gpu · {msg}"
-        html = generate_presenter_html(deck, backend_label=label)
-        if HTMLResponse is not None:
-            return HTMLResponse(html)
-        return html
+    # Named route for HTMX embed: with host=None, iframe src becomes "/sslive"
+    # (same-origin relative path — SolveIt proxies to this JupyUvi port).
+    sslive_rt = app.get("/sslive")(_presenter_page)
+    app.get("/")(_presenter_page)
 
     @app.get("/status")
     def status():
@@ -893,13 +909,13 @@ def _ensure_live_server() -> int:
             "slides": len(deck.slides) if deck else 0,
             "code_cells": len(deck.ordered_code_ids) if deck else 0,
             "port": _SESSION.get("port"),
+            "in_solveit": _in_solveit(),
         }
         if JSONResponse is not None:
             return JSONResponse(payload)
         return payload
 
     async def execute(req=None, cell_id: str = ""):
-        # Accept form, query, or JSON body (HTMX hx-vals → form by default)
         cid = cell_id
         if req is not None and not cid:
             try:
@@ -916,7 +932,6 @@ def _ensure_live_server() -> int:
             if not cid:
                 cid = req.query_params.get("cell_id") or ""
 
-        # GPU execute is blocking — keep event loop free
         import asyncio
 
         loop = asyncio.get_running_loop()
@@ -925,7 +940,6 @@ def _ensure_live_server() -> int:
             return HTMLResponse(html, status_code=code, headers=headers)
         return html
 
-    # Register POST with request object for form parsing
     try:
         from starlette.requests import Request
 
@@ -949,16 +963,15 @@ def _ensure_live_server() -> int:
         return payload
 
     if JupyUvi is not None:
-        srv = JupyUvi(app, port=port)
+        # host 0.0.0.0 (JupyUvi default) — required for notebook/SolveIt proxy
+        srv = JupyUvi(app, port=port, host="0.0.0.0")
     else:
-        # Fallback: uvicorn in a daemon thread
         import uvicorn
 
-        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning")
         srv = uvicorn.Server(config)
         t = threading.Thread(target=srv.run, daemon=True)
         t.start()
-        # wait briefly for bind
         for _ in range(50):
             if not _port_free(port):
                 break
@@ -967,6 +980,7 @@ def _ensure_live_server() -> int:
     _SESSION["app"] = app
     _SESSION["server"] = srv
     _SESSION["port"] = port
+    _SESSION["sslive_rt"] = sslive_rt
     return port
 
 
@@ -986,29 +1000,64 @@ def sstop() -> None:
     _SESSION["server"] = None
     _SESSION["app"] = None
     _SESSION["port"] = None
+    _SESSION["sslive_rt"] = None
     print("sslive: server stopped")
 
 
 def _show_presenter(port: int, height: str = "720px"):
-    """Embed presenter in SolveIt dialog."""
-    url = f"http://127.0.0.1:{port}/"
-    if HTMX is not None and _SESSION.get("app") is not None:
+    """Embed presenter like pcviz: HTMX + same-origin path (not raw 127.0.0.1).
+
+    In SolveIt / Jupyter, ``HTMX(route, host=None, port=...)`` sets iframe
+    ``src`` to the route path (e.g. ``/sslive``) so the browser hits the
+    notebook host; SolveIt/Jupyter proxy traffic to JupyUvi.
+
+    Outside SolveIt (true local browser+kernel), fall back to localhost.
+    """
+    if isinstance(height, int):
+        height = f"{height}px"
+
+    app = _SESSION.get("app")
+    sslive_rt = _SESSION.get("sslive_rt")
+    in_solveit = _in_solveit()
+
+    # 1) pcviz-style: host=None → relative path / route (works on SolveIt)
+    if HTMX is not None and app is not None and sslive_rt is not None:
         try:
-            # HTMX helper from fasthtml.jupyter — may expect a route path
-            display(IFrame(src=url, width="100%", height=height))  # type: ignore
+            # str(sslive_rt) == "/sslive"; host=None → iframe src="/sslive"
+            preview = HTMX(sslive_rt, app=app, host=None, port=port, height=height)
+            if display is not None:
+                display(preview)
+            else:
+                print(preview)
+            print(f"sslive: embedded via HTMX (host=None, port={port}, path=/sslive)")
             return
-        except Exception:
-            pass
-    if display is not None and IFrame is not None:
-        display(
-            IFrame(
-                src=url,
-                width="100%",
-                height=height,
-            )
+        except Exception as e:
+            print(f"sslive: HTMX host=None embed failed: {e}")
+
+    # 2) Local notebook: browser can reach kernel localhost
+    if HTMX is not None and not in_solveit:
+        try:
+            preview = HTMX("/sslive", host="localhost", port=port, height=height)
+            if display is not None:
+                display(preview)
+            print(f"sslive: embedded via HTMX localhost:{port}/sslive")
+            return
+        except Exception as e:
+            print(f"sslive: HTMX localhost embed failed: {e}")
+
+    # 3) Last resort — only useful when kernel and browser share a machine
+    url = f"http://127.0.0.1:{port}/sslive"
+    if not in_solveit and display is not None and IFrame is not None:
+        display(IFrame(src=url, width="100%", height=height))
+        print(f"sslive: embedded IFrame {url} (local fallback)")
+        return
+
+    print(f"sslive: open presenter at {url}")
+    if in_solveit:
+        print(
+            "sslive: IN_SOLVEIT is set but HTMX embed failed — "
+            "raw 127.0.0.1 from the browser will not reach the kernel."
         )
-    else:
-        print(f"sslive presenter: open {url}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1023,7 +1072,10 @@ class LiveSession:
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}/"
+        # Same-origin path for SolveIt; localhost only when not in SolveIt
+        if _in_solveit():
+            return f"/sslive"
+        return f"http://127.0.0.1:{self.port}/sslive"
 
     def status(self) -> dict:
         ex = _SESSION.get("executor") or LiveExecutor()
@@ -1035,6 +1087,7 @@ class LiveSession:
             "backend": self.backend,
             "kernel_ok": ok,
             "kernel_msg": msg,
+            "in_solveit": _in_solveit(),
             "slides": len(d.slides) if d else 0,
             "code_cells": len(d.ordered_code_ids) if d else 0,
             "busy": bool(getattr(ex, "busy", False)),
@@ -1051,7 +1104,7 @@ async def slive(
     echo_to_dialog: bool = False,
     embed: bool = True,
 ):
-    """Load deck, start live host, embed presenter.
+    """Load deck, start live host, embed presenter (HTMX / JupyUvi).
 
     dialoghelper APIs are async — call from SolveIt as::
 
@@ -1076,13 +1129,28 @@ async def slive(
     _SESSION["echo_to_dialog"] = echo_to_dialog
     _SESSION["theme"] = theme_dict
 
-    port = _ensure_live_server()
+    # Reuse running server if it has the HTMX route; otherwise (re)start
+    if (
+        _SESSION.get("server") is not None
+        and _SESSION.get("port") is not None
+        and _SESSION.get("sslive_rt") is not None
+    ):
+        port = int(_SESSION["port"])
+    else:
+        if _SESSION.get("server") is not None:
+            try:
+                sstop()
+            except Exception:
+                pass
+        port = _ensure_live_server()
+
     session = LiveSession(port=port, backend="gpu", deck=deck)
 
     n_code = len(deck.ordered_code_ids)
     print(
         f"sslive: {len(deck.slides)} slides, {n_code} code cells, "
-        f"backend=gpu ({msg}) → {session.url}"
+        f"backend=gpu ({msg}) → {session.url} (port {port}, "
+        f"IN_SOLVEIT={_in_solveit()})"
     )
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
