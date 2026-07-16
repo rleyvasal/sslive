@@ -11,7 +11,7 @@ RISE-like live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https:/
 | Output updates under the cell | ✅ |
 | Sync source → SolveIt dialog cell | ✅ |
 | Stay on current slide in **fullscreen** | ✅ |
-| Preview mode keep-focus after Run | ⚠️ best-effort (see below) |
+| Preview mode keep-focus after Run | ✅ pre-emptive focus guard (see below) |
 
 ## Usage
 
@@ -38,9 +38,9 @@ Slide edit → postMessage → Python bridge
   → refocus slide iframe
 ```
 
-## Known limitation (preview focus)
+## Preview focus (pre-emptive guard)
 
-After dialog write-back, SolveIt often **focuses the updated dialog cell** (same class of issue as HTMX live-preview swaps focusing dialog content). Fullscreen hides this; in **inline preview** we re-focus `#sslive-frame` after sync (blur active element + scrollIntoView + multi-tick focus). Host UI may still briefly steal focus; click the slide if needed.
+After dialog write-back, SolveIt tries to **focus the updated dialog cell** (same class of issue as HTMX live-preview swaps focusing dialog content). `update_msg` has no opt-out, so in **inline preview** the parent bridge arms a short *focus guard* right before each write-back: for ~2 s, `focus()` / `scrollIntoView()` calls targeting anything outside `#sslive-frame` are swallowed, and a `focusin` backstop bounces stray focus back within the same tick — so focus never visibly leaves the slide. Real clicks/keys in the dialog always win (guard yields to user gestures), and fullscreen is untouched. A light reactive refocus remains as fallback for host paths the guard can't intercept.
 
 Optional: `await sync_dialog()` to push all deck sources later.
 

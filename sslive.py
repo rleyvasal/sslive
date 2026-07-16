@@ -1359,6 +1359,10 @@ def _refocus_presenter_js() -> str:
     var fs = document.fullscreenElement || document.webkitFullscreenElement;
     if (fs) return true;
 
+    // Focus never left the slides (guard worked) — no thrash needed
+    var cur = findFrame();
+    if (cur && document.activeElement === cur) return true;
+
     try {
       var ae = document.activeElement;
       if (ae && ae !== document.body && ae.tagName !== 'IFRAME'
@@ -1410,6 +1414,21 @@ def refocus_presenter() -> None:
         pass
 
 
+def _arm_focus_guard(ms: int = 2000) -> None:
+    """Pre-empt SolveIt's focus/scroll steal for the next ``ms`` (parent page).
+
+    The parent bridge patches ``focus``/``scrollIntoView`` while armed, so the
+    dialog write-back never visibly yanks focus away from the slide iframe.
+    Call *before* ``update_msg``; user gestures in the dialog override it.
+    """
+    if iife is None:
+        return
+    try:
+        iife(f"window.__sslive_guard_until = Date.now() + {int(ms)};")
+    except Exception:
+        pass
+
+
 async def _read_parent_slide_index() -> int | None:
     try:
         if js_eval is None and js_eval_a is None:
@@ -1449,6 +1468,7 @@ async def _flush_pending_dialog_sync(*, refocus: bool = True) -> int:
     if not pending:
         return 0
     _SESSION["pending_dialog_sync"] = {}
+    _arm_focus_guard(2000 + 500 * len(pending))
     n = 0
     for cid, src in pending.items():
         if await write_back_cell(cid, src):
@@ -1484,19 +1504,23 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
         async def _deferred_dialog_write(cid=cell_id, src=source):
             try:
                 await asyncio.sleep(0.2)
+                # Preview: arm the parent-page guard *before* update_msg so the
+                # host's focus/scroll-on-update is swallowed at the source
+                # instead of corrected after the fact (no visible jump).
+                in_fs = await _parent_in_fullscreen()
+                if not in_fs:
+                    _arm_focus_guard(2000)
                 pending = dict(_SESSION.get("pending_dialog_sync") or {})
                 pending[cid] = src
                 _SESSION["pending_dialog_sync"] = {}
                 for pcid, psrc in pending.items():
                     await write_back_cell(pcid, psrc)
                 push_slide_result(cid, result, source=src)
-                # Preview: host focuses the updated message — pull focus back
-                in_fs = await _parent_in_fullscreen()
                 if not in_fs:
-                    # Multi-wave refocus after SolveIt's own focus-on-update
-                    for delay in (0, 0.05, 0.12, 0.3, 0.6):
-                        if delay:
-                            await asyncio.sleep(delay)
+                    # Backstop for host paths the guard can't intercept —
+                    # no-op when focus never left the slides.
+                    for delay in (0.1, 0.4):
+                        await asyncio.sleep(delay)
                         refocus_presenter()
             except Exception as e:
                 _SESSION["_dialog_sync_err"] = str(e)
@@ -1505,6 +1529,7 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
             asyncio.get_running_loop().create_task(_deferred_dialog_write())
         except RuntimeError:
             try:
+                _arm_focus_guard(2000)
                 await write_back_cell(cell_id, source)
                 refocus_presenter()
             except Exception:
@@ -1528,6 +1553,7 @@ async def sync_dialog() -> int:
             _apply_source_to_deck(cid, src)
     _SESSION["pending_dialog_sync"] = {}
 
+    _arm_focus_guard(2000 + 500 * len(deck.ordered_code_ids))
     n = 0
     for cid in deck.ordered_code_ids:
         src = deck.cells[cid].source
@@ -1561,6 +1587,48 @@ if (!window.__sslive_bridge) {
       t: Date.now()
     });
   });
+}
+// Focus guard: pre-empt SolveIt's focus/scroll-on-update after update_msg.
+// Armed from Python (window.__sslive_guard_until) just before dialog
+// write-back. Real user gestures in the dialog always win (see __sslive_user_ts).
+// Separate flag from __sslive_bridge so it installs on pages with an old bridge.
+if (!window.__sslive_guard_v1) {
+  window.__sslive_guard_v1 = true;
+  window.__sslive_guard_until = 0;
+  window.__sslive_user_ts = 0;
+  var slFrame = function () {
+    return document.getElementById('sslive-frame')
+      || document.querySelector('iframe[data-sslive="1"]');
+  };
+  var slArmed = function () {
+    return Date.now() < (window.__sslive_guard_until || 0)
+      && Date.now() - (window.__sslive_user_ts || 0) > 400;
+  };
+  var slAllowed = function (el) {
+    var ifr = slFrame();
+    return !ifr || el === ifr || (el && ifr.contains && ifr.contains(el));
+  };
+  window.addEventListener('pointerdown', function () { window.__sslive_user_ts = Date.now(); }, true);
+  window.addEventListener('keydown', function () { window.__sslive_user_ts = Date.now(); }, true);
+  var slFocus = HTMLElement.prototype.focus;
+  HTMLElement.prototype.focus = function () {
+    if (slArmed() && !slAllowed(this)) return;
+    return slFocus.apply(this, arguments);
+  };
+  var slScroll = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = function () {
+    if (slArmed() && !slAllowed(this)) return;
+    return slScroll.apply(this, arguments);
+  };
+  // Backstop for focus paths that bypass .focus() (e.g. autofocus in swapped
+  // HTMX content): bounce focus back to the iframe within the same tick.
+  document.addEventListener('focusin', function (e) {
+    if (!slArmed() || slAllowed(e.target)) return;
+    var ifr = slFrame();
+    if (!ifr) return;
+    try { ifr.focus({ preventScroll: true }); } catch (err) { try { ifr.focus(); } catch (e2) {} }
+    try { if (ifr.contentWindow) ifr.contentWindow.focus(); } catch (err) {}
+  }, true);
 }
 """
     # Prefer dialoghelper so the script lands on the real dialog DOM
