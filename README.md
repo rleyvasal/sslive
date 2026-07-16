@@ -53,10 +53,17 @@ await slive()          # starts local server + embeds preview iframe
 Requires a note cell with exactly `#| s`, then `#` / `##` slide content below it.
 
 **Presenter:** slides are embedded with **srcdoc** (works on cloud SolveIt).  
-**Run:** browser cannot call the kernel HTTP port on SolveIt — use the **ipywidgets controls under the slides**, or:
+
+**Editable cells:** under the deck, each code cell is an **ipywidgets textarea** (edit like SolveIt).  
+- **▶ Run** — uses the editor text → GPU (CRAFT) → refreshes slides + shows output  
+- **💾 Save** — write source back to the SolveIt dialog (`update_msg`) without running  
+- Default `write_back=True` also saves on Run  
 
 ```python
-run_cell_index(0)   # GPU via CRAFT; refreshes the slide deck
+await slive()                    # editors + slides
+await slive(write_back=False)    # edit/run only; don't touch dialog
+run_cell_index(0)                # runs current editor text if present
+set_cell_source(cell_id, "…")    # programmatic edit
 ```
 
 **Important:** keep `slive` / `run_cell_*` under `%local`.

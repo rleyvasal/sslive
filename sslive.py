@@ -1130,15 +1130,96 @@ def refresh_presenter(height: str | None = None) -> None:
         print(f"sslive: refresh_presenter failed: {e}")
 
 
-def _run_and_refresh(cell_id: str, *, status_widget=None) -> ExecResult:
-    """Execute on GPU and refresh the srcdoc presenter (kernel-side Run)."""
+def _schedule_async(coro) -> None:
+    """Fire-and-forget async coroutine from a sync widget callback."""
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        loop.create_task(coro)
+        return
+    try:
+        asyncio.run(coro)
+    except RuntimeError:
+        # Nested event loop (some notebook hosts)
+        try:
+            import nest_asyncio
+
+            nest_asyncio.apply()
+            asyncio.get_event_loop().run_until_complete(coro)
+        except Exception as e:
+            print(f"sslive: async schedule failed: {e}")
+
+
+async def _write_back_cell(cell_id: str, content: str) -> None:
+    """Persist edited source to the SolveIt dialog message (source of truth)."""
+    if update_msg is None:
+        return
+    # dialog ids sometimes have a leading _; try both
+    candidates = [cell_id]
+    if cell_id.startswith("_"):
+        candidates.append(cell_id.lstrip("_"))
+    else:
+        candidates.append("_" + cell_id)
+    last_err = None
+    for mid in candidates:
+        try:
+            await update_msg(id=mid, content=content)
+            return
+        except Exception as e:
+            last_err = e
+    if last_err:
+        print(f"sslive: write-back failed for {cell_id}: {last_err}")
+
+
+def set_cell_source(cell_id: str, source: str, *, write_back: bool | None = None) -> None:
+    """Update deck source (and optional editor widget) for a code cell."""
+    deck = _SESSION.get("deck")
+    if deck is None or cell_id not in deck.cells:
+        raise KeyError(cell_id)
+    deck.cells[cell_id].source = source
+    editors = _SESSION.get("editors") or {}
+    if cell_id in editors:
+        editors[cell_id].value = source
+    if write_back is None:
+        write_back = bool(_SESSION.get("write_back", True))
+    if write_back:
+        _schedule_async(_write_back_cell(cell_id, source))
+
+
+def _run_and_refresh(
+    cell_id: str,
+    *,
+    source: str | None = None,
+    status_widget=None,
+    write_back: bool | None = None,
+) -> ExecResult:
+    """Execute on GPU and refresh the srcdoc presenter (kernel-side Run).
+
+    If ``source`` is given (e.g. from an editor), it becomes the cell source
+    before execute — this is the editable-cell path.
+    """
     deck = _SESSION.get("deck")
     executor = _SESSION.get("executor")
     if deck is None or executor is None:
         raise RuntimeError("Call await slive() first")
+    if source is not None:
+        deck.cells[cell_id].source = source
+        # keep code Element content in sync for future layout work
+        el_id = f"el-code-{cell_id}"
+        if el_id in deck.elements:
+            deck.elements[el_id].content = source
+        if write_back is None:
+            write_back = bool(_SESSION.get("write_back", True))
+        if write_back:
+            _schedule_async(_write_back_cell(cell_id, source))
+
     echo = bool(_SESSION.get("echo_to_dialog", False))
     if status_widget is not None:
-        status_widget.value = f"Running {cell_id}…"
+        status_widget.value = f"<span style='color:#fbbf24'>Running {html_module.escape(cell_id)}…</span>"
     result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo)
     preview = ""
     if result.parts:
@@ -1146,11 +1227,12 @@ def _run_and_refresh(cell_id: str, *, status_widget=None) -> ExecResult:
         preview = (p0.text or p0.kind)[:80].replace("\n", " ")
     msg = (
         f"{'ok' if result.ok else 'err'} {result.duration_ms}ms"
-        + (f" — {preview}" if preview else "")
-        + (f" ({result.error})" if result.error else "")
+        + (f" — {html_module.escape(preview)}" if preview else "")
+        + (f" ({html_module.escape(result.error)})" if result.error else "")
     )
     if status_widget is not None:
-        status_widget.value = msg
+        color = "#86efac" if result.ok else "#fca5a5"
+        status_widget.value = f"<span style='color:{color}'>{msg}</span>"
     else:
         print(f"run_cell({cell_id!r}): {msg}")
     refresh_presenter()
@@ -1158,10 +1240,11 @@ def _run_and_refresh(cell_id: str, *, status_widget=None) -> ExecResult:
 
 
 def _show_kernel_controls() -> None:
-    """Run controls that call Python in the SolveIt kernel (no browser→port).
+    """Editable code cells + Run (kernel-side — works on cloud SolveIt).
 
-    Cloud SolveIt cannot reach JupyUvi from the iframe (api unreachable).
-    These buttons use the same path as run_cell_index — CRAFT on GPU.
+    Each code cell gets a textarea (SolveIt-like edit surface). Run uses the
+    current editor text → deck → CRAFT GPU → refresh slides. Optional write-back
+    updates the dialog message via dialoghelper.update_msg.
     """
     deck: Deck | None = _SESSION.get("deck")
     if deck is None or not deck.ordered_code_ids:
@@ -1169,44 +1252,125 @@ def _show_kernel_controls() -> None:
     if display is None:
         return
 
-    if widgets is not None:
-        status = widgets.HTML(
-            value="<b>sslive controls</b> — Run executes on GPU via CRAFT "
-            "(works when in-slide ▶ cannot reach the API)."
-        )
-        log = widgets.HTML(value="")
-        btns = []
+    if widgets is None:
+        print("sslive: install ipywidgets for editable cells, or use:")
+        print("  set_cell_source(cell_id, 'print(1)')")
+        print("  run_cell(cell_id)")
         for i, cid in enumerate(deck.ordered_code_ids):
-            src = deck.cells[cid].source.strip().splitlines()
-            label = (src[0][:40] + "…") if src else cid
-            b = widgets.Button(
-                description=f"▶ {i}: {label}",
-                tooltip=cid,
-                layout=widgets.Layout(width="auto", min_width="12em"),
-            )
-
-            def _click(_btn, cell_id=cid, log_w=log):
-                r = _run_and_refresh(cell_id)
-                log_w.value = (
-                    f"<code>{cell_id}</code> ok={r.ok} {r.duration_ms}ms"
-                    + (f" err={r.error}" if r.error else "")
-                )
-
-            b.on_click(_click)
-            btns.append(b)
-
-        refresh_btn = widgets.Button(description="↻ Refresh slides")
-        refresh_btn.on_click(lambda _b: refresh_presenter())
-        row = widgets.HBox(btns + [refresh_btn])
-        display(widgets.VBox([status, row, log]))
-        print("sslive: kernel-side Run controls ready (use these on SolveIt).")
+            print(f"  run_cell_index({i})  # {cid}")
         return
 
-    # Fallback without ipywidgets: print ids + instructions
-    print("sslive: kernel-side run (no ipywidgets) — call:")
+    editors: dict[str, Any] = {}
+    _SESSION["editors"] = editors
+
+    header = widgets.HTML(
+        value=(
+            "<div style='font:14px system-ui;margin:4px 0 8px'>"
+            "<b>Editable cells</b> — edit like SolveIt, then <b>▶ Run</b> "
+            "(GPU via CRAFT). Changes update the slide deck"
+            + (
+                " and write back to the dialog."
+                if _SESSION.get("write_back", True)
+                else "."
+            )
+            + "</div>"
+        )
+    )
+
+    cell_boxes = []
     for i, cid in enumerate(deck.ordered_code_ids):
-        print(f"  run_cell_index({i})  # {cid}")
-    print("  refresh_presenter()  # re-draw deck after run")
+        cell = deck.cells[cid]
+        n_lines = max(3, min(20, cell.source.count("\n") + 2))
+        ta = widgets.Textarea(
+            value=cell.source,
+            description="",
+            layout=widgets.Layout(
+                width="100%",
+                height=f"{max(72, n_lines * 22)}px",
+                border="1px solid #374151",
+                font_family="ui-monospace, SFMono-Regular, Menlo, monospace",
+            ),
+            style={"description_width": "0px"},
+        )
+        editors[cid] = ta
+        status = widgets.HTML(value=f"<code style='opacity:0.7'>{html_module.escape(cid)}</code>")
+        run_btn = widgets.Button(
+            description="▶ Run",
+            button_style="primary",
+            layout=widgets.Layout(width="6em"),
+        )
+        save_btn = widgets.Button(
+            description="💾 Save",
+            tooltip="Write source back to SolveIt dialog (no execute)",
+            layout=widgets.Layout(width="6em"),
+        )
+        out_preview = widgets.HTML(value="")
+
+        def _on_run(
+            _btn,
+            cell_id=cid,
+            editor=ta,
+            st=status,
+            prev=out_preview,
+        ):
+            r = _run_and_refresh(cell_id, source=editor.value, status_widget=st)
+            # show last stream/text under the editor
+            bits = []
+            for p in r.parts:
+                if p.kind in ("stream", "text/plain") and p.text:
+                    bits.append(
+                        f"<pre style='margin:4px 0;padding:8px;background:#1f2937;"
+                        f"color:#e5e7eb;border-radius:6px;white-space:pre-wrap'>"
+                        f"{html_module.escape(p.text)}</pre>"
+                    )
+                elif p.kind == "error" and p.text:
+                    bits.append(
+                        f"<pre style='margin:4px 0;padding:8px;background:#7f1d1d;"
+                        f"color:#fecaca;border-radius:6px;white-space:pre-wrap'>"
+                        f"{html_module.escape(p.text)}</pre>"
+                    )
+                elif p.kind == "image/png" and p.b64:
+                    bits.append(
+                        f"<img src='data:image/png;base64,{p.b64}' "
+                        f"style='max-width:100%;max-height:240px'/>"
+                    )
+            prev.value = "".join(bits) or "<span style='opacity:0.5'>(no output)</span>"
+
+        def _on_save(_btn, cell_id=cid, editor=ta, st=status):
+            set_cell_source(cell_id, editor.value, write_back=True)
+            st.value = (
+                f"<span style='color:#86efac'>saved → dialog "
+                f"<code>{html_module.escape(cell_id)}</code></span>"
+            )
+            refresh_presenter()
+
+        run_btn.on_click(_on_run)
+        save_btn.on_click(_on_save)
+
+        title = widgets.HTML(
+            value=(
+                f"<div style='font:13px system-ui;color:#9ca3af;margin-top:10px'>"
+                f"Code cell {i} · edit below</div>"
+            )
+        )
+        toolbar = widgets.HBox([run_btn, save_btn, status])
+        box = widgets.VBox(
+            [title, toolbar, ta, out_preview],
+            layout=widgets.Layout(
+                border="1px solid #1f2937",
+                padding="8px 10px",
+                margin="0 0 10px 0",
+                width="100%",
+            ),
+        )
+        cell_boxes.append(box)
+
+    refresh_btn = widgets.Button(description="↻ Refresh slides only")
+    refresh_btn.on_click(lambda _b: refresh_presenter())
+    display(widgets.VBox([header, *cell_boxes, refresh_btn]))
+    print(
+        "sslive: editable cells ready — edit text, ▶ Run (GPU), 💾 Save (dialog write-back)."
+    )
 
 
 def _show_presenter(port: int | None, height: str = "720px"):
@@ -1285,8 +1449,9 @@ async def slive(
     echo_to_dialog: bool = False,
     embed: bool = True,
     use_http: bool | None = None,
+    write_back: bool = True,
 ):
-    """Load deck, embed presenter, enable GPU run.
+    """Load deck, embed presenter, enable editable GPU run.
 
     dialoghelper APIs are async — call from SolveIt as::
 
@@ -1294,11 +1459,11 @@ async def slive(
         await slive()
 
     On **SolveIt (cloud)** the browser cannot reach the kernel HTTP port, so:
-      - slides are embedded with **srcdoc** (navigation works in the iframe)
-      - **Run** uses kernel-side controls / ``run_cell_index`` (CRAFT → GPU)
-      - optional ``use_http=True`` still starts JupyUvi (usually unreachable)
+      - slides are embedded with **srcdoc** (navigation in the iframe)
+      - **editable cells** + ▶ Run live under the deck (ipywidgets → CRAFT)
+      - ``write_back=True`` (default) saves edited source to the dialog on Run/Save
 
-    On a **local** notebook, ``use_http`` defaults True (HTMX/localhost).
+    On a **local** notebook, ``use_http`` defaults True (optional HTMX/localhost).
     """
     _ensure_local_magic()
 
@@ -1319,6 +1484,7 @@ async def slive(
     _SESSION["executor"] = executor
     _SESSION["echo_to_dialog"] = echo_to_dialog
     _SESSION["theme"] = theme_dict
+    _SESSION["write_back"] = write_back
 
     port: int | None = None
     if use_http:
@@ -1349,7 +1515,8 @@ async def slive(
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
     print("Iframe: ←/→ slides · f fullscreen")
-    print("Run: use controls below the slides (or run_cell_index(0)) — GPU via CRAFT")
+    print("Edit + Run: use editors below the slides (GPU via CRAFT)"
+          + ("; write-back to dialog ON" if write_back else "; write-back OFF"))
 
     if embed:
         _show_presenter(port, height=height)
@@ -1367,21 +1534,39 @@ async def slive(
     return session
 
 
-def run_cell(cell_id: str, *, echo_to_dialog: bool | None = None, refresh: bool = True) -> ExecResult:
-    """Execute one code cell on GPU by id; updates deck outputs + refreshes slides."""
+def run_cell(
+    cell_id: str,
+    *,
+    source: str | None = None,
+    echo_to_dialog: bool | None = None,
+    refresh: bool = True,
+    write_back: bool | None = None,
+) -> ExecResult:
+    """Execute one code cell on GPU by id; updates deck outputs + refreshes slides.
+
+    Pass ``source=`` to run edited text (updates deck, optional dialog write-back).
+    If omitted, uses editor widget value when present, else deck source.
+    """
     deck: Deck | None = _SESSION.get("deck")
     executor: LiveExecutor | None = _SESSION.get("executor")
     if deck is None or executor is None:
         raise RuntimeError("Call await slive() first")
+    if source is None:
+        editors = _SESSION.get("editors") or {}
+        if cell_id in editors:
+            source = editors[cell_id].value
     if echo_to_dialog is None:
         echo_to_dialog = bool(_SESSION.get("echo_to_dialog", False))
-    # temporarily override echo in session for _run_and_refresh path
     old = _SESSION.get("echo_to_dialog")
     _SESSION["echo_to_dialog"] = echo_to_dialog
     try:
         if refresh:
-            result = _run_and_refresh(cell_id)
+            result = _run_and_refresh(
+                cell_id, source=source, write_back=write_back
+            )
         else:
+            if source is not None:
+                deck.cells[cell_id].source = source
             result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo_to_dialog)
             print(
                 f"run_cell({cell_id!r}): ok={result.ok} parts={len(result.parts)} "
@@ -1428,6 +1613,7 @@ __all__ = [
     "run_cell_index",
     "deck_summary",
     "refresh_presenter",
+    "set_cell_source",
     "render_output_html",
     "generate_presenter_html",
     "get_craft_exec_mgr",
