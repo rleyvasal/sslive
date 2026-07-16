@@ -1623,7 +1623,8 @@ async def _drain_slide_queue() -> list[dict]:
 
 
 async def _bridge_poll_loop() -> None:
-    """Background: apply in-slide Run requests (edit → dialog + GPU)."""
+    """Background: apply in-slide Run requests (edit → GPU; dialog when safe)."""
+    was_fs = False
     while _SESSION.get("bridge_active"):
         try:
             pending = await _drain_slide_queue()
@@ -1643,6 +1644,14 @@ async def _bridge_poll_loop() -> None:
                     )
                 except Exception as e:
                     print(f"sslive: slide Run failed: {e}")
+
+            # When leaving fullscreen, flush dialog sources queued during FS runs
+            in_fs = await _parent_in_fullscreen()
+            if was_fs and not in_fs:
+                n = await _flush_pending_dialog_sync(refocus=True)
+                if n:
+                    print(f"sslive: flushed {n} dialog sync(s) after exiting fullscreen")
+            was_fs = in_fs
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1695,16 +1704,15 @@ def _show_run_panel(deck: Deck) -> None:
     html = """
 <div style="font:14px system-ui;color:#e5e7eb;margin:10px 0;padding:12px 14px;
             background:#0b1220;border:1px solid #374151;border-radius:8px">
-  <b>RISE-style:</b> edit code in the slide → <b>▶ Run</b> / <b>Shift+Enter</b>
-  → GPU + updates dialog cell source + restores this slide in the preview.
+  <b>RISE-style:</b> edit in the slide → <b>▶ Run</b> / <b>Shift+Enter</b> → GPU.
   <div style="margin-top:8px;font-size:12px;color:#9ca3af">
-    SolveIt may briefly move focus when syncing the dialog cell; the preview
-    should reopen on the <b>same slide</b> with new output (not the title).
+    <b>Fullscreen:</b> stays in the slide; dialog sync is queued until you exit FS
+    (focusing the dialog would exit fullscreen).<br/>
+    <b>Preview:</b> runs + syncs dialog source, then returns focus to the slide
+    (no full rebuild/flash).
   </div>
   <div style="margin-top:6px;font-size:12px;color:#9ca3af">
-    Fallback: <code>await run_cell_index(0)</code>
-    · <code>await sync_dialog()</code>
-    · <code>await pump_slide_runs()</code>
+    <code>await sync_dialog()</code> · <code>await pump_slide_runs()</code>
   </div>
 </div>
 """
@@ -1840,10 +1848,11 @@ async def slive(
     )
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
-    _SESSION["write_back"] = True  # sync dialog source; rebuild restores slide index
     _SESSION["slide_index"] = 0
-    print("In-slide: edit · ▶ Run / Shift+Enter → GPU + dialog source sync")
-    print("After Run we restore the same slide (SolveIt may briefly exit fullscreen)")
+    _SESSION.setdefault("pending_dialog_sync", {})
+    print("In-slide: edit · ▶ Run / Shift+Enter → GPU")
+    print("Fullscreen: stays put; dialog sync when you exit FS (or await sync_dialog())")
+    print("Preview: updates in place + dialog sync + refocus slide")
 
     if embed:
         _show_presenter(port, height=height)
