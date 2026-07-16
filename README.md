@@ -52,13 +52,16 @@ await slive()          # starts local server + embeds preview iframe
 
 Requires a note cell with exactly `#| s`, then `#` / `##` slide content below it.
 
-**Presenter (click iframe first):** `←`/`→` slides · **Shift+Enter** run selected code · `f` fullscreen · ▶ Run on each code cell.
+**Presenter:** slides are embedded with **srcdoc** (works on cloud SolveIt).  
+**Run:** browser cannot call the kernel HTTP port on SolveIt — use the **ipywidgets controls under the slides**, or:
 
-**Important:** keep `slive` / `run_cell_*` under `%local`. Only slide *source strings* run on the GPU via CRAFT.
+```python
+run_cell_index(0)   # GPU via CRAFT; refreshes the slide deck
+```
 
-**Embedding:** uses FastHTML `JupyUvi` + `HTMX(..., host=None)` like pcviz — iframe `src` is same-origin `/sslive` (SolveIt proxies to the kernel server). Do **not** use raw `http://127.0.0.1:...` from the browser on cloud SolveIt.
+**Important:** keep `slive` / `run_cell_*` under `%local`.
 
-`sstop()` stops the local presenter server. If you had an older sslive run, call `sstop()` once before `await slive()` again.
+Optional HTTP server (local notebooks only): `await slive(use_http=True)`.
 
 ## Local reference
 

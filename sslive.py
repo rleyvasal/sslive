@@ -37,10 +37,15 @@ except Exception:  # pragma: no cover - outside SolveIt
     find_msgs = curr_dialog = update_msg = None
 
 try:
-    from IPython.display import display, IFrame
+    from IPython.display import display, IFrame, clear_output, DisplayHandle
     from IPython import get_ipython
 except Exception:  # pragma: no cover
-    display = IFrame = get_ipython = None
+    display = IFrame = clear_output = DisplayHandle = get_ipython = None
+
+try:
+    import ipywidgets as widgets
+except Exception:  # pragma: no cover
+    widgets = None
 
 try:
     from fasthtml.common import (
@@ -1085,63 +1090,158 @@ def sstop() -> None:
     print("sslive: server stopped")
 
 
-def _show_presenter(port: int, height: str = "720px"):
-    """Embed presenter without relying on SolveIt front-door paths.
-
-    ``iframe src="/sslive"`` hits SolveIt's web app → **404** (what you saw).
-    The kernel server listens on ``port`` inside the SolveIt VM; the browser
-    only reaches it if hostname:port or /proxy/port works.
-
-    Strategy:
-      1. **srcdoc** embed of the full deck HTML (always shows slides, like sslides)
-      2. In-page JS probes API bases (hostname:port, /proxy/port, localhost)
-         so Run can hit JupyUvi when any path is open
-      3. Local (not IN_SOLVEIT): also try HTMX localhost iframe as optional
-    """
+def _presenter_iframe_html(height: str = "720px", port: int | None = None) -> str:
+    """Build srcdoc iframe HTML for the current deck (display only)."""
     if isinstance(height, int):
         height = f"{height}px"
-
     deck = _SESSION.get("deck") or Deck()
     ex = _SESSION.get("executor") or LiveExecutor()
     ok, msg = ex.kernel_ok()
-    html = generate_presenter_html(
-        deck, backend_label=f"gpu · {msg}", port=port
-    )
-
-    # Escape for srcdoc attribute
+    label = f"gpu · {msg}" if ok else f"gpu · {msg}"
+    # On SolveIt, browser cannot reach JupyUvi — label says kernel-side run
+    if _in_solveit() or not port:
+        label = f"gpu · {msg} · run via controls below"
+    html = generate_presenter_html(deck, backend_label=label, port=port or 0)
     escaped = html_module.escape(html, quote=True)
-    iframe_html = (
+    return (
         f'<iframe srcdoc="{escaped}" '
         f'style="width:100%;height:{height};border:none;background:#111;" '
         f'sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals" '
         f'allow="fullscreen"></iframe>'
     )
 
+
+def refresh_presenter(height: str | None = None) -> None:
+    """Re-draw the srcdoc deck (call after run_cell so outputs update)."""
+    if display is None:
+        return
+    h = height or _SESSION.get("height") or "720px"
+    port = _SESSION.get("port")
+    try:
+        from IPython.display import HTML as IPyHTML
+
+        handle = _SESSION.get("presenter_handle")
+        iframe = IPyHTML(_presenter_iframe_html(h, port=port))
+        if handle is not None:
+            handle.update(iframe)
+        else:
+            _SESSION["presenter_handle"] = display(iframe, display_id=True)
+    except Exception as e:
+        print(f"sslive: refresh_presenter failed: {e}")
+
+
+def _run_and_refresh(cell_id: str, *, status_widget=None) -> ExecResult:
+    """Execute on GPU and refresh the srcdoc presenter (kernel-side Run)."""
+    deck = _SESSION.get("deck")
+    executor = _SESSION.get("executor")
+    if deck is None or executor is None:
+        raise RuntimeError("Call await slive() first")
+    echo = bool(_SESSION.get("echo_to_dialog", False))
+    if status_widget is not None:
+        status_widget.value = f"Running {cell_id}…"
+    result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo)
+    preview = ""
+    if result.parts:
+        p0 = result.parts[0]
+        preview = (p0.text or p0.kind)[:80].replace("\n", " ")
+    msg = (
+        f"{'ok' if result.ok else 'err'} {result.duration_ms}ms"
+        + (f" — {preview}" if preview else "")
+        + (f" ({result.error})" if result.error else "")
+    )
+    if status_widget is not None:
+        status_widget.value = msg
+    else:
+        print(f"run_cell({cell_id!r}): {msg}")
+    refresh_presenter()
+    return result
+
+
+def _show_kernel_controls() -> None:
+    """Run controls that call Python in the SolveIt kernel (no browser→port).
+
+    Cloud SolveIt cannot reach JupyUvi from the iframe (api unreachable).
+    These buttons use the same path as run_cell_index — CRAFT on GPU.
+    """
+    deck: Deck | None = _SESSION.get("deck")
+    if deck is None or not deck.ordered_code_ids:
+        return
+    if display is None:
+        return
+
+    if widgets is not None:
+        status = widgets.HTML(
+            value="<b>sslive controls</b> — Run executes on GPU via CRAFT "
+            "(works when in-slide ▶ cannot reach the API)."
+        )
+        log = widgets.HTML(value="")
+        btns = []
+        for i, cid in enumerate(deck.ordered_code_ids):
+            src = deck.cells[cid].source.strip().splitlines()
+            label = (src[0][:40] + "…") if src else cid
+            b = widgets.Button(
+                description=f"▶ {i}: {label}",
+                tooltip=cid,
+                layout=widgets.Layout(width="auto", min_width="12em"),
+            )
+
+            def _click(_btn, cell_id=cid, log_w=log):
+                r = _run_and_refresh(cell_id)
+                log_w.value = (
+                    f"<code>{cell_id}</code> ok={r.ok} {r.duration_ms}ms"
+                    + (f" err={r.error}" if r.error else "")
+                )
+
+            b.on_click(_click)
+            btns.append(b)
+
+        refresh_btn = widgets.Button(description="↻ Refresh slides")
+        refresh_btn.on_click(lambda _b: refresh_presenter())
+        row = widgets.HBox(btns + [refresh_btn])
+        display(widgets.VBox([status, row, log]))
+        print("sslive: kernel-side Run controls ready (use these on SolveIt).")
+        return
+
+    # Fallback without ipywidgets: print ids + instructions
+    print("sslive: kernel-side run (no ipywidgets) — call:")
+    for i, cid in enumerate(deck.ordered_code_ids):
+        print(f"  run_cell_index({i})  # {cid}")
+    print("  refresh_presenter()  # re-draw deck after run")
+
+
+def _show_presenter(port: int | None, height: str = "720px"):
+    """Embed deck via srcdoc + kernel-side Run controls (SolveIt-safe)."""
+    if isinstance(height, int):
+        height = f"{height}px"
+    _SESSION["height"] = height
+
     try:
         from IPython.display import HTML as IPyHTML
 
         if display is not None:
-            display(IPyHTML(iframe_html))
+            iframe = IPyHTML(_presenter_iframe_html(height, port=port))
+            # display_id so refresh_presenter can update in place
+            handle = display(iframe, display_id=True)
+            _SESSION["presenter_handle"] = handle
             print(
-                f"sslive: embedded via srcdoc (port={port}). "
-                f"Run buttons probe hostname:{port} and /proxy/{port}."
+                f"sslive: embedded via srcdoc"
+                + (f" (http server :{port})" if port else " (no browser API)")
             )
-            return
     except Exception as e:
         print(f"sslive: srcdoc embed failed: {e}")
 
-    # Optional local HTMX (browser and kernel on same machine)
-    if HTMX is not None and not _in_solveit():
+    # Always show kernel-side controls on SolveIt; also useful elsewhere
+    _show_kernel_controls()
+
+    # Optional local HTMX when not on SolveIt and port is up
+    if port and HTMX is not None and not _in_solveit():
         try:
             preview = HTMX("/sslive", host="localhost", port=port, height=height)
             if display is not None:
                 display(preview)
-            print(f"sslive: embedded via HTMX localhost:{port}/sslive")
-            return
-        except Exception as e:
-            print(f"sslive: HTMX localhost embed failed: {e}")
-
-    print(f"sslive: open http://127.0.0.1:{port}/sslive if kernel is local")
+            print(f"sslive: also HTMX localhost:{port}/sslive (local only)")
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1184,15 +1284,21 @@ async def slive(
     height: str = "720px",
     echo_to_dialog: bool = False,
     embed: bool = True,
+    use_http: bool | None = None,
 ):
-    """Load deck, start live host, embed presenter (HTMX / JupyUvi).
+    """Load deck, embed presenter, enable GPU run.
 
     dialoghelper APIs are async — call from SolveIt as::
 
         %local
         await slive()
 
-    Controls (click iframe first): ←/→ slides, Shift+Enter run, f fullscreen.
+    On **SolveIt (cloud)** the browser cannot reach the kernel HTTP port, so:
+      - slides are embedded with **srcdoc** (navigation works in the iframe)
+      - **Run** uses kernel-side controls / ``run_cell_index`` (CRAFT → GPU)
+      - optional ``use_http=True`` still starts JupyUvi (usually unreachable)
+
+    On a **local** notebook, ``use_http`` defaults True (HTMX/localhost).
     """
     _ensure_local_magic()
 
@@ -1202,6 +1308,10 @@ async def slive(
         print("Load CRAFT and run %gpu, then call await slive() again under %local.")
         return None
 
+    if use_http is None:
+        # Cloud SolveIt: skip HTTP server (browser cannot call it)
+        use_http = not _in_solveit()
+
     theme_dict = theme if isinstance(theme, dict) else dict(THEME_DARK)
     deck = await build_deck(theme=theme_dict)
     executor = LiveExecutor()
@@ -1210,33 +1320,36 @@ async def slive(
     _SESSION["echo_to_dialog"] = echo_to_dialog
     _SESSION["theme"] = theme_dict
 
-    # Reuse running server if it has the HTMX route; otherwise (re)start
-    if (
-        _SESSION.get("server") is not None
-        and _SESSION.get("port") is not None
-        and _SESSION.get("sslive_rt") is not None
-    ):
-        port = int(_SESSION["port"])
+    port: int | None = None
+    if use_http:
+        if (
+            _SESSION.get("server") is not None
+            and _SESSION.get("port") is not None
+            and _SESSION.get("sslive_rt") is not None
+        ):
+            port = int(_SESSION["port"])
+        else:
+            if _SESSION.get("server") is not None:
+                try:
+                    sstop()
+                except Exception:
+                    pass
+            port = _ensure_live_server()
     else:
-        if _SESSION.get("server") is not None:
-            try:
-                sstop()
-            except Exception:
-                pass
-        port = _ensure_live_server()
+        # Ensure we don't keep a stale server pointer confusing status
+        _SESSION["port"] = None
 
-    session = LiveSession(port=port, backend="gpu", deck=deck)
+    session = LiveSession(port=port or 0, backend="gpu", deck=deck)
 
     n_code = len(deck.ordered_code_ids)
     print(
         f"sslive: {len(deck.slides)} slides, {n_code} code cells, "
-        f"backend=gpu ({msg}) → {session.url} (port {port}, "
-        f"IN_SOLVEIT={_in_solveit()})"
+        f"backend=gpu ({msg}), IN_SOLVEIT={_in_solveit()}, use_http={use_http}"
     )
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
-    print("Click the preview, then: ←/→ navigate · Shift+Enter run · f fullscreen")
-    print("Headless still works: run_cell_index(0)")
+    print("Iframe: ←/→ slides · f fullscreen")
+    print("Run: use controls below the slides (or run_cell_index(0)) — GPU via CRAFT")
 
     if embed:
         _show_presenter(port, height=height)
@@ -1254,19 +1367,28 @@ async def slive(
     return session
 
 
-def run_cell(cell_id: str, *, echo_to_dialog: bool | None = None) -> ExecResult:
-    """Execute one code cell on GPU by id; also updates deck outputs for presenter."""
+def run_cell(cell_id: str, *, echo_to_dialog: bool | None = None, refresh: bool = True) -> ExecResult:
+    """Execute one code cell on GPU by id; updates deck outputs + refreshes slides."""
     deck: Deck | None = _SESSION.get("deck")
     executor: LiveExecutor | None = _SESSION.get("executor")
     if deck is None or executor is None:
         raise RuntimeError("Call await slive() first")
     if echo_to_dialog is None:
         echo_to_dialog = bool(_SESSION.get("echo_to_dialog", False))
-    result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo_to_dialog)
-    print(
-        f"run_cell({cell_id!r}): ok={result.ok} parts={len(result.parts)} "
-        f"ms={result.duration_ms}" + (f" err={result.error}" if result.error else "")
-    )
+    # temporarily override echo in session for _run_and_refresh path
+    old = _SESSION.get("echo_to_dialog")
+    _SESSION["echo_to_dialog"] = echo_to_dialog
+    try:
+        if refresh:
+            result = _run_and_refresh(cell_id)
+        else:
+            result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo_to_dialog)
+            print(
+                f"run_cell({cell_id!r}): ok={result.ok} parts={len(result.parts)} "
+                f"ms={result.duration_ms}" + (f" err={result.error}" if result.error else "")
+            )
+    finally:
+        _SESSION["echo_to_dialog"] = old
     return result
 
 
@@ -1305,6 +1427,7 @@ __all__ = [
     "run_cell",
     "run_cell_index",
     "deck_summary",
+    "refresh_presenter",
     "render_output_html",
     "generate_presenter_html",
     "get_craft_exec_mgr",
