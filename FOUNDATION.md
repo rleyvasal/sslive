@@ -65,12 +65,21 @@ Do **not** use `execute_remote()` alone (dialog-only hook). Same client, capture
 
 ## Build order
 
-1. Deck model + loader  
-2. Executor + capture (headless proof)  
-3. Live host `/execute`  
-4. Minimal presenter  
-5. `slive()` + skip cell  
-6. Interrupt / status polish  
+1. Deck model + loader ✅  
+2. Executor + capture (headless proof) ✅  
+3. Live host `/execute` ✅  
+4. Minimal presenter ✅  
+5. `slive()` + skip cell ✅  
+6. Interrupt / status polish (partial: `/interrupt`, status badge)  
+
+### Live host routes
+
+| Method | Path | Role |
+|--------|------|------|
+| GET | `/` | Presenter HTML |
+| GET | `/status` | `{backend, busy, kernel_ok, …}` |
+| POST | `/execute` | form/JSON `cell_id` → `#el-output-*` HTML |
+| POST | `/interrupt` | CRAFT control-channel interrupt |
 
 ## dialoghelper (SolveIt)
 

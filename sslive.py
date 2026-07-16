@@ -462,28 +462,39 @@ class LiveExecutor:
 
 def render_output_html(parts: list[OutputPart], cell_id: str, theme: dict | None = None) -> str:
     """Return HTML for #el-output-{cell_id}. No FastHTML required."""
-    theme = theme or {}
-    out_cls = theme.get("output", "bg-gray-800 p-2 text-sm font-mono text-gray-100")
-    err_cls = theme.get("error", "bg-red-900 text-red-200 p-2 text-sm font-mono")
-    img_cls = theme.get("output-image", "max-w-full max-h-96 object-contain")
+    theme = theme or THEME_DARK
+    out_st = theme.get(
+        "output",
+        "background:#1f2937;color:#e5e7eb;padding:0.5rem;font:13px/1.4 ui-monospace,monospace;"
+        "white-space:pre-wrap;border-radius:6px;margin:0.25rem 0;",
+    )
+    err_st = theme.get(
+        "error",
+        "background:#7f1d1d;color:#fecaca;padding:0.5rem;font:13px/1.4 ui-monospace,monospace;"
+        "white-space:pre-wrap;border-radius:6px;margin:0.25rem 0;",
+    )
+    img_st = theme.get(
+        "output-image",
+        "max-width:100%;max-height:24rem;object-fit:contain;display:block;margin:0.5rem 0;",
+    )
 
     chunks: list[str] = []
     for p in parts:
         if p.kind == "stream":
-            chunks.append(f'<pre class="{out_cls}">{html_module.escape(p.text)}</pre>')
+            chunks.append(f'<pre style="{out_st}">{html_module.escape(p.text)}</pre>')
         elif p.kind == "error":
-            chunks.append(f'<pre class="{err_cls}">{html_module.escape(p.text)}</pre>')
+            chunks.append(f'<pre style="{err_st}">{html_module.escape(p.text)}</pre>')
         elif p.kind == "image/png" and p.b64:
             chunks.append(
-                f'<img src="data:image/png;base64,{p.b64}" class="{img_cls}" alt="output"/>'
+                f'<img src="data:image/png;base64,{p.b64}" style="{img_st}" alt="output"/>'
             )
         elif p.kind == "text/html":
             chunks.append(f'<div class="sslive-html">{p.text}</div>')
         elif p.kind == "text/plain":
-            chunks.append(f'<pre class="{out_cls}">{html_module.escape(p.text)}</pre>')
+            chunks.append(f'<pre style="{out_st}">{html_module.escape(p.text)}</pre>')
 
     if not chunks:
-        chunks.append(f'<pre class="{out_cls} opacity-50">(no output)</pre>')
+        chunks.append(f'<pre style="{out_st}opacity:0.5">(no output)</pre>')
 
     inner = "\n".join(chunks)
     return (
@@ -494,8 +505,25 @@ def render_output_html(parts: list[OutputPart], cell_id: str, theme: dict | None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Piece 4 + 5 — Live host + presenter (stubs for next step)
+# Piece 4 + 5 — Live host + presenter (FastHTML / HTMX)
 # ═══════════════════════════════════════════════════════════════════════════
+
+try:
+    from starlette.responses import HTMLResponse, JSONResponse, Response
+except Exception:  # pragma: no cover
+    HTMLResponse = JSONResponse = Response = None  # type: ignore
+
+THEME_DARK = {
+    "bg": "#111827",
+    "fg": "#f3f4f6",
+    "muted": "#9ca3af",
+    "code_bg": "#1f2937",
+    "output": "background:#1f2937;color:#e5e7eb;padding:0.5rem;font:13px/1.4 ui-monospace,monospace;"
+    "white-space:pre-wrap;word-break:break-word;border-radius:6px;margin:0.25rem 0;",
+    "error": "background:#7f1d1d;color:#fecaca;padding:0.5rem;font:13px/1.4 ui-monospace,monospace;"
+    "white-space:pre-wrap;border-radius:6px;margin:0.25rem 0;",
+    "output-image": "max-width:100%;max-height:24rem;object-fit:contain;display:block;margin:0.5rem 0;",
+}
 
 _SESSION: dict[str, Any] = {
     "deck": None,
@@ -503,6 +531,8 @@ _SESSION: dict[str, Any] = {
     "server": None,
     "port": None,
     "app": None,
+    "echo_to_dialog": False,
+    "theme": THEME_DARK,
 }
 
 
@@ -535,25 +565,500 @@ def _ensure_local_magic():
         pass
 
 
+def _note_to_html(source: str) -> str:
+    """Lightweight note render (headers + paragraphs). Full mistletoe later."""
+    lines = (source or "").splitlines()
+    if not lines:
+        return ""
+    first = lines[0].strip()
+    body = "\n".join(lines[1:]).strip()
+    if first.startswith("## "):
+        h = f"<h2 class='slide-h2'>{html_module.escape(first[3:])}</h2>"
+    elif first.startswith("# ") and not first.startswith("### "):
+        h = f"<h1 class='slide-h1'>{html_module.escape(first[2:])}</h1>"
+    else:
+        h = ""
+        body = source
+    if body:
+        # preserve paragraphs
+        paras = []
+        for block in re.split(r"\n\s*\n", body):
+            block = block.strip()
+            if not block:
+                continue
+            if block.startswith(("# ", "## ", "### ")):
+                paras.append(f"<p class='slide-p'>{html_module.escape(block)}</p>")
+            else:
+                paras.append(
+                    f"<p class='slide-p'>{html_module.escape(block).replace(chr(10), '<br/>')}</p>"
+                )
+        return h + "".join(paras)
+    return h
+
+
+def _code_block_html(cell: Cell) -> str:
+    cid = html_module.escape(cell.id)
+    src = html_module.escape(cell.source)
+    collapsed = cell.i_collapsed
+    code_inner = f"<pre class='code-pre'><code>{src}</code></pre>"
+    if collapsed:
+        code_inner = f"<details><summary>Code</summary>{code_inner}</details>"
+    return f"""
+    <div id="el-code-{cid}" class="code-wrap" data-type="code" data-cell-id="{cid}" data-runnable="1"
+         tabindex="0" onclick="selectCell('{cid}')">
+      <div class="code-toolbar">
+        <button type="button" class="run-btn"
+          hx-post="/execute"
+          hx-vals='{{"cell_id": "{cid}"}}'
+          hx-target="#el-output-{cid}"
+          hx-swap="outerHTML"
+          hx-disabled-elt="this"
+          onclick="event.stopPropagation(); selectCell('{cid}')">▶ Run</button>
+        <span class="cell-id">{cid}</span>
+      </div>
+      {code_inner}
+    </div>
+    """
+
+
+def _slide_html(deck: Deck, slide: Slide) -> str:
+    parts: list[str] = []
+    for cid in slide.cell_ids:
+        cell = deck.cells[cid]
+        if cell.kind == "note":
+            eid = html_module.escape(f"el-note-{cid}")
+            parts.append(
+                f'<div id="{eid}" class="note-block" data-el-id="{eid}" data-cell-id="{html_module.escape(cid)}">'
+                f"{_note_to_html(cell.source)}</div>"
+            )
+        else:
+            parts.append(_code_block_html(cell))
+            # always emit output mount (seeded from last outputs / notebook)
+            parts.append(render_output_html(cell.outputs, cell.id, deck.theme or THEME_DARK))
+    cls = "slide title-slide" if slide.is_title else "slide"
+    hidden = " active" if slide.index == 0 else " hidden"
+    return (
+        f'<section class="{cls}{hidden}" data-slide="{slide.index}">'
+        f'{"".join(parts)}</section>'
+    )
+
+
+def generate_presenter_html(deck: Deck, *, backend_label: str = "gpu") -> str:
+    """Full presenter page (custom JS + HTMX). No Reveal.js."""
+    theme = deck.theme or THEME_DARK
+    slides_html = "\n".join(_slide_html(deck, s) for s in deck.slides)
+    n = len(deck.slides)
+    first_code = deck.ordered_code_ids[0] if deck.ordered_code_ids else ""
+
+    css = f"""
+    * {{ box-sizing: border-box; }}
+    html, body {{ margin:0; height:100%; background:{theme.get("bg", "#111")}; color:{theme.get("fg", "#eee")};
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; }}
+    #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
+    #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
+    .slide {{ width:1920px; height:1080px; padding:48px 64px; display:none; flex-direction:column;
+      justify-content:flex-start; align-items:stretch; overflow:auto; gap:12px; }}
+    .slide.active {{ display:flex; }}
+    .slide.hidden {{ display:none; }}
+    .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
+    .slide-h1 {{ font-size:4.5rem; font-weight:700; margin:0 0 1rem; }}
+    .slide-h2 {{ font-size:3rem; font-weight:700; margin:0 0 1rem; }}
+    .slide-p {{ font-size:1.75rem; line-height:1.5; margin:0.5rem 0; color:{theme.get("fg", "#eee")}; }}
+    .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
+      padding:8px 12px; outline:none; }}
+    .code-wrap.selected {{ border-color:#60a5fa; box-shadow:0 0 0 2px rgba(96,165,250,0.35); }}
+    .code-toolbar {{ display:flex; align-items:center; gap:12px; margin-bottom:6px; }}
+    .run-btn {{ cursor:pointer; background:#2563eb; color:white; border:0; border-radius:6px;
+      padding:6px 14px; font-size:14px; font-weight:600; }}
+    .run-btn:hover {{ background:#1d4ed8; }}
+    .run-btn:disabled {{ opacity:0.5; cursor:wait; }}
+    .cell-id {{ font-size:11px; color:{theme.get("muted", "#9ca3af")}; font-family:ui-monospace,monospace; }}
+    .code-pre {{ margin:0; font:14px/1.45 ui-monospace,monospace; white-space:pre-wrap;
+      color:#e5e7eb; overflow:auto; max-height:420px; }}
+    #chrome {{ position:fixed; left:12px; top:12px; z-index:20; display:flex; gap:10px; align-items:center;
+      background:rgba(0,0,0,0.55); color:#fff; padding:6px 12px; border-radius:8px; font-size:13px; }}
+    #chrome .ok {{ color:#86efac; }} #chrome .bad {{ color:#fca5a5; }}
+    #nav {{ position:fixed; right:16px; bottom:16px; z-index:20; display:flex; gap:12px; align-items:center;
+      background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.35;
+      transition:opacity 0.15s; }}
+    #nav:hover {{ opacity:1; }}
+    #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer; padding:0 6px; }}
+    .htmx-request .run-btn, .run-btn.htmx-request {{ opacity:0.6; }}
+    """
+
+    js = f"""
+    let currentSlide = 0;
+    let selectedCellId = {json.dumps(first_code)};
+    const slides = () => document.querySelectorAll('[data-slide]');
+
+    function updateCounter() {{
+      const el = document.getElementById('slide-counter');
+      if (el) el.textContent = (currentSlide + 1) + ' / ' + slides().length;
+    }}
+
+    function selectCell(id) {{
+      selectedCellId = id;
+      document.querySelectorAll('[data-runnable]').forEach(el => {{
+        el.classList.toggle('selected', el.dataset.cellId === id);
+      }});
+    }}
+
+    function showSlide(n) {{
+      const ss = slides();
+      if (!ss.length) return;
+      ss[currentSlide]?.classList.remove('active');
+      ss[currentSlide]?.classList.add('hidden');
+      currentSlide = Math.max(0, Math.min(n, ss.length - 1));
+      ss[currentSlide].classList.remove('hidden');
+      ss[currentSlide].classList.add('active');
+      updateCounter();
+      const first = ss[currentSlide].querySelector('[data-runnable]');
+      if (first) selectCell(first.dataset.cellId);
+    }}
+
+    async function runSelected() {{
+      if (!selectedCellId) return;
+      const btn = document.querySelector(
+        '[data-runnable][data-cell-id="' + selectedCellId + '"] .run-btn');
+      if (btn) btn.click();
+    }}
+
+    document.addEventListener('keydown', (e) => {{
+      if (e.key === 'ArrowRight') {{ e.preventDefault(); showSlide(currentSlide + 1); }}
+      if (e.key === 'ArrowLeft')  {{ e.preventDefault(); showSlide(currentSlide - 1); }}
+      if (e.key === 'Enter' && e.shiftKey) {{ e.preventDefault(); runSelected(); }}
+      if (e.key === 'f' && !e.metaKey && !e.ctrlKey) {{
+        document.documentElement.requestFullscreen?.();
+      }}
+      if (e.key === 'ArrowDown') {{
+        document.querySelector('[data-slide].active')?.scrollBy({{ top: 100, behavior: 'smooth' }});
+      }}
+      if (e.key === 'ArrowUp') {{
+        document.querySelector('[data-slide].active')?.scrollBy({{ top: -100, behavior: 'smooth' }});
+      }}
+    }});
+
+    document.getElementById('prev-btn')?.addEventListener('click', () => showSlide(currentSlide - 1));
+    document.getElementById('next-btn')?.addEventListener('click', () => showSlide(currentSlide + 1));
+
+    // scale 1920x1080 stage to viewport
+    (() => {{
+      const DESIGN_W = 1920, DESIGN_H = 1080;
+      const stage = document.getElementById('stage');
+      const viewport = document.getElementById('viewport');
+      function rescale() {{
+        const vw = viewport.clientWidth, vh = viewport.clientHeight;
+        const scale = Math.min(vw / DESIGN_W, vh / DESIGN_H);
+        stage.style.transform = 'scale(' + scale + ')';
+        stage.style.left = ((vw - DESIGN_W * scale) / 2) + 'px';
+        stage.style.top = ((vh - DESIGN_H * scale) / 2) + 'px';
+      }}
+      new ResizeObserver(rescale).observe(viewport);
+      rescale();
+    }})();
+
+    async function refreshStatus() {{
+      try {{
+        const r = await fetch('/status');
+        const j = await r.json();
+        const el = document.getElementById('status-badge');
+        if (!el) return;
+        el.textContent = (j.backend || '?') + (j.busy ? ' · busy' : ' · idle')
+          + (j.kernel_ok ? '' : ' · kernel down');
+        el.className = j.kernel_ok ? 'ok' : 'bad';
+      }} catch (e) {{}}
+    }}
+    setInterval(refreshStatus, 3000);
+    refreshStatus();
+    if (selectedCellId) selectCell(selectedCellId);
+    updateCounter();
+    """
+
+    empty = ""
+    if n == 0:
+        empty = (
+            "<section class='slide active' data-slide='0'>"
+            "<h2 class='slide-h2'>No slides</h2>"
+            "<p class='slide-p'>Add a note with exactly <code>#| s</code>, "
+            "then <code>#</code> / <code>##</code> content below it. "
+            "Re-run <code>await slive()</code>.</p></section>"
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>sslive</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>{css}</style>
+</head>
+<body>
+  <div id="chrome">
+    <strong>sslive</strong>
+    <span id="status-badge" class="ok">{html_module.escape(backend_label)}</span>
+    <span style="opacity:0.7">Shift+Enter run · ←/→ slides · f fullscreen</span>
+  </div>
+  <div id="viewport">
+    <div id="stage">
+      <div id="slides-container">
+        {slides_html or empty}
+      </div>
+    </div>
+  </div>
+  <div id="nav">
+    <button type="button" id="prev-btn" aria-label="Previous">‹</button>
+    <span id="slide-counter">1 / {max(n, 1)}</span>
+    <button type="button" id="next-btn" aria-label="Next">›</button>
+  </div>
+  <script>{js}</script>
+</body>
+</html>
+"""
+
+
+def _do_execute(cell_id: str) -> tuple[str, dict[str, str], int]:
+    """Run cell; return (html, headers, status_code)."""
+    deck: Deck | None = _SESSION.get("deck")
+    executor: LiveExecutor | None = _SESSION.get("executor")
+    theme = _SESSION.get("theme") or THEME_DARK
+    headers = {
+        "X-Slive-Backend": "gpu",
+        "X-Slive-Cell": cell_id or "",
+    }
+    if not deck or not executor:
+        html = render_output_html(
+            [OutputPart(kind="error", text="sslive not initialized — await slive() first")],
+            cell_id or "unknown",
+            theme,
+        )
+        headers["X-Slive-Ok"] = "0"
+        return html, headers, 503
+
+    if not cell_id or cell_id not in deck.cells or deck.cells[cell_id].kind != "code":
+        html = render_output_html(
+            [OutputPart(kind="error", text=f"unknown code cell_id: {cell_id!r}")],
+            cell_id or "unknown",
+            theme,
+        )
+        headers["X-Slive-Ok"] = "0"
+        return html, headers, 400
+
+    echo = bool(_SESSION.get("echo_to_dialog", False))
+    result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo)
+    if result.error and not result.parts:
+        parts = [OutputPart(kind="error", text=result.error)]
+    else:
+        parts = list(result.parts)
+        if result.error:
+            parts.append(OutputPart(kind="error", text=result.error))
+    html = render_output_html(parts, cell_id, theme)
+    headers["X-Slive-Ok"] = "1" if result.ok else "0"
+    headers["X-Slive-Ms"] = str(result.duration_ms)
+    return html, headers, 200 if result.ok or result.parts else 500
+
+
+def _ensure_live_server() -> int:
+    """Start singleton FastHTML+JupyUvi (or uvicorn) server. Returns port."""
+    if _SESSION.get("server") is not None and _SESSION.get("port"):
+        return int(_SESSION["port"])
+
+    if FastHTML is None:
+        raise RuntimeError("fasthtml not available — install python-fasthtml in SolveIt")
+
+    port = _pick_port(8100, 50)
+    app = FastHTML(hdrs=())
+
+    @app.get("/")
+    def home():
+        deck = _SESSION.get("deck") or Deck()
+        ex = _SESSION.get("executor") or LiveExecutor()
+        ok, msg = ex.kernel_ok()
+        label = f"gpu · {msg}" if ok else f"gpu · {msg}"
+        html = generate_presenter_html(deck, backend_label=label)
+        if HTMLResponse is not None:
+            return HTMLResponse(html)
+        return html
+
+    @app.get("/status")
+    def status():
+        deck = _SESSION.get("deck")
+        ex = _SESSION.get("executor") or LiveExecutor()
+        ok, msg = ex.kernel_ok()
+        payload = {
+            "backend": "gpu",
+            "busy": bool(getattr(ex, "busy", False)),
+            "kernel_ok": ok,
+            "kernel_msg": msg,
+            "slides": len(deck.slides) if deck else 0,
+            "code_cells": len(deck.ordered_code_ids) if deck else 0,
+            "port": _SESSION.get("port"),
+        }
+        if JSONResponse is not None:
+            return JSONResponse(payload)
+        return payload
+
+    async def execute(req=None, cell_id: str = ""):
+        # Accept form, query, or JSON body (HTMX hx-vals → form by default)
+        cid = cell_id
+        if req is not None and not cid:
+            try:
+                form = await req.form()
+                cid = form.get("cell_id") or ""
+            except Exception:
+                pass
+            if not cid:
+                try:
+                    body = await req.json()
+                    cid = (body or {}).get("cell_id") or ""
+                except Exception:
+                    pass
+            if not cid:
+                cid = req.query_params.get("cell_id") or ""
+
+        # GPU execute is blocking — keep event loop free
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        html, headers, code = await loop.run_in_executor(None, lambda: _do_execute(str(cid)))
+        if HTMLResponse is not None:
+            return HTMLResponse(html, status_code=code, headers=headers)
+        return html
+
+    # Register POST with request object for form parsing
+    try:
+        from starlette.requests import Request
+
+        @app.post("/execute")
+        async def execute_route(request: Request):
+            return await execute(req=request)
+
+    except Exception:
+
+        @app.post("/execute")
+        async def execute_route(cell_id: str = ""):
+            return await execute(cell_id=cell_id)
+
+    @app.post("/interrupt")
+    def interrupt():
+        ex = _SESSION.get("executor")
+        ok = bool(ex and ex.interrupt())
+        payload = {"ok": ok, "backend": "gpu"}
+        if JSONResponse is not None:
+            return JSONResponse(payload)
+        return payload
+
+    if JupyUvi is not None:
+        srv = JupyUvi(app, port=port)
+    else:
+        # Fallback: uvicorn in a daemon thread
+        import uvicorn
+
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+        srv = uvicorn.Server(config)
+        t = threading.Thread(target=srv.run, daemon=True)
+        t.start()
+        # wait briefly for bind
+        for _ in range(50):
+            if not _port_free(port):
+                break
+            time.sleep(0.05)
+
+    _SESSION["app"] = app
+    _SESSION["server"] = srv
+    _SESSION["port"] = port
+    return port
+
+
+def sstop() -> None:
+    """Stop the live presenter server (best-effort)."""
+    srv = _SESSION.get("server")
+    if srv is None:
+        print("sslive: no server running")
+        return
+    try:
+        if hasattr(srv, "stop"):
+            srv.stop()
+        elif hasattr(srv, "should_exit"):
+            srv.should_exit = True
+    except Exception as e:
+        print(f"sslive: stop error: {e}")
+    _SESSION["server"] = None
+    _SESSION["app"] = None
+    _SESSION["port"] = None
+    print("sslive: server stopped")
+
+
+def _show_presenter(port: int, height: str = "720px"):
+    """Embed presenter in SolveIt dialog."""
+    url = f"http://127.0.0.1:{port}/"
+    if HTMX is not None and _SESSION.get("app") is not None:
+        try:
+            # HTMX helper from fasthtml.jupyter — may expect a route path
+            display(IFrame(src=url, width="100%", height=height))  # type: ignore
+            return
+        except Exception:
+            pass
+    if display is not None and IFrame is not None:
+        display(
+            IFrame(
+                src=url,
+                width="100%",
+                height=height,
+            )
+        )
+    else:
+        print(f"sslive presenter: open {url}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Piece 6 — Entry
 # ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class LiveSession:
+    port: int
+    backend: str = "gpu"
+    deck: Deck | None = None
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/"
+
+    def status(self) -> dict:
+        ex = _SESSION.get("executor") or LiveExecutor()
+        ok, msg = ex.kernel_ok()
+        d = _SESSION.get("deck")
+        return {
+            "port": self.port,
+            "url": self.url,
+            "backend": self.backend,
+            "kernel_ok": ok,
+            "kernel_msg": msg,
+            "slides": len(d.slides) if d else 0,
+            "code_cells": len(d.ordered_code_ids) if d else 0,
+            "busy": bool(getattr(ex, "busy", False)),
+        }
+
+    def stop(self) -> None:
+        sstop()
+
 
 async def slive(
     theme: str | dict = "dark",
     *,
     height: str = "720px",
     echo_to_dialog: bool = False,
+    embed: bool = True,
 ):
-    """Start foundation session: load deck, verify GPU, print status.
+    """Load deck, start live host, embed presenter.
 
     dialoghelper APIs are async — call from SolveIt as::
 
         %local
         await slive()
 
-    Full presenter host is the next implementation step. For now this proves
-    loader + executor wiring and skips the launcher cell (D6).
+    Controls (click iframe first): ←/→ slides, Shift+Enter run, f fullscreen.
     """
     _ensure_local_magic()
 
@@ -563,21 +1068,29 @@ async def slive(
         print("Load CRAFT and run %gpu, then call await slive() again under %local.")
         return None
 
-    deck = await build_deck(theme=theme if isinstance(theme, dict) else {})
+    theme_dict = theme if isinstance(theme, dict) else dict(THEME_DARK)
+    deck = await build_deck(theme=theme_dict)
     executor = LiveExecutor()
     _SESSION["deck"] = deck
     _SESSION["executor"] = executor
     _SESSION["echo_to_dialog"] = echo_to_dialog
+    _SESSION["theme"] = theme_dict
+
+    port = _ensure_live_server()
+    session = LiveSession(port=port, backend="gpu", deck=deck)
 
     n_code = len(deck.ordered_code_ids)
     print(
-        f"sslive foundation: {len(deck.slides)} slides, {n_code} code cells, "
-        f"backend=gpu ({msg})"
+        f"sslive: {len(deck.slides)} slides, {n_code} code cells, "
+        f"backend=gpu ({msg}) → {session.url}"
     )
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
-    print("Headless run:  run_cell('<cell_id>')  or  run_cell_index(0)")
-    print("Presenter host (GET / + POST /execute) — next step.")
+    print("Click the preview, then: ←/→ navigate · Shift+Enter run · f fullscreen")
+    print("Headless still works: run_cell_index(0)")
+
+    if embed:
+        _show_presenter(port, height=height)
 
     # D6 — hide launcher from dialog context
     if update_msg is not None:
@@ -589,11 +1102,11 @@ async def slive(
         except Exception:
             pass
 
-    return deck
+    return session
 
 
 def run_cell(cell_id: str, *, echo_to_dialog: bool | None = None) -> ExecResult:
-    """Foundation proof: execute one code cell on GPU by id, print summary."""
+    """Execute one code cell on GPU by id; also updates deck outputs for presenter."""
     deck: Deck | None = _SESSION.get("deck")
     executor: LiveExecutor | None = _SESSION.get("executor")
     if deck is None or executor is None:
@@ -636,11 +1149,14 @@ __all__ = [
     "Element",
     "OutputPart",
     "LiveExecutor",
+    "LiveSession",
     "build_deck",
     "slive",
+    "sstop",
     "run_cell",
     "run_cell_index",
     "deck_summary",
     "render_output_html",
+    "generate_presenter_html",
     "get_craft_exec_mgr",
 ]
