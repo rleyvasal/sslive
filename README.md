@@ -12,7 +12,8 @@ RISE-like live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https:/
 | Sync source → SolveIt dialog cell | ✅ |
 | Stay on current slide in **fullscreen** | ✅ |
 | Preview mode keep-focus after Run | ✅ pre-emptive focus guard (see below) |
-| Move/size/font/order elements (S2-A API) | ✅ `await set_layout(...)` — drag UI next (S2-B) |
+| Move/size/font/order elements (S2-A API) | ✅ `await set_layout(...)` |
+| Edit mode: drag/nudge **in the slide** (S2-B) | ✅ press `e` |
 
 ## Usage
 
@@ -62,5 +63,16 @@ Layout is design-space px on the 1920×1080 stage; overrides persist in a
 hidden `#| sslive-layout` note in the dialog (auto-created, `skipped=1`).
 Example: `await set_layout('el-output-_abc123', x=1000, y=400, w=700)` moves
 that screenshot/output block live — no rebuild, focus stays put.
+
+### Edit mode (in the slide)
+
+Press **`e`** (or the ✎ nav button): elements get dashed outlines.
+**Drag** notes/outputs anywhere; **code cells drag by their toolbar strip**
+(textarea/Run keep working). Click selects; **arrows nudge 1px**
+(Shift = 10px); **Esc** deselects, then exits. A plain click never changes
+an element's layout mode — only actual movement pins it. Every drop/nudge
+flows through the bridge into the overlay and persists to the dialog
+(debounced, focus-guarded). First drag of a flow element freezes its
+current width so the text keeps its wrap.
 
 Keep driver cells under **`%local`**.

@@ -319,6 +319,7 @@ async def build_deck(
 LAYOUT_MARKER = "#| sslive-layout"
 _UNSET = object()
 _ALIGN_VALUES = {"left", "center", "right", "justify"}
+_LAYOUT_KEYS = ("x", "y", "w", "h", "z", "order", "fs", "ff", "align")
 _FF_SAFE_RE = re.compile(r"[^\w\s,'\"-]")
 
 
@@ -444,6 +445,37 @@ def _layout_spec(deck: "Deck | None", el_id: str) -> dict:
     return spec if isinstance(spec, dict) else {}
 
 
+def _apply_layout_patch(deck: "Deck", el_id: str, patch: dict) -> dict:
+    """Merge a validated patch into the overlay; returns the new spec.
+
+    ``None`` values clear keys; unknown keys are dropped. Shared by
+    ``set_layout`` (Python API) and the slide edit-mode bridge (S2-B),
+    so both paths sanitize identically.
+    """
+    els = deck.layout.setdefault("elements", {})
+    spec = dict(els.get(el_id) or {})
+    for k, v in (patch or {}).items():
+        if k not in _LAYOUT_KEYS:
+            continue
+        if v is None:
+            spec.pop(k, None)
+        elif k in ("z", "order"):
+            spec[k] = int(v)
+        elif k == "ff":
+            spec[k] = str(v)
+        elif k == "align":
+            if v not in _ALIGN_VALUES:
+                raise ValueError(f"align must be one of {sorted(_ALIGN_VALUES)}")
+            spec[k] = v
+        else:
+            spec[k] = float(v)
+    if spec:
+        els[el_id] = spec
+    else:
+        els.pop(el_id, None)
+    return spec
+
+
 def _css_len(v: Any) -> str | None:
     try:
         f = float(v)
@@ -556,31 +588,13 @@ async def set_layout(
         raise RuntimeError("Call await slive() first")
     if el_id not in deck.elements:
         raise KeyError(f"unknown element {el_id!r} — see layout_ids() for options")
-    els = deck.layout.setdefault("elements", {})
-    spec = dict(els.get(el_id) or {})
     updates = {
         "x": x, "y": y, "w": w, "h": h, "z": z,
         "order": order, "fs": fs, "ff": ff, "align": align,
     }
-    for k, v in updates.items():
-        if v is _UNSET:
-            continue
-        if v is None:
-            spec.pop(k, None)
-        elif k in ("z", "order"):
-            spec[k] = int(v)
-        elif k == "ff":
-            spec[k] = str(v)
-        elif k == "align":
-            if v not in _ALIGN_VALUES:
-                raise ValueError(f"align must be one of {sorted(_ALIGN_VALUES)}")
-            spec[k] = v
-        else:
-            spec[k] = float(v)
-    if spec:
-        els[el_id] = spec
-    else:
-        els.pop(el_id, None)
+    spec = _apply_layout_patch(
+        deck, el_id, {k: v for k, v in updates.items() if v is not _UNSET}
+    )
     _push_layout(el_id)
     if save:
         _schedule_layout_save()
@@ -953,6 +967,7 @@ def _code_block_html(cell: Cell, *, style: str = "") -> str:
          data-cell-id="{cid}" data-runnable="1"{_style_attr(style)}
          tabindex="0" onclick="selectCell('{cid}')">
       <div class="code-toolbar">
+        <span class="drag-grip" data-drag-for="el-code-{cid}" title="drag to move">⠿</span>
         <button type="button" class="run-btn" data-cell-id="{cid}"
           onclick="event.stopPropagation(); runCellFromSlide('{raw_id}')">▶ Run</button>
         <span class="cell-id">{cid}</span>
@@ -1061,6 +1076,19 @@ def generate_presenter_html(
       transition:opacity 0.15s; }}
     #nav:hover {{ opacity:1; }}
     #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer; padding:0 6px; }}
+    /* ── edit mode (S2-B): outlines + drag affordances ── */
+    #edit-btn.on {{ color:#f59e0b; }}
+    #edit-badge {{ display:none; color:#f59e0b; font-weight:600; }}
+    body.editing #edit-badge {{ display:inline; }}
+    body.editing .note-block, body.editing [data-type="output"] {{
+      outline:1px dashed rgba(96,165,250,0.5); outline-offset:2px; cursor:move; }}
+    body.editing .code-wrap {{ outline:1px dashed rgba(96,165,250,0.5); outline-offset:2px; }}
+    body.editing .el-editsel {{ outline:2px solid #f59e0b; outline-offset:2px; }}
+    body.editing img {{ -webkit-user-drag:none; user-drag:none; }}
+    body.editing .code-toolbar {{ cursor:move; }}
+    .drag-grip {{ display:none; cursor:move; user-select:none; color:#9ca3af;
+      font-size:18px; padding:2px 6px; touch-action:none; }}
+    body.editing .drag-grip {{ display:inline-block; }}
     """
 
     js = f"""
@@ -1160,6 +1188,127 @@ def generate_presenter_html(
       el.style.cssText = msg.style || '';
     }}
 
+    // ── S2-B edit mode: select / drag / nudge → layout patches to parent ──
+    let editing = false;
+    let editSel = null;
+    let drag = null;
+    let nudgeTimer = null;
+
+    function setEditing(on) {{
+      editing = !!on;
+      document.body.classList.toggle('editing', editing);
+      document.getElementById('edit-btn')?.classList.toggle('on', editing);
+      if (!editing) selectEl(null);
+    }}
+
+    function selectEl(el) {{
+      if (editSel) editSel.classList.remove('el-editsel');
+      editSel = el || null;
+      if (editSel) editSel.classList.add('el-editsel');
+    }}
+
+    function sendLayoutPatch(elId, patch) {{
+      try {{
+        window.parent.postMessage(
+          {{ type: 'sslive_layout', el_id: elId, patch: patch, t: Date.now() }}, '*');
+      }} catch (e) {{}}
+    }}
+
+    function ensureAbs(el) {{
+      // Pin a flow element at its current visual spot (no jump); freeze the
+      // rendered width so text keeps its wrap after leaving the flex flow.
+      const slide = el.closest('[data-slide]');
+      const sr = slide.getBoundingClientRect();
+      const er = el.getBoundingClientRect();
+      const sc = sr.width / 1920 || 1;
+      const converted = el.style.position !== 'absolute';
+      const x = Math.round((er.left - sr.left) / sc);
+      const y = Math.round((er.top - sr.top) / sc);
+      const w = Math.round(er.width / sc);
+      if (converted) {{
+        el.style.width = w + 'px';
+        el.style.position = 'absolute';
+        el.style.margin = '0';
+      }}
+      el.style.left = x + 'px';
+      el.style.top = y + 'px';
+      return {{ x: x, y: y, w: w, converted: converted }};
+    }}
+
+    function beginDrag(el, ev) {{
+      // Conversion to absolute is deferred to the first real movement —
+      // a plain click must not change the element's layout mode.
+      const slide = el.closest('[data-slide]');
+      const sc = slide ? (slide.getBoundingClientRect().width / 1920 || 1) : 1;
+      drag = {{ el: el, elId: el.dataset.elId || el.id, sx: ev.clientX, sy: ev.clientY,
+               ox: 0, oy: 0, w: 0, includeW: false, sc: sc, started: false }};
+      ev.preventDefault();
+      try {{ el.setPointerCapture(ev.pointerId); }} catch (e) {{}}
+    }}
+
+    function nudgeSel(dx, dy) {{
+      if (!editSel) return;
+      const cur = ensureAbs(editSel);
+      const nx = cur.x + dx, ny = cur.y + dy;
+      editSel.style.left = nx + 'px';
+      editSel.style.top = ny + 'px';
+      const elId = editSel.dataset.elId || editSel.id;
+      const patch = {{ x: nx, y: ny }};
+      if (cur.converted) patch.w = cur.w;
+      clearTimeout(nudgeTimer);
+      nudgeTimer = setTimeout(() => sendLayoutPatch(elId, patch), 350);
+    }}
+
+    document.addEventListener('pointerdown', (e) => {{
+      if (!editing || e.button !== 0) return;
+      const grip = e.target.closest('.drag-grip');
+      if (grip) {{
+        const el = document.getElementById(grip.dataset.dragFor);
+        if (el) {{ selectEl(el); beginDrag(el, e); }}
+        return;
+      }}
+      // interactive bits keep working while editing
+      if (e.target.closest('textarea, button, a, input, select')) return;
+      // code cells drag by their toolbar strip (big target; textarea untouched)
+      const tb = e.target.closest('.code-toolbar');
+      if (tb) {{
+        const cw = tb.closest('.code-wrap');
+        if (cw) {{ selectEl(cw); beginDrag(cw, e); return; }}
+      }}
+      const el = e.target.closest('.note-block, [data-type="output"]');
+      if (el) {{ selectEl(el); beginDrag(el, e); return; }}
+      const cw = e.target.closest('.code-wrap');
+      selectEl(cw || null);  // code body: select only; move via toolbar/arrows
+    }}, true);
+
+    document.addEventListener('pointermove', (e) => {{
+      if (!drag) return;
+      if (!drag.started) {{
+        if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) <= 2) return;
+        const start = ensureAbs(drag.el);
+        drag.ox = start.x; drag.oy = start.y;
+        drag.w = start.w; drag.includeW = start.converted;
+        drag.started = true;
+      }}
+      drag.el.style.left = (drag.ox + (e.clientX - drag.sx) / drag.sc) + 'px';
+      drag.el.style.top = (drag.oy + (e.clientY - drag.sy) / drag.sc) + 'px';
+    }});
+
+    document.addEventListener('pointerup', (e) => {{
+      if (!drag) return;
+      if (drag.started) {{
+        const patch = {{
+          x: Math.round(parseFloat(drag.el.style.left) || 0),
+          y: Math.round(parseFloat(drag.el.style.top) || 0)
+        }};
+        if (drag.includeW) patch.w = drag.w;
+        sendLayoutPatch(drag.elId, patch);
+      }}
+      drag = null;
+    }});
+
+    document.addEventListener('dragstart', (e) => {{ if (editing) e.preventDefault(); }});
+
     window.addEventListener('message', function (e) {{
       if (!e.data) return;
       if (e.data.type === 'sslive_result') applyRunResult(e.data);
@@ -1211,6 +1360,23 @@ def generate_presenter_html(
         if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') return;
         return;
       }}
+      if (e.key === 'e' && !e.metaKey && !e.ctrlKey && !e.altKey) {{
+        setEditing(!editing);
+        return;
+      }}
+      if (e.key === 'Escape' && editing) {{
+        if (editSel) selectEl(null); else setEditing(false);
+        return;
+      }}
+      if (editing && editSel && e.key.startsWith('Arrow')) {{
+        e.preventDefault();
+        const step = e.shiftKey ? 10 : 1;
+        if (e.key === 'ArrowLeft')  nudgeSel(-step, 0);
+        if (e.key === 'ArrowRight') nudgeSel(step, 0);
+        if (e.key === 'ArrowUp')    nudgeSel(0, -step);
+        if (e.key === 'ArrowDown')  nudgeSel(0, step);
+        return;
+      }}
       if (e.key === 'ArrowRight') {{ e.preventDefault(); showSlide(currentSlide + 1); }}
       if (e.key === 'ArrowLeft')  {{ e.preventDefault(); showSlide(currentSlide - 1); }}
       if (e.key === 'Enter' && e.shiftKey) {{ e.preventDefault(); runSelected(); }}
@@ -1227,6 +1393,7 @@ def generate_presenter_html(
 
     document.getElementById('prev-btn')?.addEventListener('click', () => showSlide(currentSlide - 1));
     document.getElementById('next-btn')?.addEventListener('click', () => showSlide(currentSlide + 1));
+    document.getElementById('edit-btn')?.addEventListener('click', () => setEditing(!editing));
 
     (() => {{
       const DESIGN_W = 1920, DESIGN_H = 1080;
@@ -1276,7 +1443,8 @@ def generate_presenter_html(
   <div id="chrome">
     <strong>sslive</strong>
     <span id="status-badge" class="ok">{html_module.escape(backend_label)}</span>
-    <span style="opacity:0.7">Shift+Enter run · ←/→ slides · f fullscreen</span>
+    <span id="edit-badge">✎ edit</span>
+    <span style="opacity:0.7">Shift+Enter run · ←/→ slides · f fullscreen · e edit</span>
   </div>
   <div id="viewport">
     <div id="stage">
@@ -1286,6 +1454,7 @@ def generate_presenter_html(
     </div>
   </div>
   <div id="nav">
+    <button type="button" id="edit-btn" title="edit layout (e)" aria-label="Edit layout">✎</button>
     <button type="button" id="prev-btn" aria-label="Previous">‹</button>
     <span id="slide-counter">1 / {max(n, 1)}</span>
     <button type="button" id="next-btn" aria-label="Next">›</button>
@@ -1946,6 +2115,21 @@ if (!window.__sslive_bridge) {
     });
   });
 }
+// Layout patch queue (S2-B): edit-mode drag/nudge patches from the slide.
+// Own flag so it installs on pages that already have an older bridge.
+if (!window.__sslive_layout_bridge_v1) {
+  window.__sslive_layout_bridge_v1 = true;
+  window.__sslive_layout_q = window.__sslive_layout_q || [];
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || d.type !== 'sslive_layout' || !d.el_id) return;
+    window.__sslive_layout_q.push({
+      el_id: String(d.el_id),
+      patch: d.patch || {},
+      t: d.t || Date.now()
+    });
+  });
+}
 // Focus guard: pre-empt SolveIt's focus/scroll-on-update after update_msg.
 // Armed from Python (window.__sslive_guard_until) just before dialog
 // write-back. Real user gestures in the dialog always win (see __sslive_user_ts).
@@ -2047,49 +2231,92 @@ async def _call_js_eval(expr: str) -> Any:
     return res
 
 
-async def _drain_slide_queue() -> list[dict]:
-    """Pull pending {cell_id, source} runs from the parent page queue."""
-    if js_eval is None and js_eval_a is None:
+def _item_dicts(seq: Any, fields: tuple[str, ...]) -> list[dict]:
+    """Normalize js_eval list items (dict or AttrDict-ish) to plain dicts."""
+    if seq is None:
         return []
+    if isinstance(seq, dict):
+        seq = [seq]
+    if not (hasattr(seq, "__iter__") and not isinstance(seq, (str, bytes))):
+        return []
+    out: list[dict] = []
+    for item in seq:
+        if isinstance(item, dict):
+            out.append(item)
+        elif any(hasattr(item, f) for f in fields):
+            out.append({f: getattr(item, f, None) for f in fields})
+    return out
+
+
+async def _drain_slide_queue() -> tuple[list[dict], list[dict]]:
+    """Pull pending (runs, layout patches) from the parent page queues.
+
+    One js_eval round-trip drains both ``__sslive_q`` (Run requests) and
+    ``__sslive_layout_q`` (edit-mode drag/nudge patches).
+    """
+    if js_eval is None and js_eval_a is None:
+        return [], []
     try:
         res = await _call_js_eval(
-            "const q = (window.__sslive_q || []).slice(); "
+            "const r = (window.__sslive_q || []).slice(); "
             "window.__sslive_q = []; "
-            "return q;"
+            "const l = (window.__sslive_layout_q || []).slice(); "
+            "window.__sslive_layout_q = []; "
+            "return {runs: r, layouts: l};"
         )
         q = _parse_js_eval_result(res)
         if q is None:
-            return []
-        # list-like
-        if hasattr(q, "__iter__") and not isinstance(q, (str, bytes, dict)):
-            items = list(q)
-            out = []
-            for item in items:
-                if isinstance(item, dict):
-                    out.append(item)
-                elif hasattr(item, "cell_id"):
-                    out.append(
-                        {
-                            "cell_id": getattr(item, "cell_id", None),
-                            "source": getattr(item, "source", ""),
-                        }
-                    )
-            return out
-        if isinstance(q, dict) and q.get("cell_id"):
-            return [q]
-        return []
+            return [], []
+        if isinstance(q, dict) and ("runs" in q or "layouts" in q):
+            runs_raw, layouts_raw = q.get("runs"), q.get("layouts")
+        elif hasattr(q, "runs") or hasattr(q, "layouts"):
+            runs_raw, layouts_raw = getattr(q, "runs", None), getattr(q, "layouts", None)
+        else:  # old bridge on the page: bare run list
+            runs_raw, layouts_raw = q, None
+        return (
+            _item_dicts(runs_raw, ("cell_id", "source", "slide_index")),
+            _item_dicts(layouts_raw, ("el_id", "patch", "t")),
+        )
     except Exception as e:
         if _SESSION.get("_bridge_err") != str(e):
             _SESSION["_bridge_err"] = str(e)
             print(f"sslive: bridge poll error: {e}")
-        return []
+        return [], []
+
+
+def _apply_slide_layout_patches(items: list[dict]) -> int:
+    """Apply edit-mode patches from the slide to the overlay + persist.
+
+    No ``_push_layout`` echo — the iframe DOM already shows the dragged
+    position; pushing back could fight a drag still in progress.
+    """
+    deck: Deck | None = _SESSION.get("deck")
+    if deck is None or not items:
+        return 0
+    n = 0
+    for it in items:
+        el_id = str(it.get("el_id") or "")
+        if not el_id or el_id not in deck.elements:
+            continue
+        patch = it.get("patch") or {}
+        try:
+            _apply_layout_patch(deck, el_id, dict(patch))
+            n += 1
+        except Exception as e:
+            _SESSION["_layout_patch_err"] = f"{el_id}: {e}"
+    if n:
+        _schedule_layout_save()
+    return n
 
 
 async def _bridge_poll_loop() -> None:
-    """Background: apply in-slide Run requests (GPU + in-place UI only)."""
+    """Background: apply in-slide Run requests + edit-mode layout patches."""
     while _SESSION.get("bridge_active"):
         try:
-            pending = await _drain_slide_queue()
+            pending, layout_patches = await _drain_slide_queue()
+            # layout first: a Run in the same batch re-renders the output
+            # block and must see the just-dragged position
+            _apply_slide_layout_patches(layout_patches)
             for item in pending:
                 if not isinstance(item, dict):
                     continue
@@ -2138,7 +2365,8 @@ async def pump_slide_runs(max_items: int = 20) -> int:
     """Manually drain in-slide Run queue (if background poll is not running)."""
     n = 0
     for _ in range(max_items):
-        pending = await _drain_slide_queue()
+        pending, layout_patches = await _drain_slide_queue()
+        _apply_slide_layout_patches(layout_patches)
         if not pending:
             break
         for item in pending:

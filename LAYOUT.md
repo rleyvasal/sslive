@@ -78,7 +78,11 @@ Overlay keyed by `el_id` (absent = flow layout, today's behavior):
    (deviation: overlay lives on `Deck.layout` as a JSON-shaped dict rather than
    on `Element` fields — lossless round-trip, unknown el_ids survive; `Element.x/y`
    stay reserved-unused)
-2. **S2-B** edit mode: select, drag, nudge; round-trip persist; reload survives
+2. **S2-B** edit mode: select, drag, nudge; round-trip persist; reload survives — **done**
+   (refinements: code cells drag by the whole toolbar strip, not just the ⠿ grip;
+   flow→absolute conversion deferred to first real movement so plain clicks
+   never change layout mode; nudge patches debounced 350 ms; no `_push_layout`
+   echo for slide-originated patches — the DOM already shows the result)
 3. **S2-C** toolbar: font size/family, resize, z-order, flow reorder
 4. **S2-D** finer note-block elements (mistletoe path), image polish
 5. later: reveal-order fragments (`fragment_step` reserved), undo/redo,
