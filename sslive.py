@@ -32,20 +32,34 @@ from typing import Any, Callable, Literal
 
 # ── optional SolveIt / FastHTML imports (available inside SolveIt) ───────────
 try:
-    from dialoghelper.core import find_msgs, curr_dialog, update_msg
+    from dialoghelper.core import find_msgs, curr_dialog, update_msg, js_eval
 except Exception:  # pragma: no cover - outside SolveIt
-    find_msgs = curr_dialog = update_msg = None
+    find_msgs = curr_dialog = update_msg = js_eval = None
 
 try:
-    from IPython.display import display, IFrame, clear_output, DisplayHandle
+    from IPython.display import display, IFrame, clear_output, DisplayHandle, HTML as IPyHTML
     from IPython import get_ipython
 except Exception:  # pragma: no cover
-    display = IFrame = clear_output = DisplayHandle = get_ipython = None
+    display = IFrame = clear_output = DisplayHandle = IPyHTML = get_ipython = None
 
 try:
     import ipywidgets as widgets
 except Exception:  # pragma: no cover
     widgets = None
+    # best-effort install once (SolveIt often lacks ipywidgets)
+    try:
+        import subprocess
+        import sys
+
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "ipywidgets"],
+            check=False,
+            capture_output=True,
+            timeout=120,
+        )
+        import ipywidgets as widgets  # noqa: F811
+    except Exception:
+        widgets = None
 
 try:
     from fasthtml.common import (
@@ -1239,12 +1253,137 @@ def _run_and_refresh(
     return result
 
 
+def _dom_editor_id(i: int) -> str:
+    return f"sslive-ed-{i}"
+
+
+def _show_html_editors(deck: Deck) -> None:
+    """Always-available editable textareas (no ipywidgets).
+
+    Edit in the browser; pull text into Python with::
+
+        await run_editor(0)   # read DOM → GPU run → refresh slides
+        await save_editor(0)  # read DOM → write-back to dialog
+    """
+    if display is None or IPyHTML is None:
+        print("sslive: cannot display HTML editors (no IPython.display)")
+        return
+
+    index_map: dict[int, str] = {}
+    blocks: list[str] = [
+        """
+        <div style="font:14px system-ui;color:#e5e7eb;margin:8px 0 4px">
+          <b>Editable cells</b> — type in the boxes below, then run in a cell:
+          <code style="background:#1f2937;padding:2px 6px;border-radius:4px">await run_editor(0)</code>
+          or
+          <code style="background:#1f2937;padding:2px 6px;border-radius:4px">await save_editor(0)</code>
+        </div>
+        """
+    ]
+    for i, cid in enumerate(deck.ordered_code_ids):
+        index_map[i] = cid
+        eid = _dom_editor_id(i)
+        src = html_module.escape(deck.cells[cid].source)
+        n_lines = max(4, min(18, deck.cells[cid].source.count("\n") + 3))
+        h = max(88, n_lines * 20)
+        blocks.append(
+            f"""
+<div style="border:1px solid #374151;border-radius:8px;padding:10px 12px;margin:10px 0;
+            background:#0b1220;color:#e5e7eb;font-family:system-ui,sans-serif">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+    <span style="font-size:13px;color:#9ca3af">Code cell {i}</span>
+    <code style="font-size:11px;color:#6b7280">{html_module.escape(cid)}</code>
+  </div>
+  <textarea id="{eid}" data-sslive-cell="{html_module.escape(cid)}" data-sslive-i="{i}"
+    spellcheck="false"
+    style="width:100%;height:{h}px;box-sizing:border-box;resize:vertical;
+           font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+           background:#1f2937;color:#f3f4f6;border:1px solid #4b5563;
+           border-radius:6px;padding:10px">{src}</textarea>
+  <div style="margin-top:8px;font-size:12px;color:#9ca3af">
+    After editing:
+    <code style="background:#1f2937;padding:2px 6px;border-radius:4px">await run_editor({i})</code>
+    ·
+    <code style="background:#1f2937;padding:2px 6px;border-radius:4px">await save_editor({i})</code>
+  </div>
+  <div id="sslive-out-{i}" style="margin-top:8px"></div>
+</div>
+"""
+        )
+    _SESSION["editor_index"] = index_map
+    display(IPyHTML("".join(blocks)))
+    print(
+        "sslive: HTML editors ready — edit the text boxes, then "
+        "`await run_editor(0)` (GPU) or `await save_editor(0)` (dialog only)."
+    )
+
+
+async def _read_dom_editor(i: int = 0) -> tuple[str, str]:
+    """Return (cell_id, source) from the HTML textarea via dialoghelper.js_eval."""
+    deck = _SESSION.get("deck")
+    if deck is None:
+        raise RuntimeError("Call await slive() first")
+    index_map = _SESSION.get("editor_index") or {
+        j: c for j, c in enumerate(deck.ordered_code_ids)
+    }
+    if i not in index_map:
+        raise IndexError(
+            f"editor index {i} out of range (0..{len(deck.ordered_code_ids) - 1})"
+        )
+    cid = index_map[i]
+    eid = _dom_editor_id(i)
+
+    # Prefer live DOM (user edits); fall back to deck source
+    src = None
+    if js_eval is not None:
+        try:
+            res = await js_eval(
+                f"const el=document.getElementById({json.dumps(eid)}); "
+                f"if(!el) throw new Error('editor not found'); return el.value;"
+            )
+            if res is not None:
+                if isinstance(res, dict):
+                    src = res.get("result", res.get("data"))
+                elif hasattr(res, "result"):
+                    src = res.result
+                else:
+                    src = res
+        except Exception as e:
+            print(f"sslive: js_eval read failed ({e}); using deck source")
+    if src is None:
+        # widget path
+        editors = _SESSION.get("editors") or {}
+        if cid in editors:
+            src = editors[cid].value
+        else:
+            src = deck.cells[cid].source
+            print(
+                "sslive: could not read live editor DOM — using last deck source. "
+                "Keep the editor HTML visible and ensure dialoghelper.js_eval works."
+            )
+    return cid, str(src)
+
+
+async def run_editor(i: int = 0, *, write_back: bool | None = None) -> ExecResult:
+    """Read HTML/widget editor ``i``, run on GPU, refresh slides."""
+    cid, source = await _read_dom_editor(i)
+    return run_cell(cid, source=source, write_back=write_back)
+
+
+async def save_editor(i: int = 0) -> str:
+    """Read editor ``i`` and write-back to SolveIt dialog (no execute)."""
+    cid, source = await _read_dom_editor(i)
+    set_cell_source(cid, source, write_back=True)
+    refresh_presenter()
+    print(f"sslive: saved editor {i} → dialog {cid} ({len(source)} chars)")
+    return cid
+
+
 def _show_kernel_controls() -> None:
     """Editable code cells + Run (kernel-side — works on cloud SolveIt).
 
-    Each code cell gets a textarea (SolveIt-like edit surface). Run uses the
-    current editor text → deck → CRAFT GPU → refresh slides. Optional write-back
-    updates the dialog message via dialoghelper.update_msg.
+    Prefers ipywidgets when available; always falls back to plain HTML
+    textareas + ``await run_editor(i)`` (dialoghelper.js_eval).
     """
     deck: Deck | None = _SESSION.get("deck")
     if deck is None or not deck.ordered_code_ids:
@@ -1252,125 +1391,90 @@ def _show_kernel_controls() -> None:
     if display is None:
         return
 
+    # Always show HTML editors (visible, editable, no ipywidgets required)
+    _show_html_editors(deck)
+
     if widgets is None:
-        print("sslive: install ipywidgets for editable cells, or use:")
-        print("  set_cell_source(cell_id, 'print(1)')")
-        print("  run_cell(cell_id)")
-        for i, cid in enumerate(deck.ordered_code_ids):
-            print(f"  run_cell_index({i})  # {cid}")
         return
 
-    editors: dict[str, Any] = {}
-    _SESSION["editors"] = editors
-
-    header = widgets.HTML(
-        value=(
-            "<div style='font:14px system-ui;margin:4px 0 8px'>"
-            "<b>Editable cells</b> — edit like SolveIt, then <b>▶ Run</b> "
-            "(GPU via CRAFT). Changes update the slide deck"
-            + (
-                " and write back to the dialog."
-                if _SESSION.get("write_back", True)
-                else "."
+    # Optional: also offer widget buttons that re-read DOM via stored values
+    # (widgets.Textarea is nicer when package works)
+    try:
+        editors: dict[str, Any] = {}
+        _SESSION["editors"] = editors
+        cell_boxes = []
+        for i, cid in enumerate(deck.ordered_code_ids):
+            cell = deck.cells[cid]
+            n_lines = max(3, min(20, cell.source.count("\n") + 2))
+            ta = widgets.Textarea(
+                value=cell.source,
+                description="",
+                layout=widgets.Layout(
+                    width="100%",
+                    height=f"{max(72, n_lines * 22)}px",
+                ),
             )
-            + "</div>"
-        )
-    )
-
-    cell_boxes = []
-    for i, cid in enumerate(deck.ordered_code_ids):
-        cell = deck.cells[cid]
-        n_lines = max(3, min(20, cell.source.count("\n") + 2))
-        ta = widgets.Textarea(
-            value=cell.source,
-            description="",
-            layout=widgets.Layout(
-                width="100%",
-                height=f"{max(72, n_lines * 22)}px",
-                border="1px solid #374151",
-                font_family="ui-monospace, SFMono-Regular, Menlo, monospace",
-            ),
-            style={"description_width": "0px"},
-        )
-        editors[cid] = ta
-        status = widgets.HTML(value=f"<code style='opacity:0.7'>{html_module.escape(cid)}</code>")
-        run_btn = widgets.Button(
-            description="▶ Run",
-            button_style="primary",
-            layout=widgets.Layout(width="6em"),
-        )
-        save_btn = widgets.Button(
-            description="💾 Save",
-            tooltip="Write source back to SolveIt dialog (no execute)",
-            layout=widgets.Layout(width="6em"),
-        )
-        out_preview = widgets.HTML(value="")
-
-        def _on_run(
-            _btn,
-            cell_id=cid,
-            editor=ta,
-            st=status,
-            prev=out_preview,
-        ):
-            r = _run_and_refresh(cell_id, source=editor.value, status_widget=st)
-            # show last stream/text under the editor
-            bits = []
-            for p in r.parts:
-                if p.kind in ("stream", "text/plain") and p.text:
-                    bits.append(
-                        f"<pre style='margin:4px 0;padding:8px;background:#1f2937;"
-                        f"color:#e5e7eb;border-radius:6px;white-space:pre-wrap'>"
-                        f"{html_module.escape(p.text)}</pre>"
-                    )
-                elif p.kind == "error" and p.text:
-                    bits.append(
-                        f"<pre style='margin:4px 0;padding:8px;background:#7f1d1d;"
-                        f"color:#fecaca;border-radius:6px;white-space:pre-wrap'>"
-                        f"{html_module.escape(p.text)}</pre>"
-                    )
-                elif p.kind == "image/png" and p.b64:
-                    bits.append(
-                        f"<img src='data:image/png;base64,{p.b64}' "
-                        f"style='max-width:100%;max-height:240px'/>"
-                    )
-            prev.value = "".join(bits) or "<span style='opacity:0.5'>(no output)</span>"
-
-        def _on_save(_btn, cell_id=cid, editor=ta, st=status):
-            set_cell_source(cell_id, editor.value, write_back=True)
-            st.value = (
-                f"<span style='color:#86efac'>saved → dialog "
-                f"<code>{html_module.escape(cell_id)}</code></span>"
+            editors[cid] = ta
+            status = widgets.HTML(
+                value=f"<code style='opacity:0.7'>{html_module.escape(cid)}</code>"
             )
-            refresh_presenter()
+            run_btn = widgets.Button(description="▶ Run", button_style="primary")
+            save_btn = widgets.Button(description="💾 Save")
+            out_preview = widgets.HTML(value="")
 
-        run_btn.on_click(_on_run)
-        save_btn.on_click(_on_save)
+            def _on_run(
+                _btn,
+                cell_id=cid,
+                editor=ta,
+                st=status,
+                prev=out_preview,
+            ):
+                r = _run_and_refresh(cell_id, source=editor.value, status_widget=st)
+                bits = []
+                for p in r.parts:
+                    if p.kind in ("stream", "text/plain") and p.text:
+                        bits.append(
+                            f"<pre style='margin:4px 0;padding:8px;background:#1f2937;"
+                            f"color:#e5e7eb;border-radius:6px;white-space:pre-wrap'>"
+                            f"{html_module.escape(p.text)}</pre>"
+                        )
+                    elif p.kind == "error" and p.text:
+                        bits.append(
+                            f"<pre style='margin:4px 0;padding:8px;background:#7f1d1d;"
+                            f"color:#fecaca;border-radius:6px;white-space:pre-wrap'>"
+                            f"{html_module.escape(p.text)}</pre>"
+                        )
+                    elif p.kind == "image/png" and p.b64:
+                        bits.append(
+                            f"<img src='data:image/png;base64,{p.b64}' "
+                            f"style='max-width:100%;max-height:240px'/>"
+                        )
+                prev.value = "".join(bits) or "<span style='opacity:0.5'>(no output)</span>"
 
-        title = widgets.HTML(
-            value=(
-                f"<div style='font:13px system-ui;color:#9ca3af;margin-top:10px'>"
-                f"Code cell {i} · edit below</div>"
+            def _on_save(_btn, cell_id=cid, editor=ta, st=status):
+                set_cell_source(cell_id, editor.value, write_back=True)
+                st.value = (
+                    f"<span style='color:#86efac'>saved → dialog "
+                    f"<code>{html_module.escape(cell_id)}</code></span>"
+                )
+                refresh_presenter()
+
+            run_btn.on_click(_on_run)
+            save_btn.on_click(_on_save)
+            cell_boxes.append(
+                widgets.VBox(
+                    [
+                        widgets.HTML(f"<b>Widget editor {i}</b> (optional)"),
+                        widgets.HBox([run_btn, save_btn, status]),
+                        ta,
+                        out_preview,
+                    ]
+                )
             )
-        )
-        toolbar = widgets.HBox([run_btn, save_btn, status])
-        box = widgets.VBox(
-            [title, toolbar, ta, out_preview],
-            layout=widgets.Layout(
-                border="1px solid #1f2937",
-                padding="8px 10px",
-                margin="0 0 10px 0",
-                width="100%",
-            ),
-        )
-        cell_boxes.append(box)
-
-    refresh_btn = widgets.Button(description="↻ Refresh slides only")
-    refresh_btn.on_click(lambda _b: refresh_presenter())
-    display(widgets.VBox([header, *cell_boxes, refresh_btn]))
-    print(
-        "sslive: editable cells ready — edit text, ▶ Run (GPU), 💾 Save (dialog write-back)."
-    )
+        display(widgets.VBox(cell_boxes))
+        print("sslive: ipywidgets editors also available.")
+    except Exception as e:
+        print(f"sslive: ipywidgets UI skipped ({e})")
 
 
 def _show_presenter(port: int | None, height: str = "720px"):
@@ -1614,6 +1718,8 @@ __all__ = [
     "deck_summary",
     "refresh_presenter",
     "set_cell_source",
+    "run_editor",
+    "save_editor",
     "render_output_html",
     "generate_presenter_html",
     "get_craft_exec_mgr",

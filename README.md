@@ -54,17 +54,17 @@ Requires a note cell with exactly `#| s`, then `#` / `##` slide content below it
 
 **Presenter:** slides are embedded with **srcdoc** (works on cloud SolveIt).  
 
-**Editable cells:** under the deck, each code cell is an **ipywidgets textarea** (edit like SolveIt).  
-- **▶ Run** — uses the editor text → GPU (CRAFT) → refreshes slides + shows output  
-- **💾 Save** — write source back to the SolveIt dialog (`update_msg`) without running  
-- Default `write_back=True` also saves on Run  
+**Editable cells:** HTML textareas under the deck (no ipywidgets required).  
+The slide iframe is view-only; **edit the boxes below**.
 
 ```python
-await slive()                    # editors + slides
-await slive(write_back=False)    # edit/run only; don't touch dialog
-run_cell_index(0)                # runs current editor text if present
-set_cell_source(cell_id, "…")    # programmatic edit
+await slive()
+# edit the textarea under the slides, then:
+await run_editor(0)    # read editor → GPU (CRAFT) → refresh slides
+await save_editor(0)   # read editor → write-back to SolveIt dialog
 ```
+
+If ipywidgets is installed you also get ▶ Run / 💾 Save buttons.
 
 **Important:** keep `slive` / `run_cell_*` under `%local`.
 
