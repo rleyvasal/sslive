@@ -625,7 +625,7 @@ def _code_block_html(cell: Cell) -> str:
         <button type="button" class="run-btn" data-cell-id="{cid}"
           onclick="event.stopPropagation(); runCellFromSlide('{raw_id}')">▶ Run</button>
         <span class="cell-id">{cid}</span>
-        <span class="hint">edit here · Shift+Enter run · syncs to SolveIt</span>
+        <span class="hint">edit here · Shift+Enter run · GPU</span>
       </div>
       <textarea class="code-ta" id="ta-{cid}" data-cell-id="{cid}"
         spellcheck="false" rows="{n_lines}"
@@ -1334,42 +1334,36 @@ def _run_and_refresh(
 
 
 async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
-    """Slide edit → GPU → in-place output. Dialog write-back is deferred.
+    """Slide edit → GPU → in-place output only.
 
-    ``update_msg`` often makes SolveIt re-render the dialog and **destroys** the
-    presentation iframe (exits fullscreen, jumps to title). So we:
-      1) run + push UI immediately
-      2) write-back in the background after a delay
+    **Do not** call ``update_msg`` here. SolveIt's dialog write-back re-renders
+    the page, steals focus to the code cell, exits fullscreen, and rebuilds the
+    preview (title slide). Deck memory stays the live source during the talk;
+    call ``await sync_dialog()`` when you want to push sources into dialog cells.
     """
     if slide_index is not None:
         _SESSION["slide_index"] = int(slide_index)
     _apply_source_to_deck(cell_id, source)
-    # 1) GPU + in-place UI only (no full refresh)
-    result = _run_and_refresh(cell_id, source=source, full_refresh=False)
+    return _run_and_refresh(cell_id, source=source, full_refresh=False)
 
-    # 2) Deferred dialog sync so presentation chrome is not blown away mid-run
-    if _SESSION.get("write_back", True):
 
-        async def _deferred_write():
-            await asyncio.sleep(1.0)
-            ok = await write_back_cell(cell_id, source)
-            if ok:
-                print(f"sslive: synced slide source → dialog {cell_id} (deferred)")
-            # Do NOT refresh_presenter here — update_msg may re-render the dialog
-            # and destroy the iframe; rebuilding would jump slides / exit fullscreen.
-            # Re-push last result so a surviving iframe still shows outputs.
-            try:
-                push_slide_result(cell_id, result, source=source)
-            except Exception:
-                pass
+async def sync_dialog() -> int:
+    """Write current deck code sources into SolveIt dialog cells.
 
-        try:
-            asyncio.get_running_loop().create_task(_deferred_write())
-        except RuntimeError:
-            ok = await write_back_cell(cell_id, source)
-            if ok:
-                print(f"sslive: synced slide source → dialog {cell_id}")
-    return result
+    Call **after** presenting if you need dialog cells to match slide edits.
+    May move focus in the SolveIt UI (host behavior).
+    """
+    deck = _SESSION.get("deck")
+    if deck is None:
+        raise RuntimeError("Call await slive() first")
+    n = 0
+    for cid in deck.ordered_code_ids:
+        src = deck.cells[cid].source
+        if await write_back_cell(cid, src):
+            n += 1
+            print(f"sslive: dialog sync {cid} ({len(src)} chars)")
+    print(f"sslive: synced {n}/{len(deck.ordered_code_ids)} code cells → dialog")
+    return n
 
 
 def _install_parent_bridge() -> None:
@@ -1566,13 +1560,17 @@ def _show_run_panel(deck: Deck) -> None:
     html = """
 <div style="font:14px system-ui;color:#e5e7eb;margin:10px 0;padding:12px 14px;
             background:#0b1220;border:1px solid #374151;border-radius:8px">
-  <b>RISE-style:</b> click the slide iframe → edit the code box →
-  <b>▶ Run</b> or <b>Shift+Enter</b>.
-  That updates the <b>SolveIt cell</b> (one source) and runs on <b>GPU</b>.
+  <b>RISE-style:</b> click the slide iframe → edit code →
+  <b>▶ Run</b> / <b>Shift+Enter</b> → runs on <b>GPU</b>, updates output in place.
   <div style="margin-top:8px;font-size:12px;color:#9ca3af">
+    During the talk, the <b>slide is the live source</b> (auto dialog write-back is off —
+    it made SolveIt steal focus and reset the preview).
+    After presenting: <code>await sync_dialog()</code> to copy sources into dialog cells.
+  </div>
+  <div style="margin-top:6px;font-size:12px;color:#9ca3af">
     Fallback: <code>await run_cell_index(0)</code>
     · <code>await reload_deck()</code>
-    · <code>await pump_slide_runs()</code> if Run seems stuck
+    · <code>await pump_slide_runs()</code>
   </div>
 </div>
 """
@@ -1708,9 +1706,10 @@ async def slive(
     )
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
-    _SESSION.setdefault("write_back", True)
-    print("In-slide: edit code · ▶ Run / Shift+Enter · GPU + sync to SolveIt")
-    print("Navigate: ←/→ · f fullscreen (outputs update in place — slide stays put)")
+    _SESSION["write_back"] = False  # never auto update_msg during present (kills fullscreen)
+    print("In-slide: edit code · ▶ Run / Shift+Enter · GPU (deck is live source)")
+    print("Navigate: ←/→ · f fullscreen — stays put; outputs update in place")
+    print("After talk (optional): await sync_dialog()  # push sources into SolveIt cells")
 
     if embed:
         _show_presenter(port, height=height)
@@ -1733,17 +1732,12 @@ async def run_cell(
     *,
     source: str | None = None,
     reload_from_dialog: bool = False,
-    write_back: bool = True,
     echo_to_dialog: bool | None = None,
     refresh: bool = True,
 ) -> ExecResult:
-    """Run a code cell on GPU.
+    """Run a code cell on GPU (in-place slide update; no dialog write-back).
 
-    Prefer **in-slide edit + ▶**. This is the fallback / programmatic API.
-
-    - ``source=``: use this text (and optionally write back to dialog)
-    - ``reload_from_dialog=True``: re-read SolveIt cell first
-    - default: use in-memory deck source
+    Prefer **in-slide edit + ▶**. For dialog sync after the talk: ``await sync_dialog()``.
     """
     deck: Deck | None = _SESSION.get("deck")
     executor: LiveExecutor | None = _SESSION.get("executor")
@@ -1761,13 +1755,11 @@ async def run_cell(
     old = _SESSION.get("echo_to_dialog")
     _SESSION["echo_to_dialog"] = echo_to_dialog
     try:
-        if source is not None and write_back:
+        if source is not None:
             result = await _sync_and_run(cell_id, source)
         elif refresh:
             result = _run_and_refresh(cell_id, source=source)
         else:
-            if source is not None:
-                _apply_source_to_deck(cell_id, source)
             result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo_to_dialog)
             print(
                 f"run_cell({cell_id!r}): ok={result.ok} parts={len(result.parts)} "
@@ -1838,6 +1830,7 @@ __all__ = [
     "reload_deck",
     "fetch_dialog_source",
     "write_back_cell",
+    "sync_dialog",
     "pump_slide_runs",
     "deck_summary",
     "refresh_presenter",
