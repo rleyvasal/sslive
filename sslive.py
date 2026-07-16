@@ -40,12 +40,13 @@ try:
         find_msgs,
         curr_dialog,
         update_msg,
+        add_msg,
         read_msg,
         js_eval,
         iife,
     )
 except Exception:  # pragma: no cover - outside SolveIt
-    find_msgs = curr_dialog = update_msg = read_msg = js_eval = iife = None
+    find_msgs = curr_dialog = update_msg = add_msg = read_msg = js_eval = iife = None
 
 # Prefer async variant when present (dialoghelper also has sync js_eval)
 try:
@@ -121,6 +122,10 @@ class Deck:
     elements: dict[str, Element] = field(default_factory=dict)
     theme: dict = field(default_factory=dict)
     ordered_code_ids: list[str] = field(default_factory=list)
+    # S2 layout overlay: {"version":1, "elements":{el_id: spec}, "deck":{}}.
+    # Kept JSON-shaped (not on Element) so unknown el_ids survive cell deletion
+    # and the whole thing round-trips to the hidden dialog message untouched.
+    layout: dict = field(default_factory=lambda: _empty_layout())
 
     def code_source(self, cell_id: str) -> str:
         c = self.cells[cell_id]
@@ -294,7 +299,325 @@ async def build_deck(
 
         deck.slides.append(slide)
 
+    try:
+        deck.layout = await load_layout()
+    except Exception as e:
+        print(f"sslive: layout load failed ({e}) — starting with empty overlay")
+
     return deck
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Piece 2b — Layout overlay (S2-A): position/size/font/order per element
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Coordinates are design-space px (1920×1080 stage); the presenter scale
+# transform makes them viewport-independent. Persisted as JSON in a hidden
+# dialog note starting with `#| sslive-layout` (skipped=1 keeps it out of
+# both the slides loader and the LLM context).
+
+LAYOUT_MARKER = "#| sslive-layout"
+_UNSET = object()
+_ALIGN_VALUES = {"left", "center", "right", "justify"}
+_FF_SAFE_RE = re.compile(r"[^\w\s,'\"-]")
+
+
+def _empty_layout() -> dict:
+    return {"version": 1, "elements": {}, "deck": {}}
+
+
+def _normalize_layout(data: Any) -> dict:
+    lay = _empty_layout()
+    if isinstance(data, dict):
+        els = data.get("elements")
+        if isinstance(els, dict):
+            lay["elements"] = {
+                str(k): dict(v) for k, v in els.items() if isinstance(v, dict)
+            }
+        dk = data.get("deck")
+        if isinstance(dk, dict):
+            lay["deck"] = dict(dk)
+    return lay
+
+
+def _layout_msg_content(layout: dict) -> str:
+    return LAYOUT_MARKER + "\n" + json.dumps(layout, indent=1)
+
+
+def _parse_layout_msg(content: str) -> dict | None:
+    """Overlay dict if ``content`` is a layout message, else None."""
+    if not content or not content.lstrip().startswith(LAYOUT_MARKER):
+        return None
+    body = content.lstrip()[len(LAYOUT_MARKER):]
+    try:
+        return _normalize_layout(json.loads(body))
+    except Exception:
+        return None
+
+
+async def _find_layout_msg() -> tuple[str, dict] | None:
+    """(msg_id, overlay) for the hidden layout note, if the dialog has one."""
+    if find_msgs is None:
+        return None
+    try:
+        for m in await find_msgs():
+            if m.get("msg_type") != "note":
+                continue
+            lay = _parse_layout_msg(m.get("content", "") or "")
+            if lay is not None:
+                return m["id"], lay
+    except Exception as e:
+        print(f"sslive: layout lookup failed: {e}")
+    return None
+
+
+async def load_layout() -> dict:
+    """Read the layout overlay from the dialog (empty overlay when absent)."""
+    found = await _find_layout_msg()
+    if found is None:
+        _SESSION.pop("layout_msg_id", None)
+        return _empty_layout()
+    mid, lay = found
+    _SESSION["layout_msg_id"] = mid
+    return lay
+
+
+async def save_layout(layout: dict | None = None) -> bool:
+    """Persist the overlay into the hidden dialog note (created if missing)."""
+    if layout is None:
+        deck = _SESSION.get("deck")
+        layout = deck.layout if deck is not None else _empty_layout()
+    if update_msg is None:
+        return False
+    content = _layout_msg_content(layout)
+    _arm_focus_guard(2000)  # update_msg would steal focus in preview otherwise
+    mid = _SESSION.get("layout_msg_id")
+    if mid:
+        try:
+            await update_msg(id=mid, content=content)
+            return True
+        except Exception as e:
+            print(f"sslive: layout save to {mid} failed ({e}); re-finding message")
+            _SESSION.pop("layout_msg_id", None)
+    found = await _find_layout_msg()
+    if found is not None:
+        _SESSION["layout_msg_id"] = found[0]
+        await update_msg(id=found[0], content=content)
+        return True
+    if add_msg is None:
+        return False
+    new_id = await add_msg(content, placement="at_start")
+    _SESSION["layout_msg_id"] = new_id
+    try:
+        await update_msg(id=new_id, skipped=1)
+    except Exception:
+        pass
+    return True
+
+
+def _schedule_layout_save(delay: float = 0.5) -> None:
+    """Debounced ``save_layout`` — one dialog write per editing burst."""
+    prev = _SESSION.get("_layout_save_task")
+    if prev is not None and not prev.done():
+        prev.cancel()
+
+    async def _later():
+        try:
+            await asyncio.sleep(delay)
+            await save_layout()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            _SESSION["_layout_save_err"] = str(e)
+
+    try:
+        _SESSION["_layout_save_task"] = asyncio.get_running_loop().create_task(_later())
+    except RuntimeError:  # no loop (headless tests) — persistence is moot there
+        _SESSION["_layout_save_task"] = None
+
+
+def _layout_spec(deck: "Deck | None", el_id: str) -> dict:
+    if deck is None:
+        return {}
+    els = (deck.layout or {}).get("elements") or {}
+    spec = els.get(el_id)
+    return spec if isinstance(spec, dict) else {}
+
+
+def _css_len(v: Any) -> str | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f"{int(f)}" if f.is_integer() else f"{f:g}"
+
+
+def _el_style(spec: dict) -> str:
+    """Inline CSS for one element's layout spec (values sanitized).
+
+    ``--code-fs`` mirrors ``fs`` so the code textarea follows too (its own
+    font-size reads that var; ``ff`` is never applied to code — stays mono).
+    """
+    if not spec:
+        return ""
+    parts: list[str] = []
+    x, y = spec.get("x"), spec.get("y")
+    if x is not None or y is not None:
+        parts.append("position:absolute")
+        parts.append(f"left:{_css_len(x) or 0}px")
+        parts.append(f"top:{_css_len(y) or 0}px")
+        parts.append("margin:0")
+    for key, prop in (("w", "width"), ("h", "height")):
+        v = _css_len(spec.get(key))
+        if v is not None:
+            parts.append(f"{prop}:{v}px")
+    for key, prop in (("z", "z-index"), ("order", "order")):
+        try:
+            if spec.get(key) is not None:
+                parts.append(f"{prop}:{int(spec[key])}")
+        except (TypeError, ValueError):
+            pass
+    fs = _css_len(spec.get("fs"))
+    if fs is not None:
+        parts.append(f"font-size:{fs}px")
+        parts.append(f"--code-fs:{fs}px")
+    ff = spec.get("ff")
+    if ff:
+        parts.append(f"font-family:{_FF_SAFE_RE.sub('', str(ff))}")
+    align = spec.get("align")
+    if align in _ALIGN_VALUES:
+        parts.append(f"text-align:{align}")
+    return ";".join(parts) + (";" if parts else "")
+
+
+def _style_attr(style: str) -> str:
+    """`` style="…"`` fragment (or empty) — escaped for the HTML attribute."""
+    return f' style="{html_module.escape(style)}"' if style else ""
+
+
+def _push_layout(el_id: str) -> None:
+    """Apply one element's overlay style in the live iframe (no rebuild)."""
+    deck = _SESSION.get("deck")
+    seq = int(_SESSION.get("_layout_push_seq") or int(time.time() * 1000)) + 1
+    _SESSION["_layout_push_seq"] = seq
+    payload = {
+        "type": "sslive_layout_apply",
+        "el_id": el_id,
+        "style": _el_style(_layout_spec(deck, el_id)),
+        "t": seq,
+    }
+    if iife is None:
+        return
+    js = f"""
+(function() {{
+  var msg = {json.dumps(payload)};
+  window.__sslive_last_layout = msg;
+  document.querySelectorAll('iframe').forEach(function(f) {{
+    try {{ f.contentWindow.postMessage(msg, '*'); }} catch (e) {{}}
+  }});
+}})();
+"""
+    try:
+        iife(js)
+    except Exception as e:
+        _SESSION["_last_push_err"] = str(e)
+
+
+async def set_layout(
+    el_id: str,
+    *,
+    x: Any = _UNSET,
+    y: Any = _UNSET,
+    w: Any = _UNSET,
+    h: Any = _UNSET,
+    z: Any = _UNSET,
+    order: Any = _UNSET,
+    fs: Any = _UNSET,
+    ff: Any = _UNSET,
+    align: Any = _UNSET,
+    save: bool = True,
+) -> dict:
+    """Position/style one slide element. Design space is 1920×1080 px.
+
+    ::
+
+        await set_layout('el-note-_abc123', x=120, y=80, w=800, fs=36)
+        await set_layout('el-output-_def456', x=1100, y=200, w=700)
+        await set_layout('el-note-_abc123', x=None, y=None)  # back to flow
+
+    Omit a param to leave it unchanged; pass ``None`` to clear it.
+    ``x``/``y`` position absolutely; without them the element stays in flow
+    and ``order`` controls its flex position. ``fs`` px, ``ff`` CSS family,
+    ``z`` stacking, ``align`` left/center/right/justify.
+    Applied live in the iframe; persisted (debounced) to the dialog.
+    """
+    deck: Deck | None = _SESSION.get("deck")
+    if deck is None:
+        raise RuntimeError("Call await slive() first")
+    if el_id not in deck.elements:
+        raise KeyError(f"unknown element {el_id!r} — see layout_ids() for options")
+    els = deck.layout.setdefault("elements", {})
+    spec = dict(els.get(el_id) or {})
+    updates = {
+        "x": x, "y": y, "w": w, "h": h, "z": z,
+        "order": order, "fs": fs, "ff": ff, "align": align,
+    }
+    for k, v in updates.items():
+        if v is _UNSET:
+            continue
+        if v is None:
+            spec.pop(k, None)
+        elif k in ("z", "order"):
+            spec[k] = int(v)
+        elif k == "ff":
+            spec[k] = str(v)
+        elif k == "align":
+            if v not in _ALIGN_VALUES:
+                raise ValueError(f"align must be one of {sorted(_ALIGN_VALUES)}")
+            spec[k] = v
+        else:
+            spec[k] = float(v)
+    if spec:
+        els[el_id] = spec
+    else:
+        els.pop(el_id, None)
+    _push_layout(el_id)
+    if save:
+        _schedule_layout_save()
+    return spec
+
+
+async def clear_layout(el_id: str | None = None, *, save: bool = True) -> int:
+    """Remove layout overrides for one element (or all when ``el_id`` is None)."""
+    deck: Deck | None = _SESSION.get("deck")
+    if deck is None:
+        raise RuntimeError("Call await slive() first")
+    els = deck.layout.setdefault("elements", {})
+    targets = [el_id] if el_id else list(els)
+    n = 0
+    for eid in targets:
+        if els.pop(eid, None) is not None:
+            n += 1
+        _push_layout(eid)
+    if save and n:
+        _schedule_layout_save()
+    return n
+
+
+def layout_ids(deck: "Deck | None" = None) -> list[str]:
+    """Element ids for ``set_layout``, annotated with kind/slide (* = has overrides)."""
+    deck = deck or _SESSION.get("deck")
+    if deck is None:
+        return []
+    overrides = (deck.layout or {}).get("elements") or {}
+    out: list[str] = []
+    for slide in deck.slides:
+        for cid in slide.cell_ids:
+            for eid in deck.cells[cid].element_ids:
+                el = deck.elements[eid]
+                mark = " *" if overrides.get(eid) else ""
+                out.append(f"{eid}  [{el.kind}, slide {slide.index}]{mark}")
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -477,7 +800,9 @@ class LiveExecutor:
 # Output → HTML fragment (presenter swap target)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def render_output_html(parts: list[OutputPart], cell_id: str, theme: dict | None = None) -> str:
+def render_output_html(
+    parts: list[OutputPart], cell_id: str, theme: dict | None = None, *, style: str = ""
+) -> str:
     """Return HTML for #el-output-{cell_id}. No FastHTML required."""
     theme = theme or THEME_DARK
     out_st = theme.get(
@@ -514,9 +839,10 @@ def render_output_html(parts: list[OutputPart], cell_id: str, theme: dict | None
         chunks.append(f'<pre style="{out_st}opacity:0.5">(no output)</pre>')
 
     inner = "\n".join(chunks)
+    eid = html_module.escape(f"el-output-{cell_id}")
     return (
-        f'<div id="el-output-{html_module.escape(cell_id)}" '
-        f'data-type="output" data-cell-id="{html_module.escape(cell_id)}">'
+        f'<div id="{eid}" data-el-id="{eid}" '
+        f'data-type="output" data-cell-id="{html_module.escape(cell_id)}"{_style_attr(style)}>'
         f"{inner}</div>"
     )
 
@@ -613,7 +939,7 @@ def _note_to_html(source: str) -> str:
     return h
 
 
-def _code_block_html(cell: Cell) -> str:
+def _code_block_html(cell: Cell, *, style: str = "") -> str:
     """In-slide editable code (textarea) + Run — RISE-style."""
     cid = html_module.escape(cell.id)
     # raw id for JS (safe: dialog ids are alphanumeric + underscore)
@@ -623,7 +949,8 @@ def _code_block_html(cell: Cell) -> str:
     # ~1.45em line height in code-ta
     ta_h = max(72, int(n_lines * 22))
     return f"""
-    <div id="el-code-{cid}" class="code-wrap" data-type="code" data-cell-id="{cid}" data-runnable="1"
+    <div id="el-code-{cid}" class="code-wrap" data-el-id="el-code-{cid}" data-type="code"
+         data-cell-id="{cid}" data-runnable="1"{_style_attr(style)}
          tabindex="0" onclick="selectCell('{cid}')">
       <div class="code-toolbar">
         <button type="button" class="run-btn" data-cell-id="{cid}"
@@ -646,14 +973,23 @@ def _slide_html(deck: Deck, slide: Slide, *, active: bool = False) -> str:
         cell = deck.cells[cid]
         if cell.kind == "note":
             eid = html_module.escape(f"el-note-{cid}")
+            style = _el_style(_layout_spec(deck, f"el-note-{cid}"))
             parts.append(
-                f'<div id="{eid}" class="note-block" data-el-id="{eid}" data-cell-id="{html_module.escape(cid)}">'
+                f'<div id="{eid}" class="note-block" data-el-id="{eid}" '
+                f'data-cell-id="{html_module.escape(cid)}"{_style_attr(style)}>'
                 f"{_note_to_html(cell.source)}</div>"
             )
         else:
-            parts.append(_code_block_html(cell))
+            parts.append(
+                _code_block_html(cell, style=_el_style(_layout_spec(deck, f"el-code-{cid}")))
+            )
             # always emit output mount (seeded from last outputs / notebook)
-            parts.append(render_output_html(cell.outputs, cell.id, deck.theme or THEME_DARK))
+            parts.append(
+                render_output_html(
+                    cell.outputs, cell.id, deck.theme or THEME_DARK,
+                    style=_el_style(_layout_spec(deck, f"el-output-{cid}")),
+                )
+            )
     cls = "slide title-slide" if slide.is_title else "slide"
     hidden = " active" if active else " hidden"
     return (
@@ -690,13 +1026,17 @@ def generate_presenter_html(
     #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
     #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
     .slide {{ width:1920px; height:1080px; padding:48px 64px; display:none; flex-direction:column;
-      justify-content:flex-start; align-items:stretch; overflow:auto; gap:12px; }}
+      justify-content:flex-start; align-items:stretch; overflow:auto; gap:12px; position:relative; }}
     .slide.active {{ display:flex; }}
     .slide.hidden {{ display:none; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
-    .slide-h1 {{ font-size:4.5rem; font-weight:700; margin:0 0 1rem; }}
-    .slide-h2 {{ font-size:3rem; font-weight:700; margin:0 0 1rem; }}
-    .slide-p {{ font-size:1.75rem; line-height:1.5; margin:0.5rem 0; color:{theme.get("fg", "#eee")}; }}
+    /* note typography in em off .note-block so one font-size override (layout
+       overlay `fs`) scales headings + body proportionally; defaults unchanged
+       (28px base: 2.5714em≈72px h1, 1.7143em≈48px h2 — the old rem values) */
+    .note-block {{ font-size:1.75rem; }}
+    .slide-h1 {{ font-size:2.5714em; font-weight:700; margin:0 0 1rem; }}
+    .slide-h2 {{ font-size:1.7143em; font-weight:700; margin:0 0 1rem; }}
+    .slide-p {{ font-size:1em; line-height:1.5; margin:0.5rem 0; color:{theme.get("fg", "#eee")}; }}
     .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
       padding:8px 12px; outline:none; }}
     .code-wrap.selected {{ border-color:#60a5fa; box-shadow:0 0 0 2px rgba(96,165,250,0.35); }}
@@ -708,7 +1048,8 @@ def generate_presenter_html(
     .cell-id {{ font-size:11px; color:{theme.get("muted", "#9ca3af")}; font-family:ui-monospace,monospace; }}
     .hint {{ font-size:11px; color:#6b7280; }}
     .code-ta {{ width:100%; box-sizing:border-box; margin:0; resize:vertical;
-      font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45;
+      font-size:var(--code-fs, 14px); white-space:pre;
       color:#e5e7eb; background:#111827; border:1px solid #4b5563; border-radius:6px;
       padding:10px; outline:none; }}
     .code-ta:focus {{ border-color:#60a5fa; }}
@@ -807,9 +1148,22 @@ def generate_presenter_html(
       }}
     }}
 
+    let lastLayoutT = 0;
+    function applyLayoutMsg(msg) {{
+      // Overwrite the element's inline style with the overlay style (both are
+      // generated by the same Python _el_style — wholesale replace is correct)
+      if (!msg || !msg.el_id) return;
+      if (msg.t && msg.t <= lastLayoutT) return;
+      if (msg.t) lastLayoutT = msg.t;
+      const el = document.getElementById(msg.el_id);
+      if (!el) return;
+      el.style.cssText = msg.style || '';
+    }}
+
     window.addEventListener('message', function (e) {{
-      if (!e.data || e.data.type !== 'sslive_result') return;
-      applyRunResult(e.data);
+      if (!e.data) return;
+      if (e.data.type === 'sslive_result') applyRunResult(e.data);
+      else if (e.data.type === 'sslive_layout_apply') applyLayoutMsg(e.data);
     }});
 
     // More reliable than postMessage into srcdoc: poll parent for last result
@@ -817,6 +1171,8 @@ def generate_presenter_html(
       try {{
         const r = window.parent.__sslive_last_result;
         if (r && r.type === 'sslive_result') applyRunResult(r);
+        const l = window.parent.__sslive_last_layout;
+        if (l && l.type === 'sslive_layout_apply') applyLayoutMsg(l);
       }} catch (e) {{}}
     }}, 150);
 
@@ -1277,7 +1633,9 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
         if source is not None:
             _apply_source_to_deck(cell_id, source)
 
-    html = render_output_html(result.parts or [], cell_id, theme)
+    # Keep overlay position/size when the output block is replaced in-place
+    out_style = _el_style(_layout_spec(deck, f"el-output-{cell_id}"))
+    html = render_output_html(result.parts or [], cell_id, theme, style=out_style)
     payload = {
         "type": "sslive_result",
         "cell_id": cell_id,
@@ -2067,6 +2425,11 @@ __all__ = [
     "fetch_dialog_source",
     "write_back_cell",
     "sync_dialog",
+    "set_layout",
+    "clear_layout",
+    "layout_ids",
+    "save_layout",
+    "load_layout",
     "pump_slide_runs",
     "deck_summary",
     "refresh_presenter",

@@ -12,6 +12,7 @@ RISE-like live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https:/
 | Sync source → SolveIt dialog cell | ✅ |
 | Stay on current slide in **fullscreen** | ✅ |
 | Preview mode keep-focus after Run | ✅ pre-emptive focus guard (see below) |
+| Move/size/font/order elements (S2-A API) | ✅ `await set_layout(...)` — drag UI next (S2-B) |
 
 ## Usage
 
@@ -53,5 +54,13 @@ Optional: `await sync_dialog()` to push all deck sources later.
 | `await pump_slide_runs()` | Drain stuck Run queue |
 | `await sync_dialog()` | Batch write sources to dialog |
 | `refocus_presenter()` | Manually return focus to slides |
+| `layout_ids()` | List element ids you can lay out |
+| `await set_layout(el_id, x=, y=, w=, fs=, ff=, z=, order=, align=)` | Position/style an element (live + persisted) |
+| `await clear_layout(el_id \| None)` | Reset one/all elements to flow layout |
+
+Layout is design-space px on the 1920×1080 stage; overrides persist in a
+hidden `#| sslive-layout` note in the dialog (auto-created, `skipped=1`).
+Example: `await set_layout('el-output-_abc123', x=1000, y=400, w=700)` moves
+that screenshot/output block live — no rebuild, focus stays put.
 
 Keep driver cells under **`%local`**.
