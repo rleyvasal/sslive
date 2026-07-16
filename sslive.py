@@ -1443,11 +1443,11 @@ async def _flush_pending_dialog_sync(*, refocus: bool = True) -> int:
 
 
 async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
-    """Minimal hot path: update deck → GPU → in-place slide output only.
+    """Update deck → GPU → in-place slide output → quiet deferred dialog write.
 
-    No ``update_msg``, no ``refresh_presenter``, no ``refocus_presenter`` here.
-    Any of those make SolveIt thrash the dialog (exit fullscreen, reset slides,
-    steal focus). Dialog write-back is queued; use ``await sync_dialog()`` after.
+    Hot path never calls ``refresh_presenter`` / ``refocus_presenter`` (those
+    reset slides / exit fullscreen). Dialog ``update_msg`` runs in a deferred
+    task after the slide UI has updated, with no follow-up UI thrash.
     """
     if slide_index is not None:
         _SESSION["slide_index"] = int(slide_index)
@@ -1459,8 +1459,33 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
     result = _run_and_refresh(
         cell_id, source=source, full_refresh=False, quiet=True
     )
-    # Single push (avoid double iife)
-    # _run_and_refresh already calls push_slide_result when full_refresh=False
+
+    # Deferred dialog write-back (unified source). Do NOT refresh/refocus after.
+    if _SESSION.get("auto_sync_dialog", True):
+
+        async def _deferred_dialog_write(cid=cell_id, src=source):
+            try:
+                await asyncio.sleep(0.25)
+                # Flush this cell (and any others queued)
+                pending = dict(_SESSION.get("pending_dialog_sync") or {})
+                pending[cid] = src
+                _SESSION["pending_dialog_sync"] = {}
+                for pcid, psrc in pending.items():
+                    await write_back_cell(pcid, psrc)
+                # Re-push slide result in case host re-rendered output area
+                # (no full rebuild — only parent.__sslive_last_result)
+                push_slide_result(cid, result, source=src)
+            except Exception as e:
+                _SESSION["_dialog_sync_err"] = str(e)
+
+        try:
+            asyncio.get_running_loop().create_task(_deferred_dialog_write())
+        except RuntimeError:
+            try:
+                await write_back_cell(cell_id, source)
+            except Exception:
+                pass
+
     return result
 
 
@@ -1684,11 +1709,10 @@ def _show_run_panel(deck: Deck) -> None:
     html = """
 <div style="font:14px system-ui;color:#e5e7eb;margin:10px 0;padding:12px 14px;
             background:#0b1220;border:1px solid #374151;border-radius:8px">
-  <b>RISE-style:</b> edit in the slide → <b>▶ Run</b> / <b>Shift+Enter</b> → GPU
-  (output updates in place; slide &amp; fullscreen stay put).
+  <b>RISE-style:</b> edit in the slide → <b>▶ Run</b> / <b>Shift+Enter</b>
+  → GPU (in place) → dialog source updates shortly after.
   <div style="margin-top:8px;font-size:12px;color:#9ca3af">
-    Dialog cells are <b>not</b> written on every Run (that resets preview / exits FS).
-    When done: <code>await sync_dialog()</code> to copy sources into SolveIt cells.
+    No full preview rebuild on Run. Manual: <code>await sync_dialog()</code>
   </div>
 </div>
 """
@@ -1826,9 +1850,10 @@ async def slive(
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
     _SESSION["slide_index"] = 0
     _SESSION.setdefault("pending_dialog_sync", {})
-    print("In-slide: edit · ▶ Run / Shift+Enter → GPU (in-place; stays on slide / FS)")
-    print("Dialog source sync is OFF during Run (avoids SolveIt focus thrash).")
-    print("After presenting: await sync_dialog()  # push slide sources into dialog cells")
+    _SESSION["auto_sync_dialog"] = True  # deferred update_msg after Run
+    print("In-slide: edit · ▶ Run / Shift+Enter → GPU (in-place)")
+    print("Dialog source: auto-sync shortly after Run (no rebuild/refocus)")
+    print("Manual: await sync_dialog()  if needed")
 
     if embed:
         _show_presenter(port, height=height)
