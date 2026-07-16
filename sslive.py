@@ -603,12 +603,14 @@ def _code_block_html(cell: Cell) -> str:
     code_inner = f"<pre class='code-pre'><code>{src}</code></pre>"
     if collapsed:
         code_inner = f"<details><summary>Code</summary>{code_inner}</details>"
+    # hx-post path is rewritten at runtime once API_BASE is resolved
     return f"""
     <div id="el-code-{cid}" class="code-wrap" data-type="code" data-cell-id="{cid}" data-runnable="1"
          tabindex="0" onclick="selectCell('{cid}')">
       <div class="code-toolbar">
         <button type="button" class="run-btn"
-          hx-post="/execute"
+          data-cell-id="{cid}"
+          hx-post="__SSLIVE_EXECUTE__"
           hx-vals='{{"cell_id": "{cid}"}}'
           hx-target="#el-output-{cid}"
           hx-swap="outerHTML"
@@ -643,12 +645,23 @@ def _slide_html(deck: Deck, slide: Slide) -> str:
     )
 
 
-def generate_presenter_html(deck: Deck, *, backend_label: str = "gpu") -> str:
-    """Full presenter page (custom JS + HTMX). No Reveal.js."""
+def generate_presenter_html(
+    deck: Deck,
+    *,
+    backend_label: str = "gpu",
+    port: int | None = None,
+) -> str:
+    """Full presenter page (custom JS + HTMX). No Reveal.js.
+
+    ``port`` is the JupyUvi port. The page probes reachable API bases so
+    execute works from a srcdoc iframe (browser cannot use bare /sslive on
+    SolveIt's front door — that is the 404 you saw).
+    """
     theme = deck.theme or THEME_DARK
     slides_html = "\n".join(_slide_html(deck, s) for s in deck.slides)
     n = len(deck.slides)
     first_code = deck.ordered_code_ids[0] if deck.ordered_code_ids else ""
+    port = int(port or _SESSION.get("port") or 8000)
 
     css = f"""
     * {{ box-sizing: border-box; }}
@@ -689,6 +702,8 @@ def generate_presenter_html(deck: Deck, *, backend_label: str = "gpu") -> str:
     js = f"""
     let currentSlide = 0;
     let selectedCellId = {json.dumps(first_code)};
+    let API_BASE = '';
+    const SSLIVE_PORT = {port};
     const slides = () => document.querySelectorAll('[data-slide]');
 
     function updateCounter() {{
@@ -741,7 +756,6 @@ def generate_presenter_html(deck: Deck, *, backend_label: str = "gpu") -> str:
     document.getElementById('prev-btn')?.addEventListener('click', () => showSlide(currentSlide - 1));
     document.getElementById('next-btn')?.addEventListener('click', () => showSlide(currentSlide + 1));
 
-    // scale 1920x1080 stage to viewport
     (() => {{
       const DESIGN_W = 1920, DESIGN_H = 1080;
       const stage = document.getElementById('stage');
@@ -757,9 +771,70 @@ def generate_presenter_html(deck: Deck, *, backend_label: str = "gpu") -> str:
       rescale();
     }})();
 
-    async function refreshStatus() {{
+    function parentOrigin() {{
+      try {{ return window.parent.location.origin; }} catch (e) {{ return location.origin; }}
+    }}
+    function parentHost() {{
+      try {{ return window.parent.location.hostname; }} catch (e) {{ return location.hostname; }}
+    }}
+    function parentProto() {{
+      try {{ return window.parent.location.protocol; }} catch (e) {{ return location.protocol; }}
+    }}
+
+    function candidateBases() {{
+      const o = parentOrigin();
+      const h = parentHost();
+      const p = parentProto();
+      return [
+        p + '//' + h + ':' + SSLIVE_PORT,
+        o + '/proxy/' + SSLIVE_PORT,
+        o + '/proxy/' + SSLIVE_PORT + '/',
+        'http://127.0.0.1:' + SSLIVE_PORT,
+        'http://localhost:' + SSLIVE_PORT,
+      ];
+    }}
+
+    async function probeBase(base) {{
+      const url = base.replace(/\\/$/, '') + '/status';
       try {{
-        const r = await fetch('/status');
+        const r = await fetch(url, {{ method: 'GET', mode: 'cors', credentials: 'omit' }});
+        if (!r.ok) return null;
+        const j = await r.json();
+        if (j && (j.backend === 'gpu' || j.port != null)) return base.replace(/\\/$/, '');
+      }} catch (e) {{}}
+      return null;
+    }}
+
+    async function resolveApiBase() {{
+      const badge = document.getElementById('status-badge');
+      if (badge) {{ badge.textContent = 'probing api…'; badge.className = 'bad'; }}
+      for (const b of candidateBases()) {{
+        const ok = await probeBase(b);
+        if (ok) {{
+          API_BASE = ok;
+          // rewrite hx-post placeholders / relative execute targets
+          document.querySelectorAll('.run-btn').forEach(btn => {{
+            btn.setAttribute('hx-post', API_BASE + '/execute');
+          }});
+          if (window.htmx) htmx.process(document.body);
+          if (badge) {{
+            badge.textContent = 'gpu · api ' + API_BASE;
+            badge.className = 'ok';
+          }}
+          return API_BASE;
+        }}
+      }}
+      if (badge) {{
+        badge.textContent = 'api unreachable · use run_cell_index()';
+        badge.className = 'bad';
+      }}
+      return '';
+    }}
+
+    async function refreshStatus() {{
+      if (!API_BASE) return;
+      try {{
+        const r = await fetch(API_BASE + '/status', {{ mode: 'cors' }});
         const j = await r.json();
         const el = document.getElementById('status-badge');
         if (!el) return;
@@ -768,10 +843,14 @@ def generate_presenter_html(deck: Deck, *, backend_label: str = "gpu") -> str:
         el.className = j.kernel_ok ? 'ok' : 'bad';
       }} catch (e) {{}}
     }}
-    setInterval(refreshStatus, 3000);
-    refreshStatus();
-    if (selectedCellId) selectCell(selectedCellId);
-    updateCounter();
+
+    (async () => {{
+      await resolveApiBase();
+      setInterval(refreshStatus, 3000);
+      refreshStatus();
+      if (selectedCellId) selectCell(selectedCellId);
+      updateCounter();
+    }})();
     """
 
     empty = ""
@@ -863,19 +942,20 @@ def _in_solveit() -> bool:
 
 
 def _presenter_page():
-    """HTML document for the live deck (served at / and /sslive)."""
+    """HTML document for the live deck (served at / and /sslive on JupyUvi)."""
     deck = _SESSION.get("deck") or Deck()
     ex = _SESSION.get("executor") or LiveExecutor()
     ok, msg = ex.kernel_ok()
     label = f"gpu · {msg}"
-    html = generate_presenter_html(deck, backend_label=label)
+    port = _SESSION.get("port")
+    html = generate_presenter_html(deck, backend_label=label, port=port)
     if HTMLResponse is not None:
         return HTMLResponse(html)
     return html
 
 
 def _ensure_live_server() -> int:
-    """Start singleton FastHTML + JupyUvi server (pcviz-style). Returns port."""
+    """Start singleton FastHTML + JupyUvi server. Returns port."""
     if _SESSION.get("server") is not None and _SESSION.get("port"):
         return int(_SESSION["port"])
 
@@ -888,11 +968,12 @@ def _ensure_live_server() -> int:
     except RuntimeError:
         port = _pick_port(8100, 50)
 
+    # Store port before routes render (presenter HTML embeds port for API probe)
+    _SESSION["port"] = port
+
     # default_hdrs/htmx + notebook CORS when IN_NOTEBOOK (SolveIt sets this)
     app = FastHTML(hdrs=())
 
-    # Named route for HTMX embed: with host=None, iframe src becomes "/sslive"
-    # (same-origin relative path — SolveIt proxies to this JupyUvi port).
     sslive_rt = app.get("/sslive")(_presenter_page)
     app.get("/")(_presenter_page)
 
@@ -1005,37 +1086,52 @@ def sstop() -> None:
 
 
 def _show_presenter(port: int, height: str = "720px"):
-    """Embed presenter like pcviz: HTMX + same-origin path (not raw 127.0.0.1).
+    """Embed presenter without relying on SolveIt front-door paths.
 
-    In SolveIt / Jupyter, ``HTMX(route, host=None, port=...)`` sets iframe
-    ``src`` to the route path (e.g. ``/sslive``) so the browser hits the
-    notebook host; SolveIt/Jupyter proxy traffic to JupyUvi.
+    ``iframe src="/sslive"`` hits SolveIt's web app → **404** (what you saw).
+    The kernel server listens on ``port`` inside the SolveIt VM; the browser
+    only reaches it if hostname:port or /proxy/port works.
 
-    Outside SolveIt (true local browser+kernel), fall back to localhost.
+    Strategy:
+      1. **srcdoc** embed of the full deck HTML (always shows slides, like sslides)
+      2. In-page JS probes API bases (hostname:port, /proxy/port, localhost)
+         so Run can hit JupyUvi when any path is open
+      3. Local (not IN_SOLVEIT): also try HTMX localhost iframe as optional
     """
     if isinstance(height, int):
         height = f"{height}px"
 
-    app = _SESSION.get("app")
-    sslive_rt = _SESSION.get("sslive_rt")
-    in_solveit = _in_solveit()
+    deck = _SESSION.get("deck") or Deck()
+    ex = _SESSION.get("executor") or LiveExecutor()
+    ok, msg = ex.kernel_ok()
+    html = generate_presenter_html(
+        deck, backend_label=f"gpu · {msg}", port=port
+    )
 
-    # 1) pcviz-style: host=None → relative path / route (works on SolveIt)
-    if HTMX is not None and app is not None and sslive_rt is not None:
-        try:
-            # str(sslive_rt) == "/sslive"; host=None → iframe src="/sslive"
-            preview = HTMX(sslive_rt, app=app, host=None, port=port, height=height)
-            if display is not None:
-                display(preview)
-            else:
-                print(preview)
-            print(f"sslive: embedded via HTMX (host=None, port={port}, path=/sslive)")
+    # Escape for srcdoc attribute
+    escaped = html_module.escape(html, quote=True)
+    iframe_html = (
+        f'<iframe srcdoc="{escaped}" '
+        f'style="width:100%;height:{height};border:none;background:#111;" '
+        f'sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals" '
+        f'allow="fullscreen"></iframe>'
+    )
+
+    try:
+        from IPython.display import HTML as IPyHTML
+
+        if display is not None:
+            display(IPyHTML(iframe_html))
+            print(
+                f"sslive: embedded via srcdoc (port={port}). "
+                f"Run buttons probe hostname:{port} and /proxy/{port}."
+            )
             return
-        except Exception as e:
-            print(f"sslive: HTMX host=None embed failed: {e}")
+    except Exception as e:
+        print(f"sslive: srcdoc embed failed: {e}")
 
-    # 2) Local notebook: browser can reach kernel localhost
-    if HTMX is not None and not in_solveit:
+    # Optional local HTMX (browser and kernel on same machine)
+    if HTMX is not None and not _in_solveit():
         try:
             preview = HTMX("/sslive", host="localhost", port=port, height=height)
             if display is not None:
@@ -1045,19 +1141,7 @@ def _show_presenter(port: int, height: str = "720px"):
         except Exception as e:
             print(f"sslive: HTMX localhost embed failed: {e}")
 
-    # 3) Last resort — only useful when kernel and browser share a machine
-    url = f"http://127.0.0.1:{port}/sslive"
-    if not in_solveit and display is not None and IFrame is not None:
-        display(IFrame(src=url, width="100%", height=height))
-        print(f"sslive: embedded IFrame {url} (local fallback)")
-        return
-
-    print(f"sslive: open presenter at {url}")
-    if in_solveit:
-        print(
-            "sslive: IN_SOLVEIT is set but HTMX embed failed — "
-            "raw 127.0.0.1 from the browser will not reach the kernel."
-        )
+    print(f"sslive: open http://127.0.0.1:{port}/sslive if kernel is local")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1072,9 +1156,6 @@ class LiveSession:
 
     @property
     def url(self) -> str:
-        # Same-origin path for SolveIt; localhost only when not in SolveIt
-        if _in_solveit():
-            return f"/sslive"
         return f"http://127.0.0.1:{self.port}/sslive"
 
     def status(self) -> dict:
