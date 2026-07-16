@@ -1,23 +1,22 @@
 # sslive
 
-Live GPU presentations for [SolveIt](https://solve.it.com), driven by [gpudev](https://github.com/rleyvasal/gpudev) / CRAFT.
+RISE-like live GPU slides for [SolveIt](https://solve.it.com), driven by [gpudev](https://github.com/rleyvasal/gpudev) / CRAFT.
 
-Sibling of [sslides](https://github.com/rleyvasal/sslides) (static snapshot decks). **sslive** is the live run path.
+## Goal
 
-## Model
-
-| Role | Where |
-|------|--------|
-| **Editor** | SolveIt dialog code cells (native browser editor) |
-| **Presentation** | Read-only srcdoc slide deck |
-| **Execute** | CRAFT remote GPU kernel |
+Edit and re-run code **on the slide** (like [RISE](https://rise.readthedocs.io/)), keep **one source** shared with the SolveIt dialog cell, execute on the **remote GPU**.
 
 ```text
-Edit in SolveIt cell  →  await run_cell_index(i)  →  re-read dialog
-                      →  CRAFT GPU  →  refresh slides
+Slide textarea (edit)
+      │  ▶ Run / Shift+Enter
+      ▼
+postMessage → SolveIt parent page queue
+      │  Python poll (js_eval)
+      ▼
+update_msg → SolveIt cell (unified source)
+      +
+CRAFT → GPU execute → refresh slide outputs
 ```
-
-No second editor (no ipywidgets / no HTML textareas). The dialog is the source of truth.
 
 ## Usage
 
@@ -29,30 +28,37 @@ No second editor (no ipywidgets / no HTML textareas). The dialog is the source o
 
 %local
 await slive()
-
-# Edit the SolveIt code cell in the dialog (above / in the #| s section), then:
-await run_cell_index(0)   # re-reads that cell → GPU → updates slide outputs
 ```
 
-Requires a note cell with exactly `#| s`, then `#` / `##` slides below it.
+1. Click the **slide iframe** so it has focus  
+2. **Edit** the code in the slide textarea  
+3. Press **▶ Run** or **Shift+Enter**  
+4. Source is written back to the SolveIt code cell and runs on the GPU  
 
-### Commands
+If Run seems stuck (bridge):
 
-| Call | Effect |
-|------|--------|
-| `await slive()` | Load deck, show slides + run panel, skip launcher cell |
-| `await run_cell_index(i)` | Re-read dialog cell `i` → GPU → refresh deck |
-| `await run_cell(cell_id)` | Same by message id |
-| `await reload_deck()` | Rebuild slides from dialog (structure changed) |
-| `refresh_presenter()` | Re-draw deck without re-running |
+```python
+await pump_slide_runs()
+```
 
-Keep `slive` / `run_cell*` under **`%local`**. Only slide *source strings* run on the GPU.
+### Fallback
 
-Optional HTTP server (local notebooks only): `await slive(use_http=True)`.
+```python
+await run_cell_index(0)              # deck source → GPU
+await run_cell_index(0, reload_from_dialog=True)  # re-read dialog first
+await reload_deck()                  # rebuild after structural changes
+```
+
+Requires `#| s` then `#` / `##` slides in the dialog.
+
+Keep `slive` / `run_cell*` under **`%local`**.
 
 ## Status
 
-- GPU execute + output capture: yes  
-- Slide navigation (srcdoc): yes  
-- Edit: **SolveIt cells only**  
-- In-iframe ▶ Run over HTTP: not used on cloud SolveIt (browser cannot reach kernel port)  
+| Feature | Status |
+|---------|--------|
+| In-slide edit | yes (textarea) |
+| In-slide Run | yes (postMessage bridge) |
+| Sync to SolveIt cell | yes (`update_msg`) |
+| GPU execute | yes (CRAFT) |
+| Navigation | ←/→, f fullscreen |

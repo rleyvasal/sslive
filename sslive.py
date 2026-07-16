@@ -1,23 +1,23 @@
-"""sslive — live GPU slides for SolveIt.
+"""sslive — RISE-like live GPU slides for SolveIt.
 
-**Edit in SolveIt** (native dialog cells). **Present** in a srcdoc deck.
-**Run** re-reads the dialog cell, executes on CRAFT GPU, refreshes the deck.
+Edit code **inside the slide**, hit ▶ Run / Shift+Enter:
+  → source syncs to the SolveIt dialog cell (one source of truth)
+  → executes on CRAFT GPU
+  → slide outputs refresh
 
 Usage::
 
     %local
     %run sslive/sslive.py
-
     %gpu
-
     %local
     await slive()
-    # Edit the SolveIt code cell in the dialog, then:
-    await run_cell_index(0)
+    # click the slide iframe, edit the code, press ▶ or Shift+Enter
 """
 
 from __future__ import annotations
 
+import asyncio
 import html as html_module
 import inspect
 import json
@@ -32,9 +32,16 @@ from typing import Any, Callable, Literal
 
 # ── optional SolveIt / FastHTML imports (available inside SolveIt) ───────────
 try:
-    from dialoghelper.core import find_msgs, curr_dialog, update_msg, read_msg
+    from dialoghelper.core import (
+        find_msgs,
+        curr_dialog,
+        update_msg,
+        read_msg,
+        js_eval,
+        iife,
+    )
 except Exception:  # pragma: no cover - outside SolveIt
-    find_msgs = curr_dialog = update_msg = read_msg = None
+    find_msgs = curr_dialog = update_msg = read_msg = js_eval = iife = None
 
 try:
     from IPython.display import display, IFrame, clear_output, DisplayHandle, HTML as IPyHTML
@@ -597,28 +604,28 @@ def _note_to_html(source: str) -> str:
 
 
 def _code_block_html(cell: Cell) -> str:
+    """In-slide editable code (textarea) + Run — RISE-style."""
     cid = html_module.escape(cell.id)
+    # raw id for JS (safe: dialog ids are alphanumeric + underscore)
+    raw_id = cell.id
     src = html_module.escape(cell.source)
-    collapsed = cell.i_collapsed
-    code_inner = f"<pre class='code-pre'><code>{src}</code></pre>"
-    if collapsed:
-        code_inner = f"<details><summary>Code</summary>{code_inner}</details>"
-    # hx-post path is rewritten at runtime once API_BASE is resolved
+    n_lines = max(3, min(24, cell.source.count("\n") + 2))
+    # ~1.45em line height in code-ta
+    ta_h = max(72, int(n_lines * 22))
     return f"""
     <div id="el-code-{cid}" class="code-wrap" data-type="code" data-cell-id="{cid}" data-runnable="1"
          tabindex="0" onclick="selectCell('{cid}')">
       <div class="code-toolbar">
-        <button type="button" class="run-btn"
-          data-cell-id="{cid}"
-          hx-post="__SSLIVE_EXECUTE__"
-          hx-vals='{{"cell_id": "{cid}"}}'
-          hx-target="#el-output-{cid}"
-          hx-swap="outerHTML"
-          hx-disabled-elt="this"
-          onclick="event.stopPropagation(); selectCell('{cid}')">▶ Run</button>
+        <button type="button" class="run-btn" data-cell-id="{cid}"
+          onclick="event.stopPropagation(); runCellFromSlide('{raw_id}')">▶ Run</button>
         <span class="cell-id">{cid}</span>
+        <span class="hint">edit here · Shift+Enter run · syncs to SolveIt</span>
       </div>
-      {code_inner}
+      <textarea class="code-ta" id="ta-{cid}" data-cell-id="{cid}"
+        spellcheck="false" rows="{n_lines}"
+        style="height:{ta_h}px"
+        onfocus="selectCell('{cid}')"
+        onkeydown="onCodeKey(event,'{raw_id}')">{src}</textarea>
     </div>
     """
 
@@ -680,14 +687,18 @@ def generate_presenter_html(
     .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
       padding:8px 12px; outline:none; }}
     .code-wrap.selected {{ border-color:#60a5fa; box-shadow:0 0 0 2px rgba(96,165,250,0.35); }}
-    .code-toolbar {{ display:flex; align-items:center; gap:12px; margin-bottom:6px; }}
+    .code-toolbar {{ display:flex; align-items:center; gap:12px; margin-bottom:6px; flex-wrap:wrap; }}
     .run-btn {{ cursor:pointer; background:#2563eb; color:white; border:0; border-radius:6px;
       padding:6px 14px; font-size:14px; font-weight:600; }}
     .run-btn:hover {{ background:#1d4ed8; }}
     .run-btn:disabled {{ opacity:0.5; cursor:wait; }}
     .cell-id {{ font-size:11px; color:{theme.get("muted", "#9ca3af")}; font-family:ui-monospace,monospace; }}
-    .code-pre {{ margin:0; font:14px/1.45 ui-monospace,monospace; white-space:pre-wrap;
-      color:#e5e7eb; overflow:auto; max-height:420px; }}
+    .hint {{ font-size:11px; color:#6b7280; }}
+    .code-ta {{ width:100%; box-sizing:border-box; margin:0; resize:vertical;
+      font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre;
+      color:#e5e7eb; background:#111827; border:1px solid #4b5563; border-radius:6px;
+      padding:10px; outline:none; }}
+    .code-ta:focus {{ border-color:#60a5fa; }}
     #chrome {{ position:fixed; left:12px; top:12px; z-index:20; display:flex; gap:10px; align-items:center;
       background:rgba(0,0,0,0.55); color:#fff; padding:6px 12px; border-radius:8px; font-size:13px; }}
     #chrome .ok {{ color:#86efac; }} #chrome .bad {{ color:#fca5a5; }}
@@ -696,14 +707,11 @@ def generate_presenter_html(
       transition:opacity 0.15s; }}
     #nav:hover {{ opacity:1; }}
     #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer; padding:0 6px; }}
-    .htmx-request .run-btn, .run-btn.htmx-request {{ opacity:0.6; }}
     """
 
     js = f"""
     let currentSlide = 0;
     let selectedCellId = {json.dumps(first_code)};
-    let API_BASE = '';
-    const SSLIVE_PORT = {port};
     const slides = () => document.querySelectorAll('[data-slide]');
 
     function updateCounter() {{
@@ -731,14 +739,57 @@ def generate_presenter_html(
       if (first) selectCell(first.dataset.cellId);
     }}
 
-    async function runSelected() {{
+    function codeSource(cellId) {{
+      const ta = document.querySelector('textarea.code-ta[data-cell-id="' + cellId + '"]');
+      return ta ? ta.value : '';
+    }}
+
+    function setRunning(cellId, msg) {{
+      const out = document.getElementById('el-output-' + cellId);
+      if (out) {{
+        out.innerHTML = '<pre style="background:#1f2937;color:#fbbf24;padding:0.5rem;' +
+          'font:13px/1.4 ui-monospace,monospace;border-radius:6px">' +
+          (msg || 'Running…') + '</pre>';
+      }}
+      const btn = document.querySelector('.run-btn[data-cell-id="' + cellId + '"]');
+      if (btn) btn.disabled = true;
+    }}
+
+    function runCellFromSlide(cellId) {{
+      selectCell(cellId);
+      const source = codeSource(cellId);
+      setRunning(cellId, 'Running on GPU…');
+      // Bridge to SolveIt parent page → Python poll loop (no kernel HTTP port)
+      try {{
+        window.parent.postMessage({{
+          type: 'sslive_run',
+          cell_id: cellId,
+          source: source
+        }}, '*');
+      }} catch (e) {{
+        setRunning(cellId, 'postMessage failed: ' + e);
+      }}
+    }}
+
+    function onCodeKey(e, cellId) {{
+      if (e.key === 'Enter' && e.shiftKey) {{
+        e.preventDefault();
+        e.stopPropagation();
+        runCellFromSlide(cellId);
+      }}
+    }}
+
+    function runSelected() {{
       if (!selectedCellId) return;
-      const btn = document.querySelector(
-        '[data-runnable][data-cell-id="' + selectedCellId + '"] .run-btn');
-      if (btn) btn.click();
+      runCellFromSlide(selectedCellId);
     }}
 
     document.addEventListener('keydown', (e) => {{
+      // don't steal keys while typing in a textarea (except handled above)
+      if (e.target && e.target.tagName === 'TEXTAREA') {{
+        if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') return;
+        return;
+      }}
       if (e.key === 'ArrowRight') {{ e.preventDefault(); showSlide(currentSlide + 1); }}
       if (e.key === 'ArrowLeft')  {{ e.preventDefault(); showSlide(currentSlide - 1); }}
       if (e.key === 'Enter' && e.shiftKey) {{ e.preventDefault(); runSelected(); }}
@@ -771,86 +822,8 @@ def generate_presenter_html(
       rescale();
     }})();
 
-    function parentOrigin() {{
-      try {{ return window.parent.location.origin; }} catch (e) {{ return location.origin; }}
-    }}
-    function parentHost() {{
-      try {{ return window.parent.location.hostname; }} catch (e) {{ return location.hostname; }}
-    }}
-    function parentProto() {{
-      try {{ return window.parent.location.protocol; }} catch (e) {{ return location.protocol; }}
-    }}
-
-    function candidateBases() {{
-      const o = parentOrigin();
-      const h = parentHost();
-      const p = parentProto();
-      return [
-        p + '//' + h + ':' + SSLIVE_PORT,
-        o + '/proxy/' + SSLIVE_PORT,
-        o + '/proxy/' + SSLIVE_PORT + '/',
-        'http://127.0.0.1:' + SSLIVE_PORT,
-        'http://localhost:' + SSLIVE_PORT,
-      ];
-    }}
-
-    async function probeBase(base) {{
-      const url = base.replace(/\\/$/, '') + '/status';
-      try {{
-        const r = await fetch(url, {{ method: 'GET', mode: 'cors', credentials: 'omit' }});
-        if (!r.ok) return null;
-        const j = await r.json();
-        if (j && (j.backend === 'gpu' || j.port != null)) return base.replace(/\\/$/, '');
-      }} catch (e) {{}}
-      return null;
-    }}
-
-    async function resolveApiBase() {{
-      const badge = document.getElementById('status-badge');
-      if (badge) {{ badge.textContent = 'probing api…'; badge.className = 'bad'; }}
-      for (const b of candidateBases()) {{
-        const ok = await probeBase(b);
-        if (ok) {{
-          API_BASE = ok;
-          // rewrite hx-post placeholders / relative execute targets
-          document.querySelectorAll('.run-btn').forEach(btn => {{
-            btn.setAttribute('hx-post', API_BASE + '/execute');
-          }});
-          if (window.htmx) htmx.process(document.body);
-          if (badge) {{
-            badge.textContent = 'gpu · api ' + API_BASE;
-            badge.className = 'ok';
-          }}
-          return API_BASE;
-        }}
-      }}
-      if (badge) {{
-        badge.textContent = 'api unreachable · use run_cell_index()';
-        badge.className = 'bad';
-      }}
-      return '';
-    }}
-
-    async function refreshStatus() {{
-      if (!API_BASE) return;
-      try {{
-        const r = await fetch(API_BASE + '/status', {{ mode: 'cors' }});
-        const j = await r.json();
-        const el = document.getElementById('status-badge');
-        if (!el) return;
-        el.textContent = (j.backend || '?') + (j.busy ? ' · busy' : ' · idle')
-          + (j.kernel_ok ? '' : ' · kernel down');
-        el.className = j.kernel_ok ? 'ok' : 'bad';
-      }} catch (e) {{}}
-    }}
-
-    (async () => {{
-      await resolveApiBase();
-      setInterval(refreshStatus, 3000);
-      refreshStatus();
-      if (selectedCellId) selectCell(selectedCellId);
-      updateCounter();
-    }})();
+    if (selectedCellId) selectCell(selectedCellId);
+    updateCounter();
     """
 
     empty = ""
@@ -1095,7 +1068,7 @@ def _presenter_iframe_html(height: str = "720px", port: int | None = None) -> st
     label = f"gpu · {msg}" if ok else f"gpu · {msg}"
     # On SolveIt, browser cannot reach JupyUvi — label says kernel-side run
     if _in_solveit() or not port:
-        label = f"gpu · {msg} · edit in SolveIt · await run_cell_index(i)"
+        label = f"gpu · {msg} · edit in slide · ▶ Run"
     html = generate_presenter_html(deck, backend_label=label, port=port or 0)
     escaped = html_module.escape(html, quote=True)
     return (
@@ -1201,6 +1174,22 @@ def _apply_source_to_deck(cell_id: str, source: str) -> None:
         deck.elements[el_id].content = source
 
 
+async def write_back_cell(cell_id: str, content: str) -> bool:
+    """Write source into the SolveIt dialog message (unified source of truth)."""
+    if update_msg is None:
+        return False
+    last_err = None
+    for mid in _id_candidates(cell_id):
+        try:
+            await update_msg(id=mid, content=content)
+            return True
+        except Exception as e:
+            last_err = e
+    if last_err:
+        print(f"sslive: write-back failed for {cell_id}: {last_err}")
+    return False
+
+
 def _run_and_refresh(cell_id: str, *, source: str | None = None) -> ExecResult:
     """Execute deck source for cell_id on GPU and refresh the srcdoc deck."""
     deck = _SESSION.get("deck")
@@ -1226,81 +1215,193 @@ def _run_and_refresh(cell_id: str, *, source: str | None = None) -> ExecResult:
     return result
 
 
+async def _sync_and_run(cell_id: str, source: str) -> ExecResult:
+    """Unified path: slide-edited source → dialog write-back → GPU → refresh."""
+    _apply_source_to_deck(cell_id, source)
+    ok = await write_back_cell(cell_id, source)
+    if ok:
+        print(f"sslive: synced slide source → dialog {cell_id}")
+    return _run_and_refresh(cell_id, source=source)
+
+
+def _install_parent_bridge() -> None:
+    """Listen on the SolveIt parent page for postMessage from the slide iframe.
+
+    Slide Run cannot call the kernel HTTP port; it posts to parent, Python
+    drains ``window.__sslive_q`` via js_eval.
+    """
+    bridge_js = r"""
+if (!window.__sslive_bridge) {
+  window.__sslive_bridge = true;
+  window.__sslive_q = window.__sslive_q || [];
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || d.type !== 'sslive_run') return;
+    window.__sslive_q.push({
+      cell_id: d.cell_id,
+      source: d.source == null ? '' : String(d.source),
+      t: Date.now()
+    });
+  });
+}
+"""
+    # Prefer dialoghelper so the script lands on the real dialog DOM
+    if iife is not None:
+        try:
+            iife(bridge_js)
+            print("sslive: parent bridge installed (dialoghelper.iife)")
+            return
+        except Exception as e:
+            print(f"sslive: iife bridge failed ({e}); trying HTML script")
+
+    if display is not None and IPyHTML is not None:
+        # Fallback: inject via notebook output (usually still parent page)
+        display(
+            IPyHTML(
+                f"<script>{bridge_js}</script>"
+                "<div style='font:12px system-ui;color:#9ca3af;margin:4px 0'>"
+                "sslive: Run bridge active — edit code in the slide, press ▶"
+                "</div>"
+            )
+        )
+        print("sslive: parent bridge installed (HTML script tag)")
+    else:
+        print("sslive: WARNING — could not install parent bridge; in-slide Run will not work")
+
+
+def _parse_js_eval_result(res: Any) -> Any:
+    if res is None:
+        return None
+    if isinstance(res, dict):
+        if "result" in res:
+            return res["result"]
+        if "data" in res:
+            return res["data"]
+        return res
+    if hasattr(res, "result"):
+        return res.result
+    return res
+
+
+async def _drain_slide_queue() -> list[dict]:
+    """Pull pending {cell_id, source} runs from the parent page queue."""
+    if js_eval is None:
+        return []
+    try:
+        res = await js_eval(
+            "const q = window.__sslive_q || []; window.__sslive_q = []; return q;"
+        )
+        q = _parse_js_eval_result(res)
+        if not q:
+            return []
+        if isinstance(q, dict):
+            # single object mistakenly returned
+            return [q] if q.get("cell_id") else []
+        return list(q)
+    except Exception as e:
+        # quiet — poll is frequent
+        if _SESSION.get("_bridge_err") != str(e):
+            _SESSION["_bridge_err"] = str(e)
+            print(f"sslive: bridge poll error: {e}")
+        return []
+
+
+async def _bridge_poll_loop() -> None:
+    """Background: apply in-slide Run requests (edit → dialog + GPU)."""
+    while _SESSION.get("bridge_active"):
+        try:
+            pending = await _drain_slide_queue()
+            for item in pending:
+                if not isinstance(item, dict):
+                    continue
+                cid = item.get("cell_id")
+                source = item.get("source", "")
+                if not cid:
+                    continue
+                print(f"sslive: slide Run → {cid} ({len(source or '')} chars)")
+                try:
+                    await _sync_and_run(str(cid), str(source if source is not None else ""))
+                except Exception as e:
+                    print(f"sslive: slide Run failed: {e}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"sslive: bridge loop: {e}")
+        await asyncio.sleep(0.2)
+
+
+def _start_bridge() -> None:
+    """Install parent listener + start async poll task."""
+    _install_parent_bridge()
+    _SESSION["bridge_active"] = True
+    # cancel previous task if any
+    old = _SESSION.get("bridge_task")
+    if old is not None:
+        try:
+            old.cancel()
+        except Exception:
+            pass
+    try:
+        task = asyncio.get_running_loop().create_task(_bridge_poll_loop())
+        _SESSION["bridge_task"] = task
+        print("sslive: bridge poll started (in-slide ▶ → GPU + dialog sync)")
+    except RuntimeError:
+        # no running loop — try ensure future later
+        print("sslive: no running event loop for bridge; use await pump_slide_runs()")
+
+
+async def pump_slide_runs(max_items: int = 20) -> int:
+    """Manually drain in-slide Run queue (if background poll is not running)."""
+    n = 0
+    for _ in range(max_items):
+        pending = await _drain_slide_queue()
+        if not pending:
+            break
+        for item in pending:
+            if not isinstance(item, dict) or not item.get("cell_id"):
+                continue
+            await _sync_and_run(
+                str(item["cell_id"]),
+                str(item.get("source") or ""),
+            )
+            n += 1
+    return n
+
+
 def _show_run_panel(deck: Deck) -> None:
-    """Slim HTML panel: SolveIt is the editor; list cells + how to Run."""
+    """Short help under the deck (edit happens *inside* the slides)."""
     if display is None or IPyHTML is None:
         return
-
-    rows = []
-    for i, cid in enumerate(deck.ordered_code_ids):
-        src = deck.cells[cid].source.strip().splitlines()
-        preview = html_module.escape((src[0][:72] + "…") if src else "(empty)")
-        rows.append(
-            f"<tr>"
-            f"<td style='padding:6px 10px;color:#9ca3af'>{i}</td>"
-            f"<td style='padding:6px 10px'><code style='color:#93c5fd'>"
-            f"{html_module.escape(cid)}</code></td>"
-            f"<td style='padding:6px 10px;font-family:ui-monospace,monospace;"
-            f"color:#e5e7eb'>{preview}</td>"
-            f"<td style='padding:6px 10px'><code style='background:#1f2937;"
-            f"padding:2px 6px;border-radius:4px;color:#a7f3d0'>"
-            f"await run_cell_index({i})</code></td>"
-            f"</tr>"
-        )
-
-    html = f"""
+    html = """
 <div style="font:14px system-ui;color:#e5e7eb;margin:10px 0;padding:12px 14px;
             background:#0b1220;border:1px solid #374151;border-radius:8px">
-  <div style="margin-bottom:8px">
-    <b>SolveIt is the editor</b> — change code in the dialog cells
-    (above <code>#| s</code> content), then run:
-  </div>
-  <div style="margin:6px 0 10px">
-    <code style="background:#1f2937;padding:4px 8px;border-radius:4px">await run_cell_index(0)</code>
-    re-reads that SolveIt cell → GPU (CRAFT) → refreshes slides
-  </div>
-  <table style="width:100%;border-collapse:collapse;font-size:13px">
-    <thead>
-      <tr style="color:#9ca3af;text-align:left;border-bottom:1px solid #374151">
-        <th style="padding:6px 10px">#</th>
-        <th style="padding:6px 10px">cell id</th>
-        <th style="padding:6px 10px">snapshot preview</th>
-        <th style="padding:6px 10px">run</th>
-      </tr>
-    </thead>
-    <tbody>
-      {"".join(rows) if rows else "<tr><td colspan='4' style='padding:8px'>(no code cells)</td></tr>"}
-    </tbody>
-  </table>
-  <div style="margin-top:10px;font-size:12px;color:#9ca3af">
-    Also: <code>await run_cell('…id…')</code>
-    · <code>await reload_deck()</code> (rebuild slides from dialog)
-    · <code>refresh_presenter()</code> (re-draw without re-run)
+  <b>RISE-style:</b> click the slide iframe → edit the code box →
+  <b>▶ Run</b> or <b>Shift+Enter</b>.
+  That updates the <b>SolveIt cell</b> (one source) and runs on <b>GPU</b>.
+  <div style="margin-top:8px;font-size:12px;color:#9ca3af">
+    Fallback: <code>await run_cell_index(0)</code>
+    · <code>await reload_deck()</code>
+    · <code>await pump_slide_runs()</code> if Run seems stuck
   </div>
 </div>
 """
     display(IPyHTML(html))
-    print(
-        "sslive: edit code in SolveIt cells, then "
-        "`await run_cell_index(0)` (re-reads dialog → GPU)."
-    )
 
 
 def _show_presenter(port: int | None, height: str = "720px"):
-    """Embed read-only deck (srcdoc) + run panel (SolveIt is the editor)."""
+    """Embed deck (srcdoc) with in-slide editors + Run bridge."""
     if isinstance(height, int):
         height = f"{height}px"
     _SESSION["height"] = height
+
+    _start_bridge()
 
     try:
         if display is not None and IPyHTML is not None:
             iframe = IPyHTML(_presenter_iframe_html(height, port=port))
             handle = display(iframe, display_id=True)
             _SESSION["presenter_handle"] = handle
-            print(
-                f"sslive: slides embedded via srcdoc"
-                + (f" (http :{port})" if port else "")
-            )
+            print("sslive: slides ready — edit code in the iframe, ▶ Run / Shift+Enter")
     except Exception as e:
         print(f"sslive: srcdoc embed failed: {e}")
 
@@ -1313,7 +1414,6 @@ def _show_presenter(port: int | None, height: str = "720px"):
             preview = HTMX("/sslive", host="localhost", port=port, height=height)
             if display is not None:
                 display(preview)
-            print(f"sslive: also HTMX localhost:{port}/sslive (local only)")
         except Exception:
             pass
 
@@ -1360,16 +1460,16 @@ async def slive(
     embed: bool = True,
     use_http: bool | None = None,
 ):
-    """Load deck and embed read-only slides. Edit in SolveIt; run via CRAFT.
+    """Load deck with **in-slide editable code** (RISE-style).
 
     ::
 
         %local
         await slive()
-        # Edit the SolveIt code cell in the dialog, then:
-        await run_cell_index(0)   # re-reads dialog → GPU → refresh slides
+        # Click the slide iframe, edit the code box, press ▶ or Shift+Enter
+        # → writes source to SolveIt cell + runs on GPU + refreshes outputs
 
-    **SolveIt dialog cells are the only editor.** The slide iframe is a view.
+    Fallback if bridge stalls: ``await pump_slide_runs()`` or ``await run_cell_index(0)``.
     """
     _ensure_local_magic()
 
@@ -1413,13 +1513,12 @@ async def slive(
     n_code = len(deck.ordered_code_ids)
     print(
         f"sslive: {len(deck.slides)} slides, {n_code} code cells, "
-        f"backend=gpu ({msg}), IN_SOLVEIT={_in_solveit()}, use_http={use_http}"
+        f"backend=gpu ({msg}), IN_SOLVEIT={_in_solveit()}"
     )
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
-    print("Edit: SolveIt dialog code cells (source of truth)")
-    print("Run:  await run_cell_index(0)  # re-reads dialog → GPU → slides")
-    print("View: ←/→ in the slide iframe · f fullscreen")
+    print("In-slide: edit code · ▶ Run / Shift+Enter · syncs to SolveIt + GPU")
+    print("Navigate: ←/→ · f fullscreen")
 
     if embed:
         _show_presenter(port, height=height)
@@ -1441,17 +1540,18 @@ async def run_cell(
     cell_id: str,
     *,
     source: str | None = None,
-    reload_from_dialog: bool = True,
+    reload_from_dialog: bool = False,
+    write_back: bool = True,
     echo_to_dialog: bool | None = None,
     refresh: bool = True,
 ) -> ExecResult:
     """Run a code cell on GPU.
 
-    By default **re-reads the SolveIt dialog** for live source (edit there),
-    then executes via CRAFT and refreshes the slide deck.
+    Prefer **in-slide edit + ▶**. This is the fallback / programmatic API.
 
-    Pass ``source=`` to skip the dialog re-read (testing / programmatic).
-    Pass ``reload_from_dialog=False`` to use the in-memory deck snapshot.
+    - ``source=``: use this text (and optionally write back to dialog)
+    - ``reload_from_dialog=True``: re-read SolveIt cell first
+    - default: use in-memory deck source
     """
     deck: Deck | None = _SESSION.get("deck")
     executor: LiveExecutor | None = _SESSION.get("executor")
@@ -1469,7 +1569,9 @@ async def run_cell(
     old = _SESSION.get("echo_to_dialog")
     _SESSION["echo_to_dialog"] = echo_to_dialog
     try:
-        if refresh:
+        if source is not None and write_back:
+            result = await _sync_and_run(cell_id, source)
+        elif refresh:
             result = _run_and_refresh(cell_id, source=source)
         else:
             if source is not None:
@@ -1485,7 +1587,7 @@ async def run_cell(
 
 
 async def run_cell_index(i: int = 0, **kw) -> ExecResult:
-    """Run ordered code cell ``i`` after re-reading the SolveIt dialog."""
+    """Run ordered code cell ``i`` (deck / optional dialog reload)."""
     deck: Deck | None = _SESSION.get("deck")
     if deck is None:
         raise RuntimeError("Call await slive() first")
@@ -1543,6 +1645,8 @@ __all__ = [
     "run_cell_index",
     "reload_deck",
     "fetch_dialog_source",
+    "write_back_cell",
+    "pump_slide_runs",
     "deck_summary",
     "refresh_presenter",
     "render_output_html",
