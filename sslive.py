@@ -1394,41 +1394,80 @@ def refocus_presenter() -> None:
         pass
 
 
-async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
-    """Slide edit → GPU → in-place output → dialog write-back → refocus slide.
+async def _read_parent_slide_index() -> int | None:
+    try:
+        if js_eval is None and js_eval_a is None:
+            return None
+        idx = await _call_js_eval(
+            "return (window.__sslive_slide_index != null) "
+            "? window.__sslive_slide_index : 0;"
+        )
+        idx = _parse_js_eval_result(idx)
+        return int(idx) if idx is not None else None
+    except Exception:
+        return None
 
-    Fullscreen already works well. Preview mode: SolveIt focuses the dialog
-    cell after ``update_msg``; we refocus the presenter iframe (no full
-    rebuild — that reset the deck to the title slide).
+
+async def _parent_in_fullscreen() -> bool:
+    """True if the browser document (or iframe) is fullscreen."""
+    try:
+        if js_eval is None and js_eval_a is None:
+            return False
+        res = await _call_js_eval(
+            "return !!(document.fullscreenElement "
+            "|| document.webkitFullscreenElement "
+            "|| document.mozFullScreenElement);"
+        )
+        res = _parse_js_eval_result(res)
+        return bool(res)
+    except Exception:
+        return False
+
+
+async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
+    """Slide edit → GPU → in-place UI → dialog sync → keep current slide.
+
+    Fullscreen: leave the iframe alone after in-place push (already stable).
+    Preview: ``update_msg`` often recreates the output iframe from a *stale*
+    snapshot (slide 0). After sync we refresh the display handle on the saved
+    ``slide_index`` so the rebuilt preview opens on the correct slide.
     """
     if slide_index is not None:
         _SESSION["slide_index"] = int(slide_index)
+    else:
+        idx = await _read_parent_slide_index()
+        if idx is not None:
+            _SESSION["slide_index"] = idx
+
     _apply_source_to_deck(cell_id, source)
 
     result = _run_and_refresh(
         cell_id, source=source, full_refresh=False, quiet=True
     )
 
-    # Keep slide index from parent if available
-    try:
-        if js_eval is not None or js_eval_a is not None:
-            idx = await _call_js_eval(
-                "return (window.__sslive_slide_index != null) "
-                "? window.__sslive_slide_index : 0;"
-            )
-            idx = _parse_js_eval_result(idx)
-            if idx is not None:
-                _SESSION["slide_index"] = int(idx)
-    except Exception:
-        pass
+    # Re-read index after run (user may have been on slide N)
+    idx = await _read_parent_slide_index()
+    if idx is not None:
+        _SESSION["slide_index"] = idx
 
-    # Unified source (may focus dialog cell — host behavior)
+    in_fs = await _parent_in_fullscreen()
+
+    # Dialog source sync (SolveIt may re-render preview / steal focus)
     synced = await write_back_cell(cell_id, source)
 
-    # Do NOT refresh_presenter() here — rebuilds iframe, loses fullscreen,
-    # and often lands on the title slide. Instead: re-push result + refocus.
-    push_slide_result(cell_id, result, source=source)
-    refocus_presenter()
+    if in_fs:
+        # Fullscreen path: do not rebuild iframe (would exit FS). In-place only.
+        push_slide_result(cell_id, result, source=source)
+        refocus_presenter()
+    else:
+        # Preview path: host often replaces iframe with stale slide-0 snapshot.
+        # Rebuild display handle at the *current* slide with updated deck state.
+        try:
+            refresh_presenter()
+        except Exception:
+            pass
+        push_slide_result(cell_id, result, source=source)
+        refocus_presenter()
 
     preview = ""
     if result.parts:
@@ -1439,6 +1478,7 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
         + (f" — {preview}" if preview else "")
         + (f" · dialog={'synced' if synced else 'not synced'}")
         + f" · slide={_SESSION.get('slide_index', 0)}"
+        + (f" · fullscreen" if in_fs else " · preview")
     )
     return result
 
