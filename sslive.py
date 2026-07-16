@@ -43,6 +43,12 @@ try:
 except Exception:  # pragma: no cover - outside SolveIt
     find_msgs = curr_dialog = update_msg = read_msg = js_eval = iife = None
 
+# Prefer async variant when present (dialoghelper also has sync js_eval)
+try:
+    from dialoghelper.core import js_eval_a
+except Exception:  # pragma: no cover
+    js_eval_a = None
+
 try:
     from IPython.display import display, IFrame, clear_output, DisplayHandle, HTML as IPyHTML
     from IPython import get_ipython
@@ -1272,34 +1278,69 @@ if (!window.__sslive_bridge) {
 def _parse_js_eval_result(res: Any) -> Any:
     if res is None:
         return None
+    # AttrDict / dict2obj from dialoghelper
+    if hasattr(res, "result") and not isinstance(res, (str, bytes, list)):
+        try:
+            return res.result
+        except Exception:
+            pass
     if isinstance(res, dict):
         if "result" in res:
             return res["result"]
         if "data" in res:
             return res["data"]
         return res
-    if hasattr(res, "result"):
-        return res.result
+    return res
+
+
+async def _call_js_eval(expr: str) -> Any:
+    """Call dialoghelper js_eval correctly (sync or async depending on version).
+
+    In current dialoghelper, ``js_eval`` is **sync** and returns AttrDict —
+    awaiting it raises: object AttrDict can't be used in 'await' expression.
+    """
+    if js_eval_a is not None:
+        return await js_eval_a(expr)
+    if js_eval is None:
+        return None
+    res = js_eval(expr)
+    if inspect.isawaitable(res):
+        return await res
     return res
 
 
 async def _drain_slide_queue() -> list[dict]:
     """Pull pending {cell_id, source} runs from the parent page queue."""
-    if js_eval is None:
+    if js_eval is None and js_eval_a is None:
         return []
     try:
-        res = await js_eval(
-            "const q = window.__sslive_q || []; window.__sslive_q = []; return q;"
+        res = await _call_js_eval(
+            "const q = (window.__sslive_q || []).slice(); "
+            "window.__sslive_q = []; "
+            "return q;"
         )
         q = _parse_js_eval_result(res)
-        if not q:
+        if q is None:
             return []
-        if isinstance(q, dict):
-            # single object mistakenly returned
-            return [q] if q.get("cell_id") else []
-        return list(q)
+        # list-like
+        if hasattr(q, "__iter__") and not isinstance(q, (str, bytes, dict)):
+            items = list(q)
+            out = []
+            for item in items:
+                if isinstance(item, dict):
+                    out.append(item)
+                elif hasattr(item, "cell_id"):
+                    out.append(
+                        {
+                            "cell_id": getattr(item, "cell_id", None),
+                            "source": getattr(item, "source", ""),
+                        }
+                    )
+            return out
+        if isinstance(q, dict) and q.get("cell_id"):
+            return [q]
+        return []
     except Exception as e:
-        # quiet — poll is frequent
         if _SESSION.get("_bridge_err") != str(e):
             _SESSION["_bridge_err"] = str(e)
             print(f"sslive: bridge poll error: {e}")
