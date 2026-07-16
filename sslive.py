@@ -636,7 +636,7 @@ def _code_block_html(cell: Cell) -> str:
     """
 
 
-def _slide_html(deck: Deck, slide: Slide) -> str:
+def _slide_html(deck: Deck, slide: Slide, *, active: bool = False) -> str:
     parts: list[str] = []
     for cid in slide.cell_ids:
         cell = deck.cells[cid]
@@ -651,7 +651,7 @@ def _slide_html(deck: Deck, slide: Slide) -> str:
             # always emit output mount (seeded from last outputs / notebook)
             parts.append(render_output_html(cell.outputs, cell.id, deck.theme or THEME_DARK))
     cls = "slide title-slide" if slide.is_title else "slide"
-    hidden = " active" if slide.index == 0 else " hidden"
+    hidden = " active" if active else " hidden"
     return (
         f'<section class="{cls}{hidden}" data-slide="{slide.index}">'
         f'{"".join(parts)}</section>'
@@ -663,16 +663,19 @@ def generate_presenter_html(
     *,
     backend_label: str = "gpu",
     port: int | None = None,
+    initial_slide: int = 0,
 ) -> str:
-    """Full presenter page (custom JS + HTMX). No Reveal.js.
+    """Full presenter page (custom JS). No Reveal.js.
 
-    ``port`` is the JupyUvi port. The page probes reachable API bases so
-    execute works from a srcdoc iframe (browser cannot use bare /sslive on
-    SolveIt's front door — that is the 404 you saw).
+    ``initial_slide`` restores position after a rare full rebuild.
     """
     theme = deck.theme or THEME_DARK
-    slides_html = "\n".join(_slide_html(deck, s) for s in deck.slides)
-    n = len(deck.slides)
+    n_slides = len(deck.slides)
+    initial_slide = max(0, min(int(initial_slide), max(0, n_slides - 1)))
+    slides_html = "\n".join(
+        _slide_html(deck, s, active=(s.index == initial_slide)) for s in deck.slides
+    )
+    n = n_slides
     first_code = deck.ordered_code_ids[0] if deck.ordered_code_ids else ""
     port = int(port or _SESSION.get("port") or 8000)
 
@@ -716,8 +719,9 @@ def generate_presenter_html(
     """
 
     js = f"""
-    let currentSlide = 0;
+    let currentSlide = {initial_slide};
     let selectedCellId = {json.dumps(first_code)};
+    let lastResultT = 0;
     const slides = () => document.querySelectorAll('[data-slide]');
 
     function updateCounter() {{
@@ -732,17 +736,23 @@ def generate_presenter_html(
       }});
     }}
 
-    function showSlide(n) {{
+    function showSlide(n, {{ selectFirst }} = {{ selectFirst: true }}) {{
       const ss = slides();
       if (!ss.length) return;
-      ss[currentSlide]?.classList.remove('active');
-      ss[currentSlide]?.classList.add('hidden');
+      ss.forEach((s, i) => {{
+        s.classList.toggle('active', i === n);
+        s.classList.toggle('hidden', i !== n);
+      }});
       currentSlide = Math.max(0, Math.min(n, ss.length - 1));
-      ss[currentSlide].classList.remove('hidden');
-      ss[currentSlide].classList.add('active');
       updateCounter();
-      const first = ss[currentSlide].querySelector('[data-runnable]');
-      if (first) selectCell(first.dataset.cellId);
+      // tell parent our position (for rebuild recovery)
+      try {{
+        window.parent.__sslive_slide_index = currentSlide;
+      }} catch (e) {{}}
+      if (selectFirst) {{
+        const first = ss[currentSlide].querySelector('[data-runnable]');
+        if (first) selectCell(first.dataset.cellId);
+      }}
     }}
 
     function codeSource(cellId) {{
@@ -762,9 +772,11 @@ def generate_presenter_html(
     }}
 
     function applyRunResult(msg) {{
-      // In-place output update — do NOT reload the document (keeps slide + fullscreen)
+      // In-place only — never reload document (preserves slide + fullscreen)
+      if (!msg || !msg.cell_id) return;
+      if (msg.t && msg.t <= lastResultT) return;
+      if (msg.t) lastResultT = msg.t;
       const cellId = msg.cell_id;
-      if (!cellId) return;
       const out = document.getElementById('el-output-' + cellId);
       if (out && msg.html) {{
         const tmp = document.createElement('div');
@@ -774,11 +786,15 @@ def generate_presenter_html(
       }}
       const btn = document.querySelector('.run-btn[data-cell-id="' + cellId + '"]');
       if (btn) btn.disabled = false;
-      // keep selection/focus on the cell the user just ran
       selectCell(cellId);
       const ta = document.querySelector('textarea.code-ta[data-cell-id="' + cellId + '"]');
+      // keep user's edited text if Python also sent source
+      if (ta && msg.source != null && msg.source !== '') {{
+        // only sync source from Python if textarea was not focused
+        if (document.activeElement !== ta) ta.value = msg.source;
+      }}
       if (ta && msg.keep_focus !== false) {{
-        try {{ ta.focus({{ preventScroll: true }}); }} catch (e) {{ ta.focus(); }}
+        try {{ ta.focus({{ preventScroll: true }}); }} catch (e) {{ try {{ ta.focus(); }} catch (e2) {{}} }}
       }}
       const badge = document.getElementById('status-badge');
       if (badge) {{
@@ -787,18 +803,25 @@ def generate_presenter_html(
       }}
     }}
 
-    // Parent/Python posts results here after GPU run (avoids full iframe rebuild)
     window.addEventListener('message', function (e) {{
       if (!e.data || e.data.type !== 'sslive_result') return;
       applyRunResult(e.data);
     }});
 
+    // More reliable than postMessage into srcdoc: poll parent for last result
+    setInterval(function () {{
+      try {{
+        const r = window.parent.__sslive_last_result;
+        if (r && r.type === 'sslive_result') applyRunResult(r);
+      }} catch (e) {{}}
+    }}, 150);
+
     function runCellFromSlide(cellId) {{
       selectCell(cellId);
       const source = codeSource(cellId);
       setRunning(cellId, 'Running on GPU…');
-      // Bridge to SolveIt parent page → Python poll loop (no kernel HTTP port)
       try {{
+        window.parent.__sslive_slide_index = currentSlide;
         window.parent.postMessage({{
           type: 'sslive_run',
           cell_id: cellId,
@@ -824,7 +847,6 @@ def generate_presenter_html(
     }}
 
     document.addEventListener('keydown', (e) => {{
-      // don't steal keys while typing in a textarea (except handled above)
       if (e.target && e.target.tagName === 'TEXTAREA') {{
         if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') return;
         return;
@@ -861,8 +883,8 @@ def generate_presenter_html(
       rescale();
     }})();
 
-    if (selectedCellId) selectCell(selectedCellId);
-    updateCounter();
+    // restore slide without always selecting first code (keeps UX after rebuild)
+    showSlide(currentSlide, {{ selectFirst: true }});
     """
 
     empty = ""
@@ -1108,7 +1130,10 @@ def _presenter_iframe_html(height: str = "720px", port: int | None = None) -> st
     # On SolveIt, browser cannot reach JupyUvi — label says kernel-side run
     if _in_solveit() or not port:
         label = f"gpu · {msg} · edit in slide · ▶ Run"
-    html = generate_presenter_html(deck, backend_label=label, port=port or 0)
+    initial = int(_SESSION.get("slide_index") or 0)
+    html = generate_presenter_html(
+        deck, backend_label=label, port=port or 0, initial_slide=initial
+    )
     escaped = html_module.escape(html, quote=True)
     return (
         f'<iframe srcdoc="{escaped}" '
@@ -1229,33 +1254,37 @@ async def write_back_cell(cell_id: str, content: str) -> bool:
     return False
 
 
-def push_slide_result(cell_id: str, result: ExecResult) -> None:
-    """Push GPU outputs into the *existing* slide iframe (no rebuild / no slide reset)."""
+def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = None) -> None:
+    """Deliver GPU outputs to the live slide without rebuilding the iframe.
+
+    Uses ``window.__sslive_last_result`` (iframe polls parent) + postMessage.
+    Never calls refresh_presenter (that resets slide index / fullscreen).
+    """
     deck = _SESSION.get("deck")
     theme = (deck.theme if deck else None) or THEME_DARK
-    # Keep deck outputs in sync for any later full refresh
     if deck is not None and cell_id in deck.cells:
         deck.cells[cell_id].outputs = list(result.parts)
+        if source is not None:
+            _apply_source_to_deck(cell_id, source)
 
     html = render_output_html(result.parts or [], cell_id, theme)
-    # JSON-safe payload for parent → iframe postMessage
-    payload = json.dumps(
-        {
-            "type": "sslive_result",
-            "cell_id": cell_id,
-            "html": html,
-            "ok": bool(result.ok),
-            "keep_focus": True,
-        }
-    )
+    payload = {
+        "type": "sslive_result",
+        "cell_id": cell_id,
+        "html": html,
+        "ok": bool(result.ok),
+        "keep_focus": True,
+        "source": source,
+        "t": int(time.time() * 1000),
+    }
+    # Store on parent for reliable polling from srcdoc iframe
     js = f"""
 (function() {{
-  var msg = {payload};
-  // Deliver into every iframe (srcdoc slides live here)
+  var msg = {json.dumps(payload)};
+  window.__sslive_last_result = msg;
   document.querySelectorAll('iframe').forEach(function(f) {{
     try {{ f.contentWindow.postMessage(msg, '*'); }} catch (e) {{}}
   }});
-  // Prefer leaving focus on the slide iframe, not the dialog cell
   try {{
     var ifr = document.querySelector('iframe');
     if (ifr) ifr.focus();
@@ -1268,8 +1297,7 @@ def push_slide_result(cell_id: str, result: ExecResult) -> None:
             return
         except Exception as e:
             print(f"sslive: push_slide_result iife failed: {e}")
-    # last resort: full rebuild (resets slide index — avoid if possible)
-    refresh_presenter()
+    print("sslive: could not push result to slide UI (iife unavailable)")
 
 
 def _run_and_refresh(
@@ -1301,33 +1329,46 @@ def _run_and_refresh(
     if full_refresh:
         refresh_presenter()
     else:
-        push_slide_result(cell_id, result)
+        push_slide_result(cell_id, result, source=source)
     return result
 
 
-async def _sync_and_run(cell_id: str, source: str) -> ExecResult:
-    """Slide edit → GPU → in-place output; then soft-sync dialog source.
+async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
+    """Slide edit → GPU → in-place output. Dialog write-back is deferred.
 
-    Order matters: run + push UI first so we do not rebuild the iframe
-    (that was resetting to the title slide / exiting fullscreen). Write-back
-    to the dialog is after, so any focus steal is less disruptive.
+    ``update_msg`` often makes SolveIt re-render the dialog and **destroys** the
+    presentation iframe (exits fullscreen, jumps to title). So we:
+      1) run + push UI immediately
+      2) write-back in the background after a delay
     """
+    if slide_index is not None:
+        _SESSION["slide_index"] = int(slide_index)
     _apply_source_to_deck(cell_id, source)
-    # 1) GPU + in-place UI (preserve current slide / fullscreen)
+    # 1) GPU + in-place UI only (no full refresh)
     result = _run_and_refresh(cell_id, source=source, full_refresh=False)
-    # 2) Unify source into SolveIt cell (may refocus dialog — best-effort)
+
+    # 2) Deferred dialog sync so presentation chrome is not blown away mid-run
     if _SESSION.get("write_back", True):
-        ok = await write_back_cell(cell_id, source)
-        if ok:
-            print(f"sslive: synced slide source → dialog {cell_id}")
-        # try to return focus to the slide iframe after dialog update
-        if iife is not None:
+
+        async def _deferred_write():
+            await asyncio.sleep(1.0)
+            ok = await write_back_cell(cell_id, source)
+            if ok:
+                print(f"sslive: synced slide source → dialog {cell_id} (deferred)")
+            # Do NOT refresh_presenter here — update_msg may re-render the dialog
+            # and destroy the iframe; rebuilding would jump slides / exit fullscreen.
+            # Re-push last result so a surviving iframe still shows outputs.
             try:
-                iife(
-                    "try { var f=document.querySelector('iframe'); if(f) f.focus(); } catch(e){}"
-                )
+                push_slide_result(cell_id, result, source=source)
             except Exception:
                 pass
+
+        try:
+            asyncio.get_running_loop().create_task(_deferred_write())
+        except RuntimeError:
+            ok = await write_back_cell(cell_id, source)
+            if ok:
+                print(f"sslive: synced slide source → dialog {cell_id}")
     return result
 
 
@@ -1341,12 +1382,15 @@ def _install_parent_bridge() -> None:
 if (!window.__sslive_bridge) {
   window.__sslive_bridge = true;
   window.__sslive_q = window.__sslive_q || [];
+  window.__sslive_slide_index = window.__sslive_slide_index || 0;
   window.addEventListener('message', function (e) {
     var d = e.data;
     if (!d || d.type !== 'sslive_run') return;
+    if (d.slide_index != null) window.__sslive_slide_index = d.slide_index;
     window.__sslive_q.push({
       cell_id: d.cell_id,
       source: d.source == null ? '' : String(d.source),
+      slide_index: d.slide_index,
       t: Date.now()
     });
   });
@@ -1460,9 +1504,14 @@ async def _bridge_poll_loop() -> None:
                 source = item.get("source", "")
                 if not cid:
                     continue
+                sidx = item.get("slide_index")
                 print(f"sslive: slide Run → {cid} ({len(source or '')} chars)")
                 try:
-                    await _sync_and_run(str(cid), str(source if source is not None else ""))
+                    await _sync_and_run(
+                        str(cid),
+                        str(source if source is not None else ""),
+                        slide_index=int(sidx) if sidx is not None else None,
+                    )
                 except Exception as e:
                     print(f"sslive: slide Run failed: {e}")
         except asyncio.CancelledError:
