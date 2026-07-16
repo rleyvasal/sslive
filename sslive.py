@@ -761,6 +761,38 @@ def generate_presenter_html(
       if (btn) btn.disabled = true;
     }}
 
+    function applyRunResult(msg) {{
+      // In-place output update — do NOT reload the document (keeps slide + fullscreen)
+      const cellId = msg.cell_id;
+      if (!cellId) return;
+      const out = document.getElementById('el-output-' + cellId);
+      if (out && msg.html) {{
+        const tmp = document.createElement('div');
+        tmp.innerHTML = msg.html;
+        const neu = tmp.firstElementChild;
+        if (neu) out.replaceWith(neu);
+      }}
+      const btn = document.querySelector('.run-btn[data-cell-id="' + cellId + '"]');
+      if (btn) btn.disabled = false;
+      // keep selection/focus on the cell the user just ran
+      selectCell(cellId);
+      const ta = document.querySelector('textarea.code-ta[data-cell-id="' + cellId + '"]');
+      if (ta && msg.keep_focus !== false) {{
+        try {{ ta.focus({{ preventScroll: true }}); }} catch (e) {{ ta.focus(); }}
+      }}
+      const badge = document.getElementById('status-badge');
+      if (badge) {{
+        badge.textContent = msg.ok ? 'gpu · ok' : 'gpu · error';
+        badge.className = msg.ok ? 'ok' : 'bad';
+      }}
+    }}
+
+    // Parent/Python posts results here after GPU run (avoids full iframe rebuild)
+    window.addEventListener('message', function (e) {{
+      if (!e.data || e.data.type !== 'sslive_result') return;
+      applyRunResult(e.data);
+    }});
+
     function runCellFromSlide(cellId) {{
       selectCell(cellId);
       const source = codeSource(cellId);
@@ -770,7 +802,8 @@ def generate_presenter_html(
         window.parent.postMessage({{
           type: 'sslive_run',
           cell_id: cellId,
-          source: source
+          source: source,
+          slide_index: currentSlide
         }}, '*');
       }} catch (e) {{
         setRunning(cellId, 'postMessage failed: ' + e);
@@ -1196,8 +1229,56 @@ async def write_back_cell(cell_id: str, content: str) -> bool:
     return False
 
 
-def _run_and_refresh(cell_id: str, *, source: str | None = None) -> ExecResult:
-    """Execute deck source for cell_id on GPU and refresh the srcdoc deck."""
+def push_slide_result(cell_id: str, result: ExecResult) -> None:
+    """Push GPU outputs into the *existing* slide iframe (no rebuild / no slide reset)."""
+    deck = _SESSION.get("deck")
+    theme = (deck.theme if deck else None) or THEME_DARK
+    # Keep deck outputs in sync for any later full refresh
+    if deck is not None and cell_id in deck.cells:
+        deck.cells[cell_id].outputs = list(result.parts)
+
+    html = render_output_html(result.parts or [], cell_id, theme)
+    # JSON-safe payload for parent → iframe postMessage
+    payload = json.dumps(
+        {
+            "type": "sslive_result",
+            "cell_id": cell_id,
+            "html": html,
+            "ok": bool(result.ok),
+            "keep_focus": True,
+        }
+    )
+    js = f"""
+(function() {{
+  var msg = {payload};
+  // Deliver into every iframe (srcdoc slides live here)
+  document.querySelectorAll('iframe').forEach(function(f) {{
+    try {{ f.contentWindow.postMessage(msg, '*'); }} catch (e) {{}}
+  }});
+  // Prefer leaving focus on the slide iframe, not the dialog cell
+  try {{
+    var ifr = document.querySelector('iframe');
+    if (ifr) ifr.focus();
+  }} catch (e) {{}}
+}})();
+"""
+    if iife is not None:
+        try:
+            iife(js)
+            return
+        except Exception as e:
+            print(f"sslive: push_slide_result iife failed: {e}")
+    # last resort: full rebuild (resets slide index — avoid if possible)
+    refresh_presenter()
+
+
+def _run_and_refresh(
+    cell_id: str,
+    *,
+    source: str | None = None,
+    full_refresh: bool = False,
+) -> ExecResult:
+    """Execute on GPU; update slide outputs in place (default) or full rebuild."""
     deck = _SESSION.get("deck")
     executor = _SESSION.get("executor")
     if deck is None or executor is None:
@@ -1217,17 +1298,37 @@ def _run_and_refresh(cell_id: str, *, source: str | None = None) -> ExecResult:
         + (f" — {preview}" if preview else "")
         + (f" err={result.error}" if result.error else "")
     )
-    refresh_presenter()
+    if full_refresh:
+        refresh_presenter()
+    else:
+        push_slide_result(cell_id, result)
     return result
 
 
 async def _sync_and_run(cell_id: str, source: str) -> ExecResult:
-    """Unified path: slide-edited source → dialog write-back → GPU → refresh."""
+    """Slide edit → GPU → in-place output; then soft-sync dialog source.
+
+    Order matters: run + push UI first so we do not rebuild the iframe
+    (that was resetting to the title slide / exiting fullscreen). Write-back
+    to the dialog is after, so any focus steal is less disruptive.
+    """
     _apply_source_to_deck(cell_id, source)
-    ok = await write_back_cell(cell_id, source)
-    if ok:
-        print(f"sslive: synced slide source → dialog {cell_id}")
-    return _run_and_refresh(cell_id, source=source)
+    # 1) GPU + in-place UI (preserve current slide / fullscreen)
+    result = _run_and_refresh(cell_id, source=source, full_refresh=False)
+    # 2) Unify source into SolveIt cell (may refocus dialog — best-effort)
+    if _SESSION.get("write_back", True):
+        ok = await write_back_cell(cell_id, source)
+        if ok:
+            print(f"sslive: synced slide source → dialog {cell_id}")
+        # try to return focus to the slide iframe after dialog update
+        if iife is not None:
+            try:
+                iife(
+                    "try { var f=document.querySelector('iframe'); if(f) f.focus(); } catch(e){}"
+                )
+            except Exception:
+                pass
+    return result
 
 
 def _install_parent_bridge() -> None:
@@ -1558,8 +1659,9 @@ async def slive(
     )
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
-    print("In-slide: edit code · ▶ Run / Shift+Enter · syncs to SolveIt + GPU")
-    print("Navigate: ←/→ · f fullscreen")
+    _SESSION.setdefault("write_back", True)
+    print("In-slide: edit code · ▶ Run / Shift+Enter · GPU + sync to SolveIt")
+    print("Navigate: ←/→ · f fullscreen (outputs update in place — slide stays put)")
 
     if embed:
         _show_presenter(port, height=height)
