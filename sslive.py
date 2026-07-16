@@ -1349,37 +1349,53 @@ def _refocus_presenter_js() -> str:
     """
     return r"""
 (function () {
+  function findFrame() {
+    return document.getElementById('sslive-frame')
+      || document.querySelector('iframe[data-sslive="1"]')
+      || document.querySelector('iframe[srcdoc]');
+  }
   function focusFrame() {
+    // Never run this thrash while document is fullscreen (would exit FS)
+    var fs = document.fullscreenElement || document.webkitFullscreenElement;
+    if (fs) return true;
+
     try {
       var ae = document.activeElement;
-      if (ae && ae !== document.body && !(ae.id === 'sslive-frame' || ae.getAttribute('data-sslive') === '1')) {
+      if (ae && ae !== document.body && ae.tagName !== 'IFRAME'
+          && ae.id !== 'sslive-frame' && ae.getAttribute('data-sslive') !== '1') {
         try { ae.blur(); } catch (e) {}
       }
     } catch (e) {}
-    var ifr = document.getElementById('sslive-frame')
-      || document.querySelector('iframe[data-sslive="1"]')
-      || document.querySelector('iframe[srcdoc]');
+
+    var ifr = findFrame();
     if (!ifr) return false;
-    try { ifr.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' }); } catch (e) {
-      try { ifr.scrollIntoView(false); } catch (e2) {}
+
+    // Keep the presentation visible in the dialog scroller
+    try {
+      ifr.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+    } catch (e) {
+      try { ifr.scrollIntoView(true); } catch (e2) {}
     }
+    // Prefer focusing the iframe without scrolling the page again
     try { ifr.focus({ preventScroll: true }); } catch (e) {
       try { ifr.focus(); } catch (e2) {}
     }
     try {
-      // return keyboard focus into the slide document when same-origin/srcdoc allows
-      if (ifr.contentWindow) ifr.contentWindow.focus();
+      if (ifr.contentWindow) {
+        ifr.contentWindow.focus();
+        // Prefer the code textarea the user was editing
+        var doc = ifr.contentDocument || ifr.contentWindow.document;
+        if (doc) {
+          var ta = doc.querySelector('textarea.code-ta.selected, .code-wrap.selected textarea, textarea.code-ta');
+          if (ta) {
+            try { ta.focus({ preventScroll: true }); } catch (e3) { try { ta.focus(); } catch (e4) {} }
+          }
+        }
+      }
     } catch (e) {}
     return true;
   }
   focusFrame();
-  requestAnimationFrame(function () {
-    focusFrame();
-    setTimeout(focusFrame, 0);
-    setTimeout(focusFrame, 50);
-    setTimeout(focusFrame, 150);
-    setTimeout(focusFrame, 400);
-  });
 })();
 """
 
@@ -1460,21 +1476,28 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
         cell_id, source=source, full_refresh=False, quiet=True
     )
 
-    # Deferred dialog write-back (unified source). Do NOT refresh/refocus after.
+    # Deferred dialog write-back (unified source). Never refresh_presenter.
+    # After update_msg, SolveIt focuses the dialog cell in *preview* mode —
+    # steal focus back to #sslive-frame (fullscreen already keeps focus).
     if _SESSION.get("auto_sync_dialog", True):
 
         async def _deferred_dialog_write(cid=cell_id, src=source):
             try:
-                await asyncio.sleep(0.25)
-                # Flush this cell (and any others queued)
+                await asyncio.sleep(0.2)
                 pending = dict(_SESSION.get("pending_dialog_sync") or {})
                 pending[cid] = src
                 _SESSION["pending_dialog_sync"] = {}
                 for pcid, psrc in pending.items():
                     await write_back_cell(pcid, psrc)
-                # Re-push slide result in case host re-rendered output area
-                # (no full rebuild — only parent.__sslive_last_result)
                 push_slide_result(cid, result, source=src)
+                # Preview: host focuses the updated message — pull focus back
+                in_fs = await _parent_in_fullscreen()
+                if not in_fs:
+                    # Multi-wave refocus after SolveIt's own focus-on-update
+                    for delay in (0, 0.05, 0.12, 0.3, 0.6):
+                        if delay:
+                            await asyncio.sleep(delay)
+                        refocus_presenter()
             except Exception as e:
                 _SESSION["_dialog_sync_err"] = str(e)
 
@@ -1483,6 +1506,7 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
         except RuntimeError:
             try:
                 await write_back_cell(cell_id, source)
+                refocus_presenter()
             except Exception:
                 pass
 
