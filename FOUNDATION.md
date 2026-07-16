@@ -72,6 +72,18 @@ Do **not** use `execute_remote()` alone (dialog-only hook). Same client, capture
 5. `slive()` + skip cell  
 6. Interrupt / status polish  
 
+## dialoghelper (SolveIt)
+
+`find_msgs`, `curr_dialog`, and `update_msg` are **async**. Loader entry points
+must use `await`:
+
+- `await get_slides_cells_from_dialog()`
+- `await build_deck()`
+- `await slive()`
+
+Call from a SolveIt cell as `await slive()` under `%local`.  
+
+
 ## Explicit non-goals (foundation)
 
 - Write-back to SolveIt  

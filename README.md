@@ -34,15 +34,26 @@ Sibling of [sslides](https://github.com/rleyvasal/sslides) (static snapshot deck
 5. Presenter UI  
 6. `slive()` entry + skip launcher  
 
-## Usage (when wired)
+## Usage (foundation)
 
 ```python
-# SolveIt cell — after %gpu and CRAFT loaded
-%run /path/to/sslive.py
-# or: exec(open("sslive.py").read())
+# 1) Load script on SolveIt kernel (not GPU)
+%local
+%run sslive/sslive.py
 
-slive()
+# 2) Connect CRAFT
+%gpu
+
+# 3) Drive deck locally (dialoghelper is async)
+%local
+await slive()
+print(deck_summary())
+run_cell_index(0)   # executes that cell's source on the remote GPU
 ```
+
+Requires a note cell with exactly `#| s`, then `#` / `##` slide content below it.
+
+**Important:** keep `slive` / `run_cell_*` under `%local`. Only the *source strings* of slide code cells run on the GPU via CRAFT.
 
 ## Local reference
 

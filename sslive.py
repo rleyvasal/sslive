@@ -3,9 +3,17 @@
 Run-only: load deck from dialog/notebook, execute on CRAFT remote kernel,
 show outputs in a local presenter. No write-back of edits to SolveIt yet.
 
-Usage (SolveIt, after CRAFT + %gpu):
-    %run sslive.py
-    slive()
+Usage (SolveIt — driver stays local; GPU used only for cell execute)::
+
+    %local
+    %run sslive/sslive.py   # or path to this file
+
+    %gpu                    # connect CRAFT once
+
+    %local
+    await slive()
+    print(deck_summary())
+    run_cell_index(0)
 """
 
 from __future__ import annotations
@@ -108,11 +116,11 @@ class Deck:
 # Piece 1 — Content loader (sslides logic; load only — no write-back)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[dict]:
-    """Cells after `#| s` marker. Requires dialoghelper."""
+async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[dict]:
+    """Cells after `#| s` marker. Requires dialoghelper (async API)."""
     if find_msgs is None:
         raise RuntimeError("dialoghelper not available — run inside SolveIt")
-    all_msgs = find_msgs()
+    all_msgs = await find_msgs()
     marker_idx = None
     for i, m in enumerate(all_msgs):
         if m.get("msg_type") == "note" and m.get("content", "").strip() == "#| s":
@@ -200,16 +208,18 @@ def _notebook_outputs_to_parts(nb_cell: dict) -> list[OutputPart]:
     return parts
 
 
-def build_deck(
+async def build_deck(
     dialog_cells: list[dict] | None = None,
     notebook_path: str | Path | None = None,
     theme: dict | None = None,
 ) -> Deck:
     """Load authoring source into Deck. Does not write back."""
     if dialog_cells is None:
-        dialog_cells = get_slides_cells_from_dialog()
+        dialog_cells = await get_slides_cells_from_dialog()
     if notebook_path is None and curr_dialog is not None:
-        notebook_path = Path(curr_dialog()["name"]).name + ".ipynb"
+        dinfo = await curr_dialog()
+        if isinstance(dinfo, dict) and dinfo.get("name"):
+            notebook_path = Path(dinfo["name"]).name + ".ipynb"
     nb_cells, _nb_attachments = {}, {}
     if notebook_path and Path(notebook_path).exists():
         nb_cells, _nb_attachments = get_slides_cells_from_notebook(notebook_path, dialog_cells)
@@ -529,8 +539,18 @@ def _ensure_local_magic():
 # Piece 6 — Entry
 # ═══════════════════════════════════════════════════════════════════════════
 
-def slive(theme: str | dict = "dark", *, height: str = "720px", echo_to_dialog: bool = False):
+async def slive(
+    theme: str | dict = "dark",
+    *,
+    height: str = "720px",
+    echo_to_dialog: bool = False,
+):
     """Start foundation session: load deck, verify GPU, print status.
+
+    dialoghelper APIs are async — call from SolveIt as::
+
+        %local
+        await slive()
 
     Full presenter host is the next implementation step. For now this proves
     loader + executor wiring and skips the launcher cell (D6).
@@ -540,10 +560,10 @@ def slive(theme: str | dict = "dark", *, height: str = "720px", echo_to_dialog: 
     ok, msg = LiveExecutor().kernel_ok()
     if not ok:
         print(f"sslive: GPU not ready — {msg}")
-        print("Load CRAFT and run %gpu, then call slive() again.")
+        print("Load CRAFT and run %gpu, then call await slive() again under %local.")
         return None
 
-    deck = build_deck(theme=theme if isinstance(theme, dict) else {})
+    deck = await build_deck(theme=theme if isinstance(theme, dict) else {})
     executor = LiveExecutor()
     _SESSION["deck"] = deck
     _SESSION["executor"] = executor
@@ -554,6 +574,8 @@ def slive(theme: str | dict = "dark", *, height: str = "720px", echo_to_dialog: 
         f"sslive foundation: {len(deck.slides)} slides, {n_code} code cells, "
         f"backend=gpu ({msg})"
     )
+    if n_code == 0 and len(deck.slides) == 0:
+        print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
     print("Headless run:  run_cell('<cell_id>')  or  run_cell_index(0)")
     print("Presenter host (GET / + POST /execute) — next step.")
 
@@ -563,7 +585,7 @@ def slive(theme: str | dict = "dark", *, height: str = "720px", echo_to_dialog: 
             caller_globals = inspect.currentframe().f_back.f_globals
             mid = caller_globals.get("__msg_id")
             if mid:
-                update_msg(id=mid, skipped=1)
+                await update_msg(id=mid, skipped=1)
         except Exception:
             pass
 
@@ -575,7 +597,7 @@ def run_cell(cell_id: str, *, echo_to_dialog: bool | None = None) -> ExecResult:
     deck: Deck | None = _SESSION.get("deck")
     executor: LiveExecutor | None = _SESSION.get("executor")
     if deck is None or executor is None:
-        raise RuntimeError("Call slive() first")
+        raise RuntimeError("Call await slive() first")
     if echo_to_dialog is None:
         echo_to_dialog = bool(_SESSION.get("echo_to_dialog", False))
     result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo_to_dialog)
@@ -589,7 +611,7 @@ def run_cell(cell_id: str, *, echo_to_dialog: bool | None = None) -> ExecResult:
 def run_cell_index(i: int = 0, **kw) -> ExecResult:
     deck: Deck | None = _SESSION.get("deck")
     if deck is None:
-        raise RuntimeError("Call slive() first")
+        raise RuntimeError("Call await slive() first")
     if not deck.ordered_code_ids:
         raise RuntimeError("No code cells in deck")
     return run_cell(deck.ordered_code_ids[i], **kw)
