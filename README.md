@@ -4,72 +4,55 @@ Live GPU presentations for [SolveIt](https://solve.it.com), driven by [gpudev](h
 
 Sibling of [sslides](https://github.com/rleyvasal/sslides) (static snapshot decks). **sslive** is the live run path.
 
-## Status
+## Model
 
-**Foundation (S1-A):** run-only. No write-back of slide edits to the SolveIt notebook yet. Stable `cell_id` / `el_id` so save can land later.
+| Role | Where |
+|------|--------|
+| **Editor** | SolveIt dialog code cells (native browser editor) |
+| **Presentation** | Read-only srcdoc slide deck |
+| **Execute** | CRAFT remote GPU kernel |
 
-## Locked decisions
+```text
+Edit in SolveIt cell  →  await run_cell_index(i)  →  re-read dialog
+                      →  CRAFT GPU  →  refresh slides
+```
 
-| ID | Choice |
-|----|--------|
-| Delivery | Single notebook-runnable script (`sslive.py`) — not a package yet |
-| Backend | GPU only via CRAFT (`_exec_mgr`) |
-| Execute | Remote kernel path + capture hook (never mutate SolveIt cells to run) |
-| Source of truth | SolveIt dialog / `.ipynb` (load only in v0) |
-| Sync | S1-A: no live edit → notebook write-back |
-| Launcher | Skip/hide `slive()` cell after open (LLM context) |
-| UI stack | TBD after reusing sslides patterns; custom DOM + element ids |
-
-## Two pipes
-
-1. **Execute:** slide `cell_id` → Deck source → CRAFT remote kernel → outputs on slide UI  
-2. **Author (later):** slide edits → Deck → `update_msg` / notebook — **not in foundation**
-
-## Pieces (in `sslive.py`)
-
-1. Content loader  
-2. Deck model (`cell_id` / `el_id`)  
-3. GPU executor (capture)  
-4. Live host (routes)  
-5. Presenter UI  
-6. `slive()` entry + skip launcher  
+No second editor (no ipywidgets / no HTML textareas). The dialog is the source of truth.
 
 ## Usage
 
 ```python
-# 1) Load script on SolveIt kernel (not GPU)
 %local
 %run sslive/sslive.py
 
-# 2) Connect CRAFT
 %gpu
 
-# 3) Live deck (dialoghelper is async)
 %local
-await slive()          # starts local server + embeds preview iframe
-# optional: print(deck_summary()); run_cell_index(0)
-```
-
-Requires a note cell with exactly `#| s`, then `#` / `##` slide content below it.
-
-**Presenter:** slides are embedded with **srcdoc** (works on cloud SolveIt).  
-
-**Editable cells:** HTML textareas under the deck (no ipywidgets required).  
-The slide iframe is view-only; **edit the boxes below**.
-
-```python
 await slive()
-# edit the textarea under the slides, then:
-await run_editor(0)    # read editor → GPU (CRAFT) → refresh slides
-await save_editor(0)   # read editor → write-back to SolveIt dialog
+
+# Edit the SolveIt code cell in the dialog (above / in the #| s section), then:
+await run_cell_index(0)   # re-reads that cell → GPU → updates slide outputs
 ```
 
-If ipywidgets is installed you also get ▶ Run / 💾 Save buttons.
+Requires a note cell with exactly `#| s`, then `#` / `##` slides below it.
 
-**Important:** keep `slive` / `run_cell_*` under `%local`.
+### Commands
+
+| Call | Effect |
+|------|--------|
+| `await slive()` | Load deck, show slides + run panel, skip launcher cell |
+| `await run_cell_index(i)` | Re-read dialog cell `i` → GPU → refresh deck |
+| `await run_cell(cell_id)` | Same by message id |
+| `await reload_deck()` | Rebuild slides from dialog (structure changed) |
+| `refresh_presenter()` | Re-draw deck without re-running |
+
+Keep `slive` / `run_cell*` under **`%local`**. Only slide *source strings* run on the GPU.
 
 Optional HTTP server (local notebooks only): `await slive(use_http=True)`.
 
-## Local reference
+## Status
 
-Clone of sslides for inventory: `/Users/admin/sslides` (not a submodule).
+- GPU execute + output capture: yes  
+- Slide navigation (srcdoc): yes  
+- Edit: **SolveIt cells only**  
+- In-iframe ▶ Run over HTTP: not used on cloud SolveIt (browser cannot reach kernel port)  
