@@ -4127,32 +4127,53 @@ def generate_presenter_html(
 def _code_block_html_export(cell: Cell, *, style: str = "", extra_attrs: str = "") -> str:
     """Read-only code block for portable export — collapsed one-line like live UI.
 
-    Click the block to expand/collapse full source (no Run).
+    Click opens a standard floating panel (~6 lines, syntax-highlighted, SE-resize).
+    Layout height is ignored for the bar (always one line); layout x/y/w place the bar only.
     """
     cid = html_module.escape(cell.id)
     src = cell.source or ""
-    # Prefer layout height when set; else one-line bar like live (34px body)
-    layout_h = _height_px_from_style(style)
-    body_h = max(28, min(layout_h - 36, 48)) if layout_h else 34
     full_esc = html_module.escape(src)
     n_lines = max(1, src.count("\n") + (1 if src else 0))
     more = f" · {n_lines} lines" if n_lines > 1 else ""
+    # Strip layout height so a tall edit-mode box does not force a tall collapsed bar
+    style_bar = re.sub(
+        r"(?:^|;)\s*height\s*:\s*[^;]+;?",
+        ";",
+        style or "",
+        flags=re.I,
+    )
+    style_bar = re.sub(r";{2,}", ";", style_bar).strip(";").strip()
+    # Drop layout overflow too — it was paired with height for a pinned box
+    if style_bar and re.search(r"(?:^|;)\s*overflow\s*:", style_bar, flags=re.I):
+        style_bar = re.sub(
+            r"(?:^|;)\s*overflow\s*:\s*[^;]+;?",
+            ";",
+            style_bar,
+            flags=re.I,
+        )
+        style_bar = re.sub(r";{2,}", ";", style_bar).strip(";").strip()
+    first_line = (src.split("\n", 1)[0] if src else "") or " "
+    first_esc = html_module.escape(first_line)
     return (
         f'<div id="el-code-{cid}" class="code-wrap code-frozen" '
         f'data-el-id="el-code-{cid}" data-type="code" data-cell-id="{cid}"'
-        f"{extra_attrs}{_style_attr(style)}>"
-        f'<div class="code-toolbar">'
+        f"{extra_attrs}{_style_attr(style_bar)}>"
+        f'<div class="code-toolbar" onclick="ssToggleCode(this.closest(\'.code-wrap\'))">'
         f'<span class="cell-id">{cid}</span>'
         f'<span class="hint">exported · click to expand{more}</span>'
         f"</div>"
-        f'<pre class="code-pre code-pre-collapsed" style="height:{body_h}px;'
-        f'min-height:{body_h}px;max-height:{body_h}px" '
-        f'title="Click to expand/collapse" '
-        f'onclick="this.classList.toggle(\'code-pre-collapsed\');'
-        f'if(this.classList.contains(\'code-pre-collapsed\')){{'
-        f'this.style.height=this.style.minHeight;this.style.maxHeight=this.style.minHeight;'
-        f'}}else{{this.style.height=\'auto\';this.style.maxHeight=\'70vh\';}}">'
-        f"{full_esc}</pre>"
+        f'<pre class="code-pre code-pre-collapsed" title="Click to expand" '
+        f'onclick="ssToggleCode(this.closest(\'.code-wrap\'))">{first_esc}</pre>'
+        f'<div class="code-pop" id="code-pop-{cid}" hidden data-cell-id="{cid}">'
+        f'<div class="code-pop-head">'
+        f'<span class="cell-id">{cid}</span>'
+        f'<span class="hint">Esc · outside click · ↘ resize</span>'
+        f'<button type="button" class="code-pop-close" '
+        f'onclick="event.stopPropagation();ssCollapseCode()">collapse</button>'
+        f"</div>"
+        f'<pre class="code-pop-body"><code class="language-python">{full_esc}</code></pre>'
+        f'<div class="code-pop-rs" title="Drag to resize"></div>'
+        f"</div>"
         f"</div>"
     )
 
@@ -4288,29 +4309,70 @@ def generate_export_html(
     .sslive-plotly-host {{ width:100% !important; max-width:100%; box-sizing:border-box;
       position:relative; overflow:hidden; border-radius:8px; background:#0b1220; }}
     .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
-      padding:8px 12px; outline:none; flex:0 0 auto; max-width:100%; align-self:stretch; }}
+      padding:8px 12px; outline:none; flex:0 0 auto; max-width:100%; align-self:stretch;
+      cursor:pointer; box-sizing:border-box; }}
+    .code-wrap.code-open {{ border-color:#60a5fa; box-shadow:0 0 0 1px rgba(96,165,250,0.35); }}
     .code-toolbar {{ display:flex; align-items:center; gap:12px; margin-bottom:6px; flex-wrap:wrap; }}
     .cell-id {{ font-size:11px; color:{theme.get("muted", "#9ca3af")}; font-family:ui-monospace,monospace; }}
     .hint {{ font-size:11px; color:#6b7280; }}
     .code-pre {{ width:100%; box-sizing:border-box; margin:0; padding:6px 10px;
       font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45; font-size:14px;
       white-space:pre; color:#e5e7eb; background:#111827;
-      border:1px solid #4b5563; border-radius:6px; overflow:auto; cursor:pointer; }}
-    .code-pre-collapsed {{ overflow:hidden; white-space:pre; text-overflow:ellipsis; }}
+      border:1px solid #4b5563; border-radius:6px; }}
+    .code-pre-collapsed {{ height:34px; min-height:34px; max-height:34px;
+      overflow:hidden; white-space:nowrap; text-overflow:ellipsis; cursor:pointer; }}
+    /* Floating standard expand panel (viewport-fixed; above plots) */
+    .code-pop {{
+      position:fixed; z-index:40; display:flex; flex-direction:column;
+      width:min(920px, 90vw); height:200px; min-width:280px; min-height:148px;
+      max-width:95vw; max-height:50vh;
+      background:#0f172a; border:1px solid #60a5fa; border-radius:10px;
+      box-shadow:0 12px 40px rgba(0,0,0,0.55), 0 0 0 1px rgba(96,165,250,0.25);
+      overflow:hidden; box-sizing:border-box; cursor:default;
+    }}
+    .code-pop[hidden] {{ display:none !important; }}
+    .code-pop-head {{
+      display:flex; align-items:center; gap:10px; flex:0 0 auto;
+      padding:8px 12px; border-bottom:1px solid #1f2937; background:#111827;
+    }}
+    .code-pop-head .hint {{ flex:1; }}
+    .code-pop-close {{
+      background:#1f2937; border:1px solid #4b5563; color:#e5e7eb; border-radius:6px;
+      font-size:12px; padding:4px 10px; cursor:pointer;
+    }}
+    .code-pop-close:hover {{ border-color:#60a5fa; color:#93c5fd; }}
+    .code-pop-body {{
+      flex:1 1 auto; margin:0; padding:10px 14px; overflow:auto;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45; font-size:14px;
+      white-space:pre; color:#e5e7eb; background:#0b1220; tab-size:4;
+    }}
+    .code-pop-body code {{ font-family:inherit; font-size:inherit; background:transparent;
+      padding:0; white-space:pre; }}
+    .code-pop-rs {{
+      position:absolute; right:2px; bottom:2px; width:14px; height:14px; cursor:se-resize;
+      background:linear-gradient(135deg, transparent 50%, #60a5fa 50%);
+      border-radius:0 0 8px 0; opacity:0.85;
+    }}
+    .code-pop-rs:hover {{ opacity:1; }}
     .sslive-viz-frame, iframe.sslive-viz-frame {{ width:100%; border:0; border-radius:8px;
       background:#0b1220; display:block; }}
     [data-type="output"] {{ display:block; width:100%; max-width:100%; box-sizing:border-box; }}
     .frag-hidden {{ opacity:0 !important; visibility:hidden !important; pointer-events:none !important; }}
-    #chrome {{ position:fixed; left:12px; top:12px; z-index:20; display:flex; gap:10px; align-items:center;
+    #chrome {{ position:fixed; left:12px; top:12px; z-index:50; display:flex; gap:10px; align-items:center;
       background:rgba(0,0,0,0.55); color:#fff; padding:6px 12px; border-radius:8px; font-size:13px; }}
     #chrome .ok {{ color:#86efac; }}
-    #nav {{ position:fixed; right:16px; bottom:16px; z-index:20; display:flex; gap:12px; align-items:center;
+    #nav {{ position:fixed; right:16px; bottom:16px; z-index:50; display:flex; gap:12px; align-items:center;
       background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.85; }}
     #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer; padding:0 6px; }}
     #nav button:hover {{ color:#93c5fd; }}
     @media print {{
       html, body {{ overflow:visible; height:auto; background:#fff; color:#000; }}
       #chrome, #nav {{ display:none !important; }}
+      .code-pop {{ position:static !important; width:auto !important; height:auto !important;
+        max-height:none !important; box-shadow:none; border-color:#ccc; display:flex !important; }}
+      .code-pop[hidden] {{ display:flex !important; }}
+      .code-pop-rs, .code-pop-close {{ display:none !important; }}
+      .code-pre-collapsed {{ display:none !important; }}
       #viewport {{ width:auto; height:auto; overflow:visible; }}
       #stage {{ position:static; transform:none !important; left:0 !important; top:0 !important;
         width:100%; height:auto; }}
@@ -4324,7 +4386,14 @@ def generate_export_html(
     js = f"""
     let currentSlide = {initial_slide};
     let fragStep = 0;
+    let openCodeWrap = null;
+    let openCodePop = null;
     const slides = () => document.querySelectorAll('[data-slide]');
+    // Standard expanded panel: ~6 lines of mono 14px / 1.45 + header
+    const CODE_LINE = 14 * 1.45;
+    const CODE_HEAD = 40;
+    const CODE_DEF_LINES = 6;
+    const CODE_MIN_LINES = 5;
 
     function slideEls(slideEl) {{
       if (!slideEl) return [];
@@ -4355,6 +4424,7 @@ def generate_export_html(
       el.textContent = (currentSlide + 1) + ' / ' + Math.max(n, 1);
     }}
     function showSlide(n, frag) {{
+      ssCollapseCode();
       const ss = slides();
       if (!ss.length) return;
       n = Math.max(0, Math.min(n, ss.length - 1));
@@ -4383,7 +4453,73 @@ def generate_export_html(
         showSlide(prev, maxReveal(slides()[prev]));
       }}
     }}
+
+    function ssCollapseCode() {{
+      if (openCodeWrap) openCodeWrap.classList.remove('code-open');
+      if (openCodePop) {{
+        openCodePop.hidden = true;
+        // return panel to its code-wrap so DOM stays tidy
+        const ownerId = openCodePop.dataset.owner;
+        const owner = ownerId ? document.getElementById(ownerId) : null;
+        if (owner && openCodePop.parentElement !== owner) owner.appendChild(openCodePop);
+      }}
+      openCodeWrap = null;
+      openCodePop = null;
+    }}
+    function ssPositionPop(pop, wrap) {{
+      const bar = wrap.getBoundingClientRect();
+      const w = Math.min(920, Math.floor(window.innerWidth * 0.9));
+      const h = Math.round(CODE_LINE * CODE_DEF_LINES + CODE_HEAD + 16);
+      let left = Math.round(bar.left);
+      let top = Math.round(bar.bottom + 8);
+      if (left + w > window.innerWidth - 12) left = Math.max(12, window.innerWidth - w - 12);
+      if (left < 12) left = 12;
+      if (top + h > window.innerHeight - 12) {{
+        top = Math.max(12, Math.round(bar.top - h - 8));
+      }}
+      pop.style.width = w + 'px';
+      pop.style.height = h + 'px';
+      pop.style.left = left + 'px';
+      pop.style.top = top + 'px';
+    }}
+    function ssHighlightPop(pop) {{
+      const code = pop.querySelector('code.language-python');
+      if (!code || code.dataset.hl === '1') return;
+      if (window.hljs && typeof hljs.highlightElement === 'function') {{
+        try {{ hljs.highlightElement(code); code.dataset.hl = '1'; }} catch (e) {{}}
+      }}
+    }}
+    function ssToggleCode(wrap) {{
+      if (!wrap) return;
+      if (openCodeWrap === wrap) {{ ssCollapseCode(); return; }}
+      ssCollapseCode();
+      const pop = wrap.querySelector('.code-pop');
+      if (!pop) return;
+      openCodeWrap = wrap;
+      openCodePop = pop;
+      wrap.classList.add('code-open');
+      pop.dataset.owner = wrap.id || '';
+      // Portal to body so #stage transform does not trap position:fixed
+      if (pop.parentElement !== document.body) document.body.appendChild(pop);
+      pop.hidden = false;
+      ssPositionPop(pop, wrap);
+      ssHighlightPop(pop);
+    }}
+    window.ssToggleCode = ssToggleCode;
+    window.ssCollapseCode = ssCollapseCode;
+
+    document.addEventListener('mousedown', (e) => {{
+      if (!openCodePop) return;
+      if (openCodePop.contains(e.target)) return;
+      if (openCodeWrap && openCodeWrap.contains(e.target)) return;
+      ssCollapseCode();
+    }});
     document.addEventListener('keydown', (e) => {{
+      if (e.key === 'Escape' && openCodePop) {{
+        e.preventDefault();
+        ssCollapseCode();
+        return;
+      }}
       if (e.key === 'ArrowRight' || e.key === ' ') {{ e.preventDefault(); goNext(); }}
       if (e.key === 'ArrowLeft') {{ e.preventDefault(); goPrev(); }}
       if (e.key === 'f' && !e.metaKey && !e.ctrlKey) {{
@@ -4392,6 +4528,32 @@ def generate_export_html(
       if (e.key === 'Home') {{ e.preventDefault(); showSlide(0, 0); }}
       if (e.key === 'End') {{ e.preventDefault(); showSlide(slides().length - 1, 0); }}
     }});
+    // SE-corner resize for expanded code panel (session-only, not persisted)
+    (function codePopResize() {{
+      let drag = null;
+      document.addEventListener('mousedown', (e) => {{
+        const h = e.target.closest && e.target.closest('.code-pop-rs');
+        if (!h) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const pop = h.closest('.code-pop');
+        if (!pop) return;
+        const r = pop.getBoundingClientRect();
+        drag = {{ pop, x: e.clientX, y: e.clientY, w: r.width, h: r.height }};
+      }});
+      document.addEventListener('mousemove', (e) => {{
+        if (!drag) return;
+        const minH = Math.round(CODE_LINE * CODE_MIN_LINES + CODE_HEAD + 16);
+        const maxH = Math.floor(window.innerHeight * 0.5);
+        const minW = 280;
+        const maxW = Math.floor(window.innerWidth * 0.95);
+        const nw = Math.max(minW, Math.min(maxW, drag.w + (e.clientX - drag.x)));
+        const nh = Math.max(minH, Math.min(maxH, drag.h + (e.clientY - drag.y)));
+        drag.pop.style.width = nw + 'px';
+        drag.pop.style.height = nh + 'px';
+      }});
+      document.addEventListener('mouseup', () => {{ drag = null; }});
+    }})();
     document.getElementById('prev-btn')?.addEventListener('click', (e) => {{
       e.preventDefault(); goPrev();
     }});
@@ -4408,6 +4570,7 @@ def generate_export_html(
         stage.style.transform = 'scale(' + sc + ')';
         stage.style.left = ((vw - DESIGN_W * sc) / 2) + 'px';
         stage.style.top = ((vh - DESIGN_H * sc) / 2) + 'px';
+        if (openCodePop && openCodeWrap) ssPositionPop(openCodePop, openCodeWrap);
       }}
       new ResizeObserver(rescale).observe(viewport);
       rescale();
@@ -4433,6 +4596,8 @@ def generate_export_html(
   <meta name="generator" content="sslive {__version__} export"/>
   <title>{doc_title}</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <style>{css}</style>
 </head>
 <body>

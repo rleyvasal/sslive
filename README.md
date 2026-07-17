@@ -119,9 +119,12 @@ Reload host code after pulling changes:
 | Included | Not included (v1) |
 |----------|-------------------|
 | Slides, layout, reveal | Live ▶ Run |
-| Frozen code (collapsed; click to expand) | Layout editing |
+| Frozen code (collapsed bar; click → floating panel) | Layout editing |
+| Syntax-highlighted expand (~6 lines, SE-resize, Esc) | Live in-slide syntax highlighting |
 | Last-run outputs (PNG, Plotly, …) | Host-only viewers without snapshot |
-| Nav / keyboard / print CSS | Offline-vendored Plotly (uses CDN) |
+| Nav / keyboard / print CSS | Offline-vendored Plotly / highlight.js (CDN) |
+
+**Code in export:** collapsed to a one-line bar (same idea as live). Click opens a **standard floating panel** above the slide (~6 lines visible, scroll for more, highlight.js Python highlighting). Drag the ↘ corner to resize; Esc, second click, or click outside collapses. Edit-mode layout height does not size the expanded panel.
 
 **`%pointcloud` / Three.js:** export tries to embed a localhost viewer page (needs that server still reachable). If not, a placeholder is shown — use matplotlib/Plotly for fully portable viz.
 

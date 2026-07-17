@@ -27,6 +27,8 @@ End-to-end working version for SolveIt + CRAFT. **Do not paste this file into th
 
 - `export_html("talk.html")` / `export_html_str()` / `%slive_export` — static portable player
 - Frozen code + last-run outputs, layout, reveal, keyboard nav; no live GPU
+- Code expand: floating ~6-line panel (z-index above plots), SE-resize, Esc/outside collapse
+- Export syntax highlighting via highlight.js CDN (Python); layout height no longer drives expand size
 
 ### Known follow-ups
 
@@ -34,4 +36,4 @@ End-to-end working version for SolveIt + CRAFT. **Do not paste this file into th
 - Package split (`deck` / `execute` / `layout` / `presenter` / `bridge` / `entry`) behind thin `%run` entry
 - Stable note fragment ids (S2-D renumber drift)
 - Shared `craft_hostkit` + CRAFT thin addon loader for sslive / pcviz / mojo
-- Export: offline Plotly bundle, image inlining, in-preview download button
+- Export: offline Plotly / highlight.js bundles, image inlining, in-preview download button
