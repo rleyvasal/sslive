@@ -1016,6 +1016,10 @@ async def flush_layout_save(*, quiet: bool = False, force: bool = False) -> bool
     note on a clean re-``%slive``). Use ``force=True`` to always write.
 
     ``quiet=True`` avoids slide-restore postMessage / console noise.
+
+    While the slide is **fullscreen**, dialog ``update_msg`` can remount the
+    iframe and drop FS — so the write is deferred until fullscreen ends
+    (unless ``force=True``).
     """
     prev = _SESSION.get("_layout_save_task")
     had_pending_task = prev is not None and not prev.done()
@@ -1043,12 +1047,25 @@ async def flush_layout_save(*, quiet: bool = False, force: bool = False) -> bool
     )
     if not dirty:
         _SESSION["_layout_save_pending"] = False
+        _SESSION.pop("_layout_pending_fs_flush", None)
         return True
+
+    # Defer dialog write while fullscreen (keeps FS; memory already has layout)
+    if not force:
+        try:
+            if await _parent_in_fullscreen():
+                _SESSION["_layout_dirty"] = True
+                _SESSION["_layout_pending_fs_flush"] = True
+                _SESSION["_layout_save_pending"] = False
+                return True
+        except Exception:
+            pass
 
     ok = await save_layout(quiet=quiet)
     _SESSION["_layout_save_pending"] = False
     if ok:
         _SESSION["_layout_dirty"] = False
+        _SESSION.pop("_layout_pending_fs_flush", None)
     return ok
 
 
@@ -4226,6 +4243,14 @@ def generate_presenter_html(
       runCellFromSlide(selectedCellId);
     }}
 
+    // Capture phase: stop browser from leaving fullscreen on Esc while editing
+    document.addEventListener('keydown', (e) => {{
+      if (e.key !== 'Escape' || !editing) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setEditing(false);
+    }}, true);
+
     document.addEventListener('keydown', (e) => {{
       const tag = e.target && e.target.tagName;
       if (tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT') {{
@@ -4238,10 +4263,8 @@ def generate_presenter_html(
         setEditing(!editing);
         return;
       }}
-      if (e.key === 'Escape' && editing) {{
-        setEditing(false);  // exits directly (and deselects); ✎/e toggle back
-        return;
-      }}
+      // Esc while editing handled in capture listener (above)
+      if (e.key === 'Escape' && editing) return;
       // While editing + selection: arrows nudge. Otherwise arrows navigate slides.
       if (editing && editSel && e.key.startsWith('Arrow')) {{
         e.preventDefault();
@@ -4388,6 +4411,11 @@ def generate_presenter_html(
           if (e.key === 'Escape') {{
             e.preventDefault();
             e.stopPropagation();
+            // Prefer leave-edit over collapse if layout editing is on
+            if (typeof editing !== 'undefined' && editing) {{
+              setEditing(false);
+              return;
+            }}
             closeLiveCodePop({{ sync: true }});
             return;
           }}
@@ -5837,14 +5865,21 @@ def _push_slide_index_restore(*, keep_edit: bool = False) -> None:
 
 
 async def _parent_in_fullscreen() -> bool:
-    """True if document or the sslive iframe is fullscreen."""
+    """True if parent page or the sslive iframe document is fullscreen."""
     try:
         if js_eval is None and js_eval_a is None:
             return False
         res = await _call_js_eval(
-            "return !!(document.fullscreenElement "
-            "|| document.webkitFullscreenElement "
-            "|| document.mozFullScreenElement);"
+            "var fs = document.fullscreenElement || document.webkitFullscreenElement "
+            "|| document.mozFullScreenElement;"
+            "if (fs) return true;"
+            "try {"
+            "  var f = document.getElementById('sslive-frame')"
+            "    || document.querySelector('iframe[data-sslive=\"1\"]');"
+            "  var d = f && (f.contentDocument || (f.contentWindow && f.contentWindow.document));"
+            "  if (d && (d.fullscreenElement || d.webkitFullscreenElement)) return true;"
+            "} catch (e) {}"
+            "return false;"
         )
         return bool(_parse_js_eval_result(res))
     except Exception:
@@ -6262,10 +6297,23 @@ async def _bridge_poll_loop() -> None:
             # layout first: a Run in the same batch re-renders the output
             # block and must see the just-dragged position
             _apply_slide_layout_patches(layout_patches)
-            # Edit-mode exit asks for an immediate dialog write
+            # Edit-mode exit → persist layout (quiet: no focus/restore thrash).
+            # While fullscreen, flush defers the dialog write until FS ends.
             if want_flush:
                 try:
-                    await flush_layout_save()
+                    await flush_layout_save(quiet=True)
+                except Exception as e:
+                    _SESSION["_layout_flush_err"] = str(e)
+            elif _SESSION.get("_layout_pending_fs_flush") or _SESSION.get(
+                "_layout_dirty"
+            ):
+                # Finish a deferred leave-edit save once the user leaves fullscreen
+                try:
+                    if not await _parent_in_fullscreen():
+                        if _SESSION.get("_layout_pending_fs_flush") or _SESSION.get(
+                            "_layout_dirty"
+                        ):
+                            await flush_layout_save(quiet=True)
                 except Exception as e:
                     _SESSION["_layout_flush_err"] = str(e)
             for item in pending:

@@ -41,6 +41,11 @@ End-to-end working version for SolveIt + CRAFT. **Do not paste this file into th
 - After Run, Plotly used to drop absolute `left`/`top` (new HTML always has `width:100%…`, so it replaced live geometry); matplotlib (empty style) was fine
 - `applyRunResult` now always re-applies the live output box position/size onto the replacement node
 
+### Fullscreen + leave edit
+
+- Esc while ✎ editing only leaves edit mode (`preventDefault` so the browser does not exit fullscreen); second Esc can leave fullscreen
+- Leave-edit layout save is deferred while fullscreen (dialog `update_msg` was remounting the iframe and dropping FS); writes when fullscreen ends
+
 ### Export (0.1.1)
 
 - `export_html("talk.html")` / `export_html_str()` / `%slive_export` — static portable player
