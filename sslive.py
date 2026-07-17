@@ -105,6 +105,7 @@ class Element:
     kind: str
     order: int
     content: str = ""  # source snippet or plain text as applicable
+    html: str = ""  # pre-rendered fragment (S2-D note pieces)
     x: float | None = None
     y: float | None = None
     fragment_step: int | None = None
@@ -255,9 +256,9 @@ async def build_deck(
         dinfo = await curr_dialog()
         if isinstance(dinfo, dict) and dinfo.get("name"):
             notebook_path = Path(dinfo["name"]).name + ".ipynb"
-    nb_cells, _nb_attachments = {}, {}
+    nb_cells, nb_attachments = {}, {}
     if notebook_path and Path(notebook_path).exists():
-        nb_cells, _nb_attachments = get_slides_cells_from_notebook(notebook_path, dialog_cells)
+        nb_cells, nb_attachments = get_slides_cells_from_notebook(notebook_path, dialog_cells)
 
     groups = group_dialog_cells_by_heading(dialog_cells)
     deck = Deck(theme=theme or {})
@@ -299,13 +300,29 @@ async def build_deck(
                 c.element_ids.append(out_id)
                 el_counter += 1
             else:
-                # coarse note element — finer parse later (sslides mistletoe path)
-                el_id = f"el-note-{cid}"
-                deck.elements[el_id] = Element(
-                    id=el_id, cell_id=cid, kind="note", order=el_counter, content=source
-                )
-                c.element_ids.append(el_id)
-                el_counter += 1
+                # S2-D: fine-grained note pieces (heading / list_item / math / image / …)
+                pieces = parse_note_to_elements(source, cid, nb_attachments)
+                if not pieces:
+                    pieces = [
+                        {
+                            "id": f"el-0-{cid}",
+                            "kind": "paragraph",
+                            "html": "",
+                            "content": source,
+                        }
+                    ]
+                for p in pieces:
+                    el_id = p["id"]
+                    deck.elements[el_id] = Element(
+                        id=el_id,
+                        cell_id=cid,
+                        kind=p.get("kind") or "paragraph",
+                        order=el_counter,
+                        content=p.get("content") or "",
+                        html=p.get("html") or "",
+                    )
+                    c.element_ids.append(el_id)
+                    el_counter += 1
 
             deck.cells[cid] = c
             slide.cell_ids.append(cid)
@@ -974,25 +991,34 @@ def _ensure_local_magic():
 
 
 def _math_to_mathml(latex_str: str) -> str:
-    """`$...$` / `$$...$$` → MathML (display math centered as a block)."""
+    """`$...$` / `$$...$$` / ``\\(...\\)`` / ``\\[...\\]`` → MathML."""
+    raw = (latex_str or "").strip()
+    if not raw:
+        return ""
     if _l2m is None:
-        return html_module.escape(latex_str)
-    if latex_str.startswith("$$"):
-        mathml = _l2m.convert(latex_str[2:-2].strip())
+        return f'<div class="math-block">{html_module.escape(raw)}</div>'
+    display = False
+    body = raw
+    if raw.startswith("$$") and raw.endswith("$$") and len(raw) >= 4:
+        display, body = True, raw[2:-2].strip()
+    elif raw.startswith("\\[") and raw.endswith("\\]"):
+        display, body = True, raw[2:-2].strip()
+    elif raw.startswith("\\(") and raw.endswith("\\)"):
+        body = raw[2:-2].strip()
+    elif raw.startswith("$") and raw.endswith("$") and not raw.startswith("$$"):
+        body = raw[1:-1].strip()
+    try:
+        mathml = _l2m.convert(body)
+    except Exception:
+        return f'<div class="math-block">{html_module.escape(raw)}</div>'
+    if display:
         mathml = mathml.replace('display="inline"', 'display="block"')
         return f'<div class="math-block">{mathml}</div>'
-    return _l2m.convert(latex_str[1:-1])
+    return f'<span class="math-inline">{mathml}</span>'
 
 
-def _note_to_html_md(content: str) -> str:
-    """Full note render: mistletoe markdown + latex2mathml (sslides pipeline).
-
-    Math is pulled out before markdown so `_`/`^`/`\\` survive, using plain
-    alphanumeric placeholders (markdown-inert). Unlike sslides' global HTML
-    unescape, this leaves entities inside code spans intact (`` `<div>` ``
-    stays escaped). Raw HTML in notes passes through — mistletoe default,
-    and the content is the author's own dialog.
-    """
+def _extract_math_placeholders(content: str) -> tuple[str, list[str]]:
+    """Pull math out before markdown so `_`/`^`/`\\` survive."""
     math_blocks: list[str] = []
 
     def save_math(m: "re.Match[str]") -> str:
@@ -1000,11 +1026,13 @@ def _note_to_html_md(content: str) -> str:
         return f"SSLIVEMATH{len(math_blocks) - 1}X"
 
     content = re.sub(r"\$\$(.*?)\$\$", save_math, content, flags=re.DOTALL)
+    content = re.sub(r"\\\[(.*?)\\\]", save_math, content, flags=re.DOTALL)
     content = re.sub(r"\$([^\$\n]+)\$", save_math, content)
+    content = re.sub(r"\\\((.*?)\\\)", save_math, content, flags=re.DOTALL)
+    return content, math_blocks
 
-    with _MdHTMLRenderer() as renderer:
-        html = renderer.render(_MdDocument(content))
 
+def _restore_math_in_html(html: str, math_blocks: list[str]) -> str:
     for i, block in enumerate(math_blocks):
         try:
             rep = _math_to_mathml(block)
@@ -1012,6 +1040,43 @@ def _note_to_html_md(content: str) -> str:
             rep = html_module.escape(block)
         html = html.replace(f"SSLIVEMATH{i}X", rep)
     return html
+
+
+_MATH_PH_RE = re.compile(r"SSLIVEMATH(\d+)X")
+_MD_IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+_HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.I)
+_ATTACH_RE = re.compile(r"!\[([^\]]*)\]\(attachment:([^)]+)\)")
+_MEDIA_SPLIT_RE = re.compile(
+    r"(SSLIVEMATH\d+X)|(<img\b[^>]*>)|(!\[[^\]]*\]\([^)]+\))",
+    re.I,
+)
+
+
+def _resolve_note_attachments(content: str, nb_attachments: dict | None) -> str:
+    """Rewrite ``attachment:`` markdown images to data-URLs when available."""
+    if not nb_attachments:
+        return content
+
+    def repl(m: "re.Match[str]") -> str:
+        alt, att_id = m.group(1), m.group(2)
+        att = nb_attachments.get(att_id) or {}
+        for mime in ("image/png", "image/jpeg", "image/gif", "image/webp"):
+            b64 = att.get(mime)
+            if b64:
+                if isinstance(b64, list):
+                    b64 = "".join(b64)
+                return f"![{alt}](data:{mime};base64,{b64})"
+        return m.group(0)
+
+    return _ATTACH_RE.sub(repl, content)
+
+
+def _note_to_html_md(content: str) -> str:
+    """Full note render: mistletoe markdown + latex2mathml (sslides pipeline)."""
+    content, math_blocks = _extract_math_placeholders(content or "")
+    with _MdHTMLRenderer() as renderer:
+        html = renderer.render(_MdDocument(content))
+    return _restore_math_in_html(html, math_blocks)
 
 
 def _note_to_html(source: str) -> str:
@@ -1039,7 +1104,6 @@ def _note_to_html_basic(source: str) -> str:
         h = ""
         body = source
     if body:
-        # preserve paragraphs
         paras = []
         for block in re.split(r"\n\s*\n", body):
             block = block.strip()
@@ -1053,6 +1117,284 @@ def _note_to_html_basic(source: str) -> str:
                 )
         return h + "".join(paras)
     return h
+
+
+def _image_payload_to_html(payload: str) -> str:
+    payload = (payload or "").strip()
+    if payload.lower().startswith("<img"):
+        return f'<figure class="note-image">{payload}</figure>'
+    m = _MD_IMG_RE.match(payload)
+    if m:
+        alt, src = m.group(1), m.group(2)
+        return (
+            f'<figure class="note-image">'
+            f'<img src="{html_module.escape(src, quote=True)}" '
+            f'alt="{html_module.escape(alt, quote=True)}" draggable="false"/>'
+            f"</figure>"
+        )
+    return f'<figure class="note-image"><img alt="image" draggable="false"/></figure>'
+
+
+def _wrap_list_item_html(inner_html: str) -> str:
+    h = (inner_html or "").strip()
+    if h.startswith("<ul") or h.startswith("<ol"):
+        return h
+    if h.startswith("<li"):
+        return f'<ul class="note-list">{h}</ul>'
+    return f'<ul class="note-list"><li class="note-li">{h}</li></ul>'
+
+
+def _html_is_effectively_empty(html: str) -> bool:
+    text = re.sub(r"<[^>]+>", "", html or "")
+    text = html_module.unescape(text).strip()
+    return not text
+
+
+def _split_media_runs(
+    fragment: str,
+    math_blocks: list[str],
+    *,
+    text_kind: str,
+) -> list[tuple[str, str, str]]:
+    """Split HTML/text with math placeholders / images into (kind, content, html)."""
+    frag = fragment or ""
+    if not frag.strip():
+        return []
+    if not _MEDIA_SPLIT_RE.search(frag):
+        return []
+
+    runs: list[tuple[str, str, str]] = []
+    pos = 0
+    for m in _MEDIA_SPLIT_RE.finditer(frag):
+        if m.start() > pos:
+            chunk = frag[pos : m.start()]
+            if not _html_is_effectively_empty(chunk):
+                html = _restore_math_in_html(chunk.strip(), math_blocks)
+                if text_kind == "list_item":
+                    html = _wrap_list_item_html(html)
+                runs.append((text_kind, re.sub(r"<[^>]+>", "", chunk).strip(), html))
+        token = m.group(0)
+        if token.startswith("SSLIVEMATH"):
+            mm = _MATH_PH_RE.fullmatch(token)
+            idx = int(mm.group(1)) if mm else -1
+            raw = math_blocks[idx] if 0 <= idx < len(math_blocks) else token
+            runs.append(("math", raw, _math_to_mathml(raw)))
+        else:
+            runs.append(("image", token, _image_payload_to_html(token)))
+        pos = m.end()
+    if pos < len(frag):
+        chunk = frag[pos:]
+        if not _html_is_effectively_empty(chunk):
+            html = _restore_math_in_html(chunk.strip(), math_blocks)
+            if text_kind == "list_item":
+                html = _wrap_list_item_html(html)
+            runs.append((text_kind, re.sub(r"<[^>]+>", "", chunk).strip(), html))
+    return runs
+
+
+def _token_plain(token: Any) -> str:
+    parts: list[str] = []
+
+    def walk(t: Any) -> None:
+        c = getattr(t, "content", None)
+        if isinstance(c, str) and c:
+            parts.append(c)
+        for ch in getattr(t, "children", None) or []:
+            walk(ch)
+
+    walk(token)
+    return "".join(parts)
+
+
+def parse_note_to_elements(
+    source: str,
+    cell_id: str,
+    nb_attachments: dict | None = None,
+) -> list[dict]:
+    """Split a note cell into fine-grained elements (S2-D).
+
+    Returns ``[{id, kind, html, content}, ...]`` with ids ``el-{idx}-{cell_id}``.
+    """
+    source = _resolve_note_attachments(source or "", nb_attachments)
+    out: list[dict] = []
+
+    def emit(kind: str, html: str, content: str = "") -> None:
+        html = (html or "").strip()
+        if not html:
+            return
+        idx = len(out)
+        out.append(
+            {
+                "id": f"el-{idx}-{cell_id}",
+                "kind": kind,
+                "html": html,
+                "content": content or "",
+            }
+        )
+
+    def emit_runs(runs: list[tuple[str, str, str]]) -> None:
+        for kind, content, html in runs:
+            emit(kind, html, content)
+
+    if _MdDocument is not None and _MdHTMLRenderer is not None:
+        try:
+            content, math_blocks = _extract_math_placeholders(source)
+            doc = _MdDocument(content)
+            with _MdHTMLRenderer() as renderer:
+                for child in doc.children or []:
+                    tname = type(child).__name__
+                    if tname == "ThematicBreak":
+                        continue
+                    if tname == "List":
+                        for item in child.children or []:
+                            item_html = renderer.render(item)
+                            runs = _split_media_runs(
+                                item_html, math_blocks, text_kind="list_item"
+                            )
+                            if runs:
+                                emit_runs(runs)
+                                continue
+                            html = _restore_math_in_html(item_html, math_blocks)
+                            if not html.strip().startswith("<ul") and not html.strip().startswith("<ol"):
+                                html = _wrap_list_item_html(html)
+                            emit("list_item", html, _token_plain(item))
+                        continue
+
+                    kind_map = {
+                        "Heading": "heading",
+                        "Paragraph": "paragraph",
+                        "CodeFence": "code",
+                        "BlockCode": "code",
+                        "Quote": "quote",
+                        "Table": "table",
+                        "HTMLBlock": "html",
+                    }
+                    kind = kind_map.get(tname, (tname or "block").lower())
+                    html = renderer.render(child)
+                    plain = _token_plain(child)
+
+                    if kind in ("paragraph", "heading", "quote", "html"):
+                        runs = _split_media_runs(html, math_blocks, text_kind=kind)
+                        if runs:
+                            # image-only paragraph → just image(s)
+                            emit_runs(runs)
+                            continue
+                        # paragraph that is only image(s) after render
+                        imgs = _HTML_IMG_RE.findall(html)
+                        without = _HTML_IMG_RE.sub("", html)
+                        if imgs and _html_is_effectively_empty(without):
+                            for im in imgs:
+                                emit("image", _image_payload_to_html(im), im)
+                            continue
+
+                    emit(kind, _restore_math_in_html(html, math_blocks), plain)
+            if out:
+                return out
+        except Exception as e:
+            try:
+                _SESSION["_note_parse_err"] = str(e)
+            except Exception:
+                pass
+
+    return _parse_note_to_elements_basic(source, cell_id)
+
+
+def _parse_note_to_elements_basic(source: str, cell_id: str) -> list[dict]:
+    """Line-heuristic fallback when mistletoe is unavailable."""
+    out: list[dict] = []
+
+    def emit(kind: str, html: str, content: str = "") -> None:
+        if not (html or "").strip():
+            return
+        out.append(
+            {
+                "id": f"el-{len(out)}-{cell_id}",
+                "kind": kind,
+                "html": html,
+                "content": content,
+            }
+        )
+
+    text = source or ""
+    # Split out display-math blocks first
+    segments: list[tuple[str, str]] = []
+    pos = 0
+    for m in re.finditer(r"\$\$(.*?)\$\$", text, flags=re.DOTALL):
+        if m.start() > pos:
+            segments.append(("body", text[pos : m.start()]))
+        segments.append(("math", m.group(0)))
+        pos = m.end()
+    if pos < len(text):
+        segments.append(("body", text[pos:]))
+    if not segments:
+        segments = [("body", text)]
+
+    for seg_kind, chunk in segments:
+        if seg_kind == "math":
+            emit("math", _math_to_mathml(chunk), chunk)
+            continue
+        for block in re.split(r"\n\s*\n", chunk):
+            block = block.strip()
+            if not block:
+                continue
+            if _MD_IMG_RE.fullmatch(block):
+                emit("image", _image_payload_to_html(block), block)
+                continue
+            lines = [ln for ln in block.splitlines() if ln.strip()]
+            if lines and all(re.match(r"^\s*([-*+]|\d+\.)\s+", ln) for ln in lines):
+                for ln in lines:
+                    item = re.sub(r"^\s*([-*+]|\d+\.)\s+", "", ln.strip())
+                    content, maths = _extract_math_placeholders(item)
+                    # rebuild a pseudo-html with placeholders for split
+                    pseudo = content
+                    # re-insert image md as-is
+                    runs = _split_media_runs(pseudo, maths, text_kind="list_item")
+                    if runs:
+                        for k, c, h in runs:
+                            emit(k, h, c)
+                    else:
+                        emit(
+                            "list_item",
+                            _wrap_list_item_html(
+                                f"<p>{html_module.escape(item)}</p>"
+                            ),
+                            item,
+                        )
+                continue
+            first = lines[0].strip() if lines else block
+            if first.startswith("#"):
+                level = len(first) - len(first.lstrip("#"))
+                level = min(max(level, 1), 3)
+                title = first[level:].strip()
+                tag = f"h{level}"
+                cls = " slide-h1" if level == 1 else (" slide-h2" if level == 2 else "")
+                emit(
+                    "heading",
+                    f'<{tag} class="{cls.strip()}">{html_module.escape(title)}</{tag}>',
+                    title,
+                )
+                rest = "\n".join(lines[1:]).strip()
+                if rest:
+                    emit(
+                        "paragraph",
+                        f"<p class='slide-p'>{html_module.escape(rest)}</p>",
+                        rest,
+                    )
+                continue
+            content, maths = _extract_math_placeholders(block)
+            runs = _split_media_runs(content, maths, text_kind="paragraph")
+            if runs:
+                for k, c, h in runs:
+                    emit(k, h, c)
+            else:
+                emit(
+                    "paragraph",
+                    f"<p class='slide-p'>{html_module.escape(block).replace(chr(10), '<br/>')}</p>",
+                    block,
+                )
+    if not out and (source or "").strip():
+        emit("paragraph", _note_to_html_basic(source), source)
+    return out
 
 
 def _code_block_html(cell: Cell, *, style: str = "", extra_attrs: str = "") -> str:
@@ -1089,15 +1431,22 @@ def _slide_html(deck: Deck, slide: Slide, *, active: bool = False) -> str:
     for cid in slide.cell_ids:
         cell = deck.cells[cid]
         if cell.kind == "note":
-            eid = html_module.escape(f"el-note-{cid}")
-            spec = _layout_spec(deck, f"el-note-{cid}")
-            style = _el_style(spec)
-            parts.append(
-                f'<div id="{eid}" class="note-block" data-el-id="{eid}" '
-                f'data-cell-id="{html_module.escape(cid)}"{_reveal_attr(spec)}'
-                f'{_style_attr(style)}>'
-                f"{_note_to_html(cell.source)}</div>"
-            )
+            # S2-D: one DOM node per parsed piece (title, bullet, math, image, …)
+            note_ids = cell.element_ids or [f"el-0-{cid}"]
+            for el_id in note_ids:
+                el = deck.elements.get(el_id)
+                if el is None:
+                    continue
+                eid = html_module.escape(el_id)
+                spec = _layout_spec(deck, el_id)
+                style = _el_style(spec)
+                kind = html_module.escape(el.kind or "paragraph")
+                body = el.html if el.html else _note_to_html(el.content or cell.source)
+                parts.append(
+                    f'<div id="{eid}" class="note-block" data-el-id="{eid}" '
+                    f'data-type="{kind}" data-cell-id="{html_module.escape(cid)}"'
+                    f'{_reveal_attr(spec)}{_style_attr(style)}>{body}</div>'
+                )
         else:
             cspec = _layout_spec(deck, f"el-code-{cid}")
             ospec = _layout_spec(deck, f"el-output-{cid}")
@@ -1166,6 +1515,20 @@ def generate_presenter_html(
     .slide-p, .note-block p {{ font-size:1em; line-height:1.5; margin:0.5rem 0; color:{theme.get("fg", "#eee")}; }}
     .note-block ul, .note-block ol {{ font-size:1em; line-height:1.5; margin:0.5rem 0; padding-left:1.4em; }}
     .note-block li {{ margin:0.2em 0; }}
+    /* S2-D fine pieces: tighter consecutive list items, math / image / table boxes */
+    .note-block[data-type="list_item"] {{ margin:0.15rem 0; }}
+    .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.4em; }}
+    .note-block[data-type="math"] {{ margin:0.6rem 0; }}
+    .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow-x:auto; }}
+    .note-block .math-inline {{ display:inline; }}
+    .note-block[data-type="image"], .note-block .note-image {{ margin:0.5rem 0; }}
+    .note-block .note-image {{ margin:0; }}
+    .note-block .note-image img, .note-block[data-type="image"] img {{
+      max-width:100%; height:auto; display:block; border-radius:6px; }}
+    .note-block[data-type="table"] {{ overflow-x:auto; margin:0.5rem 0; }}
+    .note-block table {{ border-collapse:collapse; width:100%; font-size:0.9em; }}
+    .note-block th, .note-block td {{ border:1px solid #374151; padding:0.35em 0.6em; text-align:left; }}
+    .note-block th {{ background:#1f2937; }}
     .note-block code {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.8em;
       background:{theme.get("code_bg", "#1f2937")}; border:1px solid #374151; border-radius:4px;
       padding:0.08em 0.35em; }}
@@ -3150,6 +3513,7 @@ __all__ = [
     "LiveExecutor",
     "LiveSession",
     "build_deck",
+    "parse_note_to_elements",
     "slive",
     "sstop",
     "run_cell",

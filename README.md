@@ -14,7 +14,8 @@ RISE-like live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https:/
 | Preview mode keep-focus after Run | ✅ pre-emptive focus guard (see below) |
 | Move/size/font/order elements (S2-A API) | ✅ `await set_layout(...)` |
 | Edit mode: drag/nudge **in the slide** (S2-B) | ✅ press `e` |
-| Toolbar: font size/family, resize, z-order, flow order (S2-C) | ✅ select an element |
+| Toolbar: font size/family, resize, reveal (S2-C) | ✅ select an element |
+| Note cells split into pieces (S2-D) | ✅ title / bullet / math / image / table each selectable |
 | Markdown + LaTeX in notes | ✅ mistletoe + latex2mathml (falls back to plain) |
 
 ## Usage
@@ -79,7 +80,12 @@ its current width so the text keeps its wrap.
 
 Notes render full markdown (bold, lists, images, code) and LaTeX
 (`$...$` / `$$...$$` → MathML) when `mistletoe` + `latex2mathml` are
-installed — same pipeline as sslides.
+installed — same pipeline as sslides. Each note cell is **split into
+elements** (heading, each bullet, math, images/screenshots, tables, …)
+so you can drag/resize/reveal them independently. Ids look like
+`el-0-_abc123` (index + cell id); insert/delete blocks may shift indices
+so re-check layout after structural edits. Old `el-note-*` layout keys
+are ignored.
 
 Selecting an element shows the **floating toolbar** (viewport-fixed, never
 scaled): **A− / A+** font size, **font** dropdown, **reveal** step (blank =

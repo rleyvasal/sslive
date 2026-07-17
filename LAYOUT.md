@@ -70,10 +70,10 @@ Overlay keyed by `el_id` (absent = flow layout, today's behavior):
 
 - **v1**: move blocks as they exist today — whole note cell, code cell,
   output mount. Ids = dialog msg ids → stable.
-- **v2 (S2-D)**: split note cells per markdown block via sslides'
-  mistletoe `parse_markdown_to_elements` (emits `el-{idx}-{cid}`).
-  Index-based ids: layout survives content edits only while block count/order
-  is stable — acceptable, document it.
+- **v2 (S2-D)**: split note cells into fine pieces via `parse_note_to_elements`
+  (heading, list_item, paragraph, math, image, table, code, quote, …).
+  Ids `el-{idx}-{cell_id}`. Layout survives content edits only while block
+  count/order is stable — acceptable; old `el-note-{cid}` overlay keys orphan.
 
 ## Build order
 
@@ -92,7 +92,9 @@ Overlay keyed by `el_id` (absent = flow layout, today's behavior):
    number inputs on the selected element (not linear-only ±1); 8-handle resize
    persists `w`/`h`/`x`/`y`; reset sends an all-null patch which drops the spec
    entirely; selection survives output re-render after Run)
-4. **S2-D** finer note-block elements (mistletoe path), image polish
+4. **S2-D** finer note-block elements — **done**
+   (`parse_note_to_elements`: per list-item, math/image media-split, tables,
+   attachment images; ids `el-{idx}-{cid}`; `Element.html` cache)
 5. **reveal steps** — layout key `reveal` + →/← navigation — **done**
    (toolbar field; blank/0 always shown; N appears when frag step ≥ N)
 6. later: undo/redo, multi-select, snap guides, per-slide backgrounds
