@@ -850,14 +850,84 @@ def _display_data_to_parts(data: dict) -> list[OutputPart]:
     """Convert a MIME bundle to OutputPart list (prefer rich types)."""
     if not data:
         return []
+    # Normalize keys that may be AttrDict / bytes
+    data = {str(k): v for k, v in dict(data).items()}
     if "image/png" in data:
         return [OutputPart(kind="image/png", b64=_as_str(data["image/png"]))]
+    if "image/jpeg" in data or "image/jpg" in data:
+        b64 = _as_str(data.get("image/jpeg") or data.get("image/jpg"))
+        # reuse png slot with data-url prefix in text/html for simplicity
+        return [
+            OutputPart(
+                kind="text/html",
+                text=(
+                    f'<img src="data:image/jpeg;base64,{b64}" '
+                    f'style="max-width:100%;height:auto;display:block" alt="output"/>'
+                ),
+            )
+        ]
+    if "image/svg+xml" in data:
+        svg = _as_str(data["image/svg+xml"])
+        return [OutputPart(kind="text/html", text=svg)]
     if "text/html" in data:
         return [OutputPart(kind="text/html", text=_as_str(data["text/html"]))]
+    if "application/javascript" in data:
+        js = _as_str(data["application/javascript"])
+        return [OutputPart(kind="text/html", text=f"<script>{js}</script>")]
     if "text/plain" in data:
         return [OutputPart(kind="text/plain", text=_as_str(data["text/plain"]))]
     return []
 
+
+def _object_to_parts(obj: Any) -> list[OutputPart]:
+    """Turn a Python / IPython display object into OutputParts."""
+    if obj is None:
+        return []
+    # Already a MIME bundle
+    if isinstance(obj, dict) and any(
+        str(k).startswith(("text/", "image/", "application/")) for k in obj
+    ):
+        return _display_data_to_parts(obj)
+    # IPython.display.DisplayObject / HTML / IFrame / etc.
+    data = getattr(obj, "data", None)
+    if isinstance(data, dict) and data:
+        parts = _display_data_to_parts(data)
+        if parts:
+            return parts
+    for meth, kind in (
+        ("_repr_mimebundle_", None),
+        ("_repr_html_", "text/html"),
+        ("_repr_png_", "image/png"),
+        ("_repr_jpeg_", "image/jpeg"),
+        ("_repr_svg_", "text/html"),
+    ):
+        fn = getattr(obj, meth, None)
+        if not callable(fn):
+            continue
+        try:
+            if meth == "_repr_mimebundle_":
+                bundle = fn(include=None, exclude=None)
+                if isinstance(bundle, tuple):
+                    bundle = bundle[0]
+                if isinstance(bundle, dict):
+                    parts = _display_data_to_parts(bundle)
+                    if parts:
+                        return parts
+            else:
+                rep = fn()
+                if not rep:
+                    continue
+                if kind == "image/png":
+                    return [OutputPart(kind="image/png", b64=_as_str(rep))]
+                return [OutputPart(kind="text/html" if kind != "text/plain" else "text/plain", text=_as_str(rep))]
+        except Exception:
+            continue
+    # Plain string result
+    if isinstance(obj, str) and obj.strip():
+        if "<" in obj and ">" in obj:
+            return [OutputPart(kind="text/html", text=obj)]
+        return [OutputPart(kind="text/plain", text=obj)]
+    return []
 
 class LiveExecutor:
     """Execute slide code: pure Python → CRAFT remote GPU; magics → host IPython.
@@ -904,7 +974,11 @@ class LiveExecutor:
         return result
 
     def _execute_host_ipython(self, code: str, *, t0: float) -> ExecResult:
-        """Run code (with magics) on the host IPython shell; capture display/output."""
+        """Run magics on host IPython; capture stdout + rich display (HTML/iframe).
+
+        ``capture_output`` alone often misses viewers that call
+        ``display_pub.publish`` or return HTML/IFrame objects — we hook both.
+        """
         if get_ipython is None:
             return ExecResult(
                 ok=False,
@@ -914,29 +988,84 @@ class LiveExecutor:
             )
         ip = get_ipython()
         parts: list[OutputPart] = []
+        published: list[dict] = []
+
+        def _on_publish(data, metadata=None, source=None, **kwargs):
+            try:
+                if data:
+                    published.append(dict(data) if not isinstance(data, dict) else data)
+            except Exception:
+                pass
+            # call through to original if present
+            orig = getattr(_on_publish, "_orig", None)
+            if callable(orig):
+                try:
+                    return orig(data, metadata=metadata, source=source, **kwargs)
+                except TypeError:
+                    try:
+                        return orig(data, metadata=metadata)
+                    except Exception:
+                        pass
+            return None
+
         try:
+            # --- hook DisplayPublisher (primary path for display()/IFrame/HTML)
+            pub = getattr(ip, "display_pub", None)
+            orig_publish = getattr(pub, "publish", None) if pub is not None else None
+            if pub is not None and orig_publish is not None:
+                _on_publish._orig = orig_publish  # type: ignore[attr-defined]
+                pub.publish = _on_publish  # type: ignore[method-assign]
+
             try:
                 from IPython.utils.capture import capture_output
             except Exception:
                 capture_output = None  # type: ignore
 
+            result = None
             if capture_output is not None:
                 with capture_output(stdout=True, stderr=True, display=True) as cap:
                     result = ip.run_cell(code, store_history=False)
                 if cap.stdout:
                     parts.append(
-                        OutputPart(kind="stream", text=_strip_ansi(cap.stdout), name="stdout")
+                        OutputPart(
+                            kind="stream", text=_strip_ansi(cap.stdout), name="stdout"
+                        )
                     )
                 if cap.stderr:
                     parts.append(
-                        OutputPart(kind="stream", text=_strip_ansi(cap.stderr), name="stderr")
+                        OutputPart(
+                            kind="stream", text=_strip_ansi(cap.stderr), name="stderr"
+                        )
                     )
                 for out in getattr(cap, "outputs", None) or []:
-                    data = getattr(out, "data", None) or {}
+                    data = getattr(out, "data", None)
+                    if data is None and isinstance(out, dict):
+                        data = out.get("data")
                     if isinstance(data, dict):
                         parts.extend(_display_data_to_parts(data))
+                    else:
+                        parts.extend(_object_to_parts(out))
             else:
                 result = ip.run_cell(code, store_history=False)
+
+            # MIME bundles from display_pub.publish
+            for data in published:
+                parts.extend(_display_data_to_parts(data))
+
+            # Return value of the cell / magic (HTML, IFrame, …)
+            if result is not None:
+                parts.extend(_object_to_parts(getattr(result, "result", None)))
+
+            # Deduplicate consecutive identical html/text parts
+            deduped: list[OutputPart] = []
+            seen: set[str] = set()
+            for p in parts:
+                key = f"{p.kind}:{p.text[:200] if p.text else ''}:{p.b64[:40] if p.b64 else ''}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(p)
+            parts = deduped
 
             ok = True
             err = None
@@ -950,17 +1079,15 @@ class LiveExecutor:
                 elif hasattr(result, "success") and not result.success:
                     ok = False
                     err = "execution failed"
-            # UsageError for missing magics often lands as a raised error string
             if err and "not found" in err and "%" in (code or ""):
                 err = (
                     f"{err}\n\n"
-                    "Magics like %pointcloud must be installed on the SolveIt host "
-                    "(same place %slive runs). Load the extension that provides "
-                    "the magic, then ▶ Run again. Pure Python still runs on the GPU."
+                    "Magics like %pointcloud must be available on the SolveIt host. "
+                    "Load the extension that provides them, then ▶ Run again."
                 )
             if err and not any(p.kind == "error" for p in parts):
                 parts.append(OutputPart(kind="error", text=err))
-            # If host couldn't resolve the magic, try remote IPython as fallback
+
             if (
                 not ok
                 and err
@@ -970,6 +1097,20 @@ class LiveExecutor:
                 remote = self._execute_gpu(code, echo_to_dialog=False, t0=t0)
                 if remote.ok or remote.parts:
                     return remote
+
+            # Successful magic with no captured display — still useful signal
+            if ok and not parts:
+                parts.append(
+                    OutputPart(
+                        kind="stream",
+                        text=(
+                            "(magic finished with no captured display — "
+                            "viewer may have opened outside the slide)"
+                        ),
+                        name="stdout",
+                    )
+                )
+
             return ExecResult(
                 ok=ok and not any(p.kind == "error" for p in parts),
                 parts=parts,
@@ -983,7 +1124,15 @@ class LiveExecutor:
                 duration_ms=int((time.perf_counter() - t0) * 1000),
                 error=str(e),
             )
-
+        finally:
+            # restore display publisher
+            try:
+                pub = getattr(ip, "display_pub", None)
+                orig = getattr(_on_publish, "_orig", None)
+                if pub is not None and orig is not None:
+                    pub.publish = orig  # type: ignore[method-assign]
+            except Exception:
+                pass
     def _execute_gpu(self, code: str, *, echo_to_dialog: bool, t0: float) -> ExecResult:
         mgr = get_craft_exec_mgr()
         if mgr is None:
@@ -1083,13 +1232,16 @@ def render_output_html(
                 f'<img src="data:image/png;base64,{p.b64}" style="{img_st}" alt="output"/>'
             )
         elif p.kind == "text/html":
-            chunks.append(f'<div class="sslive-html">{p.text}</div>')
+            # Viewers (%pointcloud etc.) often inject iframes — give them room
+            chunks.append(
+                f'<div class="sslive-html" style="width:100%;min-height:360px;'
+                f'overflow:auto">{p.text}</div>'
+            )
         elif p.kind == "text/plain":
             chunks.append(f'<pre style="{out_st}">{html_module.escape(p.text)}</pre>')
 
     if not chunks:
         chunks.append(f'<pre style="{out_st}opacity:0.5">(no output)</pre>')
-
     inner = "\n".join(chunks)
     eid = html_module.escape(f"el-output-{cell_id}")
     return (
@@ -1782,6 +1934,10 @@ def generate_presenter_html(
       padding:0.6em 0.8em; overflow-x:auto; }}
     .note-block pre code {{ background:none; border:0; padding:0; }}
     .note-block img {{ max-width:100%; }}
+    .sslive-html {{ width:100%; max-width:100%; }}
+    .sslive-html iframe {{ width:100%; min-height:420px; height:56vh; border:0;
+      border-radius:8px; background:#0b1220; display:block; }}
+    .sslive-html canvas, .sslive-html video {{ max-width:100%; height:auto; }}
     .note-block a {{ color:#60a5fa; }}
     .note-block blockquote {{ border-left:3px solid #4b5563; margin:0.5rem 0;
       padding:0 0 0 0.8em; color:{theme.get("muted", "#9ca3af")}; }}
