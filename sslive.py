@@ -3295,13 +3295,7 @@ def _show_presenter(port: int | None, height: str = "720px"):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _find_caller_msg_id() -> str | None:
-    """Walk the stack for SolveIt's ``__msg_id`` (cell that invoked us).
-
-    Checks both ``f_globals`` and ``f_locals`` — SolveIt may inject the id
-    either place. Walk the full stack (not just one ``f_back``) because
-    ``await slive()`` inserts async frames between the cell and ``slive``.
-    Falls back to IPython ``user_ns`` (where SolveIt often parks ``__msg_id``).
-    """
+    """Sync probes for SolveIt's current message id (stack / ns / find_var)."""
     frame = inspect.currentframe()
     try:
         f = frame.f_back if frame is not None else None
@@ -3313,16 +3307,152 @@ def _find_caller_msg_id() -> str | None:
             f = f.f_back
     finally:
         del frame
-    # IPython / SolveIt interactive namespace
     if get_ipython is not None:
         try:
             ip = get_ipython()
             if ip is not None:
-                mid = (ip.user_ns or {}).get("__msg_id")
-                if mid:
-                    return str(mid)
+                for ns_name in ("user_ns", "user_global_ns"):
+                    ns = getattr(ip, ns_name, None) or {}
+                    mid = ns.get("__msg_id") if isinstance(ns, dict) else None
+                    if mid:
+                        return str(mid)
         except Exception:
             pass
+    # dialoghelper uses safepyrun.find_var for __dialog_name — same for __msg_id
+    try:
+        from safepyrun import find_var  # type: ignore
+
+        mid = find_var("__msg_id")
+        if mid:
+            return str(mid)
+    except Exception:
+        pass
+    return None
+
+
+def _msg_id_from_obj(msg: Any) -> str | None:
+    if msg is None:
+        return None
+    if isinstance(msg, dict):
+        mid = msg.get("id")
+    else:
+        mid = getattr(msg, "id", None)
+        if mid is None and hasattr(msg, "get"):
+            try:
+                mid = msg.get("id")
+            except Exception:
+                mid = None
+    return str(mid) if mid else None
+
+
+async def _resolve_launcher_msg_id(hint: str | None = None) -> str | None:
+    """Resolve the cell that is running ``slive()`` — no reliance on ``__msg_id`` alone.
+
+    Order (dialoghelper-native first, matching current-message semantics)::
+
+      1. explicit hint / early capture
+      2. stack / user_ns / safepyrun.find_var
+      3. read_msg(n=0, relative=True)  — defaults to *current* message
+      4. msg_idx() + find_msgs
+      5. browser selectedMsgId (js_eval)
+      6. find_msgs content: code cells calling slive(
+    """
+    if hint:
+        return str(hint)
+
+    mid = _find_caller_msg_id()
+    if mid:
+        return mid
+
+    # 3) current message via dialoghelper (id defaults to current)
+    if read_msg is not None:
+        try:
+            msg = await read_msg(n=0, relative=True)
+            mid = _msg_id_from_obj(msg)
+            if mid:
+                return mid
+        except Exception as e:
+            _SESSION["_skip_read_msg_err"] = str(e)
+
+    # 4) msg_idx() → absolute index of *current* message, then read that slot
+    try:
+        from dialoghelper.core import msg_idx as _dh_msg_idx
+
+        idx = await _dh_msg_idx()
+        if idx is not None and read_msg is not None:
+            msg = await read_msg(n=int(idx), relative=False)
+            mid = _msg_id_from_obj(msg)
+            if mid:
+                return mid
+    except Exception as e:
+        _SESSION["_skip_msg_idx_err"] = str(e)
+
+    # 5) browser-side selection / running marker
+    if js_eval is not None or js_eval_a is not None:
+        try:
+            res = await _call_js_eval(
+                """
+try {
+  if (typeof selectedMsgId === 'function') {
+    const v = selectedMsgId();
+    if (v) return String(v);
+  } else if (typeof selectedMsgId !== 'undefined' && selectedMsgId) {
+    return String(selectedMsgId);
+  }
+  const run = document.querySelector(
+    '[data-running="1"], .msg-running, .is-running[id], [id^="_"].running');
+  if (run && (run.dataset.id || run.id))
+    return String(run.dataset.id || run.id).replace(/^_/,'');
+  const sel = document.querySelector(
+    '.msg.selected, [data-selected="1"], [aria-selected="true"][id^="_"]');
+  if (sel && (sel.dataset.id || sel.id))
+    return String(sel.dataset.id || sel.id).replace(/^_/,'');
+  return null;
+} catch (e) { return null; }
+"""
+            )
+            mid = _parse_js_eval_result(res)
+            if mid:
+                s = str(mid).strip()
+                if s and s not in ("null", "None", "undefined"):
+                    # DOM ids are often `_abc`; update_msg accepts with or without
+                    return s if s.startswith("_") else s
+        except Exception as e:
+            _SESSION["_skip_js_err"] = str(e)
+
+    # 6) content heuristic: last code cell that calls slive(
+    if find_msgs is not None:
+        try:
+            msgs = await find_msgs(
+                msg_type="code",
+                re_pattern=r"slive\s*\(",
+                include_output=False,
+                include_meta=True,
+                include_skipped=True,
+                use_regex=True,
+            )
+            best = None
+            for m in msgs or []:
+                c = ""
+                if isinstance(m, dict):
+                    c = m.get("content") or ""
+                    mid_m = m.get("id")
+                else:
+                    c = getattr(m, "content", "") or ""
+                    mid_m = getattr(m, "id", None)
+                lines = [
+                    ln
+                    for ln in str(c).splitlines()
+                    if ln.strip() and not ln.strip().startswith("%")
+                ]
+                body = "\n".join(lines)
+                if re.search(r"(?:await\s+)?slive\s*\(", body):
+                    best = mid_m
+            if best:
+                return str(best)
+        except Exception as e:
+            _SESSION["_skip_find_err"] = str(e)
+
     return None
 
 
@@ -3334,6 +3464,7 @@ def _resolve_update_msg():
         return um
     try:
         from dialoghelper.core import update_msg as um2
+
         update_msg = um2
         return um2
     except Exception:
@@ -3359,10 +3490,23 @@ async def _skip_msg(mid: str | None, *, quiet: bool = False, settle: float = 1.0
         show(...); time.sleep(1); update_msg(id=..., skipped=1)
     """
     if not mid:
+        mid = await _resolve_launcher_msg_id()
+    if not mid:
         if not quiet:
+            errs = [
+                f"{k}={_SESSION[k]}"
+                for k in (
+                    "_skip_read_msg_err",
+                    "_skip_msg_idx_err",
+                    "_skip_js_err",
+                    "_skip_find_err",
+                )
+                if _SESSION.get(k)
+            ]
+            extra = (" (" + "; ".join(errs) + ")") if errs else ""
             print(
-                "sslive: no __msg_id — run under %local in a dialog cell; "
-                "preview stays in LLM context (eye stays open)"
+                "sslive: could not resolve launcher msg id — eye stays open"
+                + extra
             )
         return None
     if _resolve_update_msg() is None:
@@ -3373,11 +3517,18 @@ async def _skip_msg(mid: str | None, *, quiet: bool = False, settle: float = 1.0
         # sslides sleeps 1s after show so the output is attached, then skips.
         if settle and settle > 0:
             await asyncio.sleep(settle)
-        await _call_update_msg(id=mid, skipped=1)
+        # Normalize: SolveIt DOM often uses _prefix; API accepts either
+        mid_try = str(mid)
+        try:
+            await _call_update_msg(id=mid_try, skipped=1)
+        except Exception:
+            alt = mid_try[1:] if mid_try.startswith("_") else "_" + mid_try
+            await _call_update_msg(id=alt, skipped=1)
+            mid_try = alt
         if not quiet:
-            print(f"sslive: AI-hidden (skipped=1) msg {mid} — eye should be red")
-        _SESSION["skipped_launcher_id"] = mid
-        return mid
+            print(f"sslive: AI-hidden (skipped=1) msg {mid_try} — eye should be red")
+        _SESSION["skipped_launcher_id"] = mid_try
+        return mid_try
     except Exception as e:
         if not quiet:
             print(f"sslive: skip failed for {mid}: {e}")
@@ -3385,8 +3536,8 @@ async def _skip_msg(mid: str | None, *, quiet: bool = False, settle: float = 1.0
 
 
 async def _skip_caller_msg(*, quiet: bool = False, mid: str | None = None) -> str | None:
-    """Skip the calling cell. Prefer a mid captured *before* any await in slive."""
-    return await _skip_msg(mid or _find_caller_msg_id(), quiet=quiet)
+    """Skip the calling cell (full async resolve if mid missing)."""
+    return await _skip_msg(mid, quiet=quiet)
 
 
 @dataclass
@@ -3439,8 +3590,7 @@ async def slive(
     Fallback if bridge stalls: ``await pump_slide_runs()`` or ``await run_cell_index(0)``.
     After embed, the calling cell is ``skipped=1`` (red eye) like sslides ``sshow``.
     """
-    # Capture SolveIt cell id *before* any await — after the first yield the
-    # cell frame can leave the stack and __msg_id is no longer findable.
+    # Sync probe first (may be empty under await — full resolve after embed).
     launcher_msg_id = _find_caller_msg_id()
     _SESSION["launcher_msg_id"] = launcher_msg_id
 
@@ -3487,7 +3637,7 @@ async def slive(
     print(
         f"sslive: {len(deck.slides)} slides, {n_code} code cells, "
         f"backend=gpu ({msg}), IN_SOLVEIT={_in_solveit()}"
-        + (f", msg={launcher_msg_id}" if launcher_msg_id else ", msg=?(no __msg_id yet)")
+        + (f", msg={launcher_msg_id}" if launcher_msg_id else "")
     )
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
@@ -3506,11 +3656,12 @@ async def slive(
     if embed:
         # sslides pattern: show → sleep(1) → update_msg(..., skipped=1)
         _show_presenter(port, height=height)
-        # Re-probe after display in case id only appears now; prefer early capture.
-        mid = launcher_msg_id or _find_caller_msg_id() or _SESSION.get("launcher_msg_id")
+        # Resolve current msg via dialoghelper if __msg_id was never injected.
+        mid = await _resolve_launcher_msg_id(launcher_msg_id)
+        _SESSION["launcher_msg_id"] = mid
         await _skip_msg(mid, settle=1.0)
     else:
-        mid = launcher_msg_id or _find_caller_msg_id()
+        mid = await _resolve_launcher_msg_id(launcher_msg_id)
         if mid:
             await _skip_msg(mid, settle=0.0)
 
