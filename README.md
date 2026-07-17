@@ -119,8 +119,11 @@ Reload host code after pulling changes:
 | Included | Not included (v1) |
 |----------|-------------------|
 | Slides, layout, reveal | Live ▶ Run |
-| Frozen code + last outputs | Layout editing |
+| Frozen code (collapsed; click to expand) | Layout editing |
+| Last-run outputs (PNG, Plotly, …) | Host-only viewers without snapshot |
 | Nav / keyboard / print CSS | Offline-vendored Plotly (uses CDN) |
+
+**`%pointcloud` / Three.js:** export tries to embed a localhost viewer page (needs that server still reachable). If not, a placeholder is shown — use matplotlib/Plotly for fully portable viz.
 
 ## Commands
 

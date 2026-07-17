@@ -2085,6 +2085,135 @@ def _isolate_rich_html(html: str, *, min_height: int | None = None) -> str:
     )
 
 
+def _iframe_src_from_html(html: str) -> str | None:
+    m = re.search(
+        r"""<iframe\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""",
+        html or "",
+        flags=re.I,
+    )
+    return m.group(1).strip() if m else None
+
+
+def _is_nonportable_viewer_url(url: str) -> bool:
+    """True for localhost / relative / blob URLs that break outside SolveIt."""
+    u = (url or "").strip()
+    if not u:
+        return True
+    low = u.lower()
+    if low.startswith("data:"):
+        return False
+    if low.startswith(("blob:", "about:", "javascript:")):
+        return True
+    if "localhost" in low or "127.0.0.1" in low or "0.0.0.0" in low:
+        return True
+    # Host-relative path (not //cdn...)
+    if u.startswith("/") and not u.startswith("//"):
+        return True
+    if not re.match(r"^https?://", u, flags=re.I) and not u.startswith("//"):
+        return True
+    return False
+
+
+def _export_viz_placeholder(reason: str, *, min_height: int = 360) -> str:
+    msg = html_module.escape(reason)
+    return (
+        f'<div class="sslive-viz-missing" style="width:100%;min-height:{min_height}px;'
+        f'display:flex;align-items:center;justify-content:center;text-align:center;'
+        f'padding:1.5rem;border-radius:8px;background:#1f2937;border:1px dashed #4b5563;'
+        f'color:#9ca3af;font:14px/1.5 system-ui,sans-serif">'
+        f"<div><div style='font-size:2rem;margin-bottom:0.5rem'>◇</div>"
+        f"<strong style='color:#e5e7eb'>Interactive viewer not embedded</strong><br/>"
+        f"<span style='font-size:13px'>{msg}</span></div></div>"
+    )
+
+
+def _try_embed_local_viewer(src: str, *, min_height: int) -> str | None:
+    """If viewer is on localhost, fetch HTML and put in data: URL with <base>.
+
+    Works when the export is viewed while that server is still up (same machine).
+    Fully offline-safe only if the page is self-contained.
+    """
+    try:
+        from urllib.parse import urlparse
+        from urllib.request import Request, urlopen
+    except Exception:
+        return None
+    try:
+        req = Request(src, headers={"User-Agent": "sslive-export/0.1"})
+        with urlopen(req, timeout=4.0) as resp:  # nosec B310 — local export helper
+            raw = resp.read()
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+    except Exception:
+        return None
+    if len(raw) > 2_500_000:
+        return None
+    if "html" not in ctype and not raw.lstrip()[:50].lower().startswith(
+        (b"<!doctype", b"<html", b"<")
+    ):
+        return None
+    try:
+        text = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    parsed = urlparse(src)
+    base = f"{parsed.scheme}://{parsed.netloc}/"
+    if re.search(r"<base\b", text, flags=re.I) is None:
+        if re.search(r"<head\b", text, flags=re.I):
+            text = re.sub(
+                r"(<head\b[^>]*>)",
+                rf'\1<base href="{html_module.escape(base, quote=True)}">',
+                text,
+                count=1,
+                flags=re.I,
+            )
+        else:
+            text = f'<head><base href="{html_module.escape(base, quote=True)}"></head>\n' + text
+    b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return (
+        f'<iframe class="sslive-viz-frame" '
+        f'sandbox="allow-scripts allow-same-origin allow-popups allow-forms" '
+        f'style="width:100%;height:{min_height}px;min-height:{min_height}px;'
+        f'border:0;border-radius:8px;background:#0b1220;display:block" '
+        f'src="data:text/html;base64,{b64}" title="embedded viewer"></iframe>'
+    )
+
+
+def _html_for_export(html: str, *, min_height: int = 420) -> str:
+    """Make captured HTML safer for a portable file (pointcloud / Three.js / etc.)."""
+    html = _scrub_output_html(html or "")
+    if not html.strip():
+        return _export_viz_placeholder("Empty HTML output.", min_height=min_height)
+
+    src = _iframe_src_from_html(html)
+    if src:
+        if not _is_nonportable_viewer_url(src):
+            # Public absolute URL — keep as-is (needs network)
+            return html
+        # Localhost / relative: try to snapshot the viewer document
+        embedded = _try_embed_local_viewer(src, min_height=min_height)
+        if embedded:
+            return embedded
+        return _export_viz_placeholder(
+            "This was a SolveIt/host viewer (e.g. %pointcloud / Three.js) served from "
+            f"<code style='color:#93c5fd'>{html_module.escape(src[:120])}</code>. "
+            "That URL is not available outside the live environment. "
+            "Re-open in SolveIt, or use a static plot (matplotlib/Plotly) for portable export.",
+            min_height=min_height,
+        )
+
+    # Inline Three.js / full HTML apps — sandbox in nested data-URL iframe
+    if re.search(
+        r"three\.js|three\.min\.js|\bTHREE\b|webgl|pointcloud|babylon",
+        html,
+        flags=re.I,
+    ):
+        return _isolate_rich_html(html, min_height=min_height)
+
+    if _looks_like_rich_html(html):
+        return _isolate_rich_html(html, min_height=min_height)
+    return html
+
+
 def render_output_html(
     parts: list[OutputPart],
     cell_id: str,
@@ -2092,8 +2221,12 @@ def render_output_html(
     *,
     style: str = "",
     extra_attrs: str = "",
+    portable: bool = False,
 ) -> str:
-    """Return HTML for #el-output-{cell_id}. No FastHTML required."""
+    """Return HTML for #el-output-{cell_id}. No FastHTML required.
+
+    ``portable=True`` rewrites host-only viewers (localhost iframes) for export.
+    """
     theme = theme or THEME_DARK
     out_st = theme.get(
         "output",
@@ -2127,7 +2260,10 @@ def render_output_html(
                 f'<img src="data:image/png;base64,{p.b64}" style="{img_st}" alt="output"/>'
             )
         elif p.kind == "text/html":
-            body = _isolate_rich_html(p.text or "", min_height=viz_h)
+            if portable:
+                body = _html_for_export(p.text or "", min_height=viz_h)
+            else:
+                body = _isolate_rich_html(p.text or "", min_height=viz_h)
             fill = "height:100%;" if layout_h else f"min-height:{viz_h}px;"
             chunks.append(
                 f'<div class="sslive-html sslive-html-viz" style="width:100%;{fill}'
@@ -3989,18 +4125,34 @@ def generate_presenter_html(
 
 
 def _code_block_html_export(cell: Cell, *, style: str = "", extra_attrs: str = "") -> str:
-    """Read-only code block for portable export (no Run / no live textarea)."""
+    """Read-only code block for portable export — collapsed one-line like live UI.
+
+    Click the block to expand/collapse full source (no Run).
+    """
     cid = html_module.escape(cell.id)
-    src = html_module.escape(cell.source or "")
+    src = cell.source or ""
+    # Prefer layout height when set; else one-line bar like live (34px body)
+    layout_h = _height_px_from_style(style)
+    body_h = max(28, min(layout_h - 36, 48)) if layout_h else 34
+    full_esc = html_module.escape(src)
+    n_lines = max(1, src.count("\n") + (1 if src else 0))
+    more = f" · {n_lines} lines" if n_lines > 1 else ""
     return (
         f'<div id="el-code-{cid}" class="code-wrap code-frozen" '
         f'data-el-id="el-code-{cid}" data-type="code" data-cell-id="{cid}"'
         f"{extra_attrs}{_style_attr(style)}>"
         f'<div class="code-toolbar">'
         f'<span class="cell-id">{cid}</span>'
-        f'<span class="hint">exported · read-only</span>'
+        f'<span class="hint">exported · click to expand{more}</span>'
         f"</div>"
-        f'<pre class="code-pre">{src}</pre>'
+        f'<pre class="code-pre code-pre-collapsed" style="height:{body_h}px;'
+        f'min-height:{body_h}px;max-height:{body_h}px" '
+        f'title="Click to expand/collapse" '
+        f'onclick="this.classList.toggle(\'code-pre-collapsed\');'
+        f'if(this.classList.contains(\'code-pre-collapsed\')){{'
+        f'this.style.height=this.style.minHeight;this.style.maxHeight=this.style.minHeight;'
+        f'}}else{{this.style.height=\'auto\';this.style.maxHeight=\'70vh\';}}">'
+        f"{full_esc}</pre>"
         f"</div>"
     )
 
@@ -4030,10 +4182,13 @@ def _slide_html_export(deck: Deck, slide: Slide, *, active: bool = False) -> str
         else:
             cspec = _layout_spec(deck, f"el-code-{cid}")
             ospec = _layout_spec(deck, f"el-output-{cid}")
+            # Code box: do not force a large height from missing layout —
+            # strip only overflow:auto if height missing so bar stays thin
+            code_style = _el_style(cspec)
             parts.append(
                 _code_block_html_export(
                     cell,
-                    style=_el_style(cspec),
+                    style=code_style,
                     extra_attrs=_reveal_attr(cspec),
                 )
             )
@@ -4044,6 +4199,7 @@ def _slide_html_export(deck: Deck, slide: Slide, *, active: bool = False) -> str
                     theme,
                     style=_el_style(ospec),
                     extra_attrs=_reveal_attr(ospec),
+                    portable=True,
                 )
             )
     cls = "slide title-slide" if slide.is_title else "slide"
@@ -4132,14 +4288,17 @@ def generate_export_html(
     .sslive-plotly-host {{ width:100% !important; max-width:100%; box-sizing:border-box;
       position:relative; overflow:hidden; border-radius:8px; background:#0b1220; }}
     .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
-      padding:8px 12px; outline:none; flex:0 0 auto; max-width:100%; }}
+      padding:8px 12px; outline:none; flex:0 0 auto; max-width:100%; align-self:stretch; }}
     .code-toolbar {{ display:flex; align-items:center; gap:12px; margin-bottom:6px; flex-wrap:wrap; }}
     .cell-id {{ font-size:11px; color:{theme.get("muted", "#9ca3af")}; font-family:ui-monospace,monospace; }}
     .hint {{ font-size:11px; color:#6b7280; }}
     .code-pre {{ width:100%; box-sizing:border-box; margin:0; padding:6px 10px;
       font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45; font-size:14px;
-      white-space:pre-wrap; word-break:break-word; color:#e5e7eb; background:#111827;
-      border:1px solid #4b5563; border-radius:6px; overflow:auto; max-height:70vh; }}
+      white-space:pre; color:#e5e7eb; background:#111827;
+      border:1px solid #4b5563; border-radius:6px; overflow:auto; cursor:pointer; }}
+    .code-pre-collapsed {{ overflow:hidden; white-space:pre; text-overflow:ellipsis; }}
+    .sslive-viz-frame, iframe.sslive-viz-frame {{ width:100%; border:0; border-radius:8px;
+      background:#0b1220; display:block; }}
     [data-type="output"] {{ display:block; width:100%; max-width:100%; box-sizing:border-box; }}
     .frag-hidden {{ opacity:0 !important; visibility:hidden !important; pointer-events:none !important; }}
     #chrome {{ position:fixed; left:12px; top:12px; z-index:20; display:flex; gap:10px; align-items:center;
