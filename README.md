@@ -27,14 +27,24 @@ You do **not** need to flip back to `%local` for the deck if `%slive` is registe
 
 ```python
 %gpu
-# load CRAFT the way you usually do in this dialog so _exec_mgr exists on the host
+# CRAFT already loaded in this dialog (so host has _exec_mgr)
 
-%gpu
-%run path/to/sslive.py    # registers %slive as a local magic — don't paste the file
+%run path/to/sslive.py    # registers %slive + marks it *local* for %gpu mode
+# if you %run *before* %gpu, re-mark after:
+#   register_slive()
 
-%slive                    # open deck (clean iframe, like %pointcloud)
+%slive                    # open deck (like %pointcloud)
 # or: await slive()
 ```
+
+If you see **`%slive` not found** under `%gpu`:
+
+```python
+register_slive()   # re-register + mark local
+%slive
+```
+
+Or skip the magic: `await slive()` on the host (same effect).
 
 1. Click the slide iframe  
 2. Edit a code box  

@@ -1019,26 +1019,41 @@ def _pick_port(start: int = 8100, span: int = 50) -> int:
     raise RuntimeError(f"No free port in {start}..{start + span - 1}")
 
 
-def _ensure_local_magic():
-    """Register ``%slive`` as a *local* magic so it works under ``%gpu`` mode.
-
-    Like other CRAFT host tools: dialog stays in GPU mode for torch/cells, but
-    ``%slive`` runs on the SolveIt host (dialoghelper + iframe), then ▶ Run
-    uses the remote kernel via CRAFT.
-    """
+def _mark_slive_local_magic() -> None:
+    """Tell CRAFT/SolveIt that %slive must run on the *host* under %gpu mode."""
     if get_ipython is None:
         return
     ip = get_ipython()
+    names = ("%slive", "slive", "%sslive", "sslive")
+    # CRAFT helper
     try:
         reg = (ip.user_ns or {}).get("register_local_magic")
         if callable(reg):
-            reg("%slive")
-            reg("slive")
-            reg("%sslive")
+            for n in names:
+                try:
+                    reg(n)
+                except Exception:
+                    pass
     except Exception:
         pass
-    # Magics class registered in load_ipython_extension / _register_slive_magic
+    # Some CRAFT builds keep a set of local magic names
+    try:
+        ns = ip.user_ns or {}
+        for key in ("_local_magics", "local_magics", "_craft_local_magics"):
+            bag = ns.get(key)
+            if isinstance(bag, set):
+                bag.update(names)
+            elif isinstance(bag, list):
+                for n in names:
+                    if n not in bag:
+                        bag.append(n)
+    except Exception:
+        pass
 
+
+def _ensure_local_magic():
+    """Register ``%slive`` as a *local* magic so it works under ``%gpu`` mode."""
+    _mark_slive_local_magic()
 
 def _host_ok() -> tuple[bool, str]:
     """Whether the sslive *host* can run (SolveIt host + dialoghelper).
@@ -3749,8 +3764,7 @@ async def slive(
     launcher_msg_id = _find_caller_msg_id()
     _SESSION["launcher_msg_id"] = launcher_msg_id
 
-    _ensure_local_magic()
-    _register_slive_magic()
+    _register_slive_magic(quiet=True)
 
     host_ok, host_msg = _host_ok()
     if not host_ok:
@@ -3914,80 +3928,119 @@ def session() -> LiveSession | None:
     return _SESSION.get("session")
 
 
-def _register_slive_magic() -> None:
-    """Install ``%slive`` line magic + mark it local for ``%gpu`` mode."""
-    if get_ipython is None:
-        return
-    ip = get_ipython()
+def _run_slive_from_magic(line: str = "") -> Any:
+    """Shared body for %slive / %sslive line magics."""
+    height = "720px"
+    line = (line or "").strip()
+    if line:
+        m = re.search(r"(?:height\s*=\s*)?(\d+)\s*(px)?", line, re.I)
+        if m:
+            height = f"{m.group(1)}px"
+
+    async def _run():
+        return await slive(height=height, return_session=False)
+
     try:
-        from IPython.core.magic import Magics, magics_class, line_magic
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_run())
+
+    try:
+        import nest_asyncio  # type: ignore
+
+        nest_asyncio.apply()
+        return loop.run_until_complete(_run())
     except Exception:
-        return
+        # Last resort: schedule on the running loop (display still happens)
+        return loop.create_task(_run())
 
-    @magics_class
-    class SSliveMagics(Magics):
-        @line_magic("slive")
-        def slive_magic(self, line: str = ""):
-            """Open the live deck (host). Works under %gpu as a local magic.
 
-            Usage::
+def _register_slive_magic(*, quiet: bool = True) -> bool:
+    """Install ``%slive`` and mark it local for ``%gpu`` mode.
 
-                %slive
-                %slive 800
-                %slive height=720
-            """
-            height = "720px"
-            line = (line or "").strip()
-            if line:
-                # "%slive 800" or "%slive 800px" or "%slive height=900"
-                m = re.search(r"(?:height\s*=\s*)?(\d+)\s*(px)?", line, re.I)
-                if m:
-                    height = f"{m.group(1)}px"
-            coro = slive(height=height, return_session=False)
+    Always re-registers (safe) so ``%run`` then ``%gpu`` still finds the magic.
+    Returns True on success.
+    """
+    if get_ipython is None:
+        return False
+    ip = get_ipython()
+    if ip is None:
+        return False
 
-            async def _run():
-                return await coro
-
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                return asyncio.run(_run())
-
-            # Notebook already has a loop (SolveIt / IPython async)
-            try:
-                import nest_asyncio  # type: ignore
-
-                nest_asyncio.apply()
-                return loop.run_until_complete(_run())
-            except Exception:
-                # Fire task; display still happens inside slive
-                return loop.create_task(_run())
-
-        @line_magic("sslive")
-        def sslive_magic(self, line: str = ""):
-            """Alias for %slive."""
-            return self.slive_magic(line)
-
+    ok = False
+    # 1) Preferred: magics_manager.register_function (reliable under %run)
     try:
-        if not getattr(ip, "_sslive_magics_loaded", False):
+        mm = ip.magics_manager
+        mm.register_function(_run_slive_from_magic, magic_kind="line", magic_name="slive")
+        mm.register_function(_run_slive_from_magic, magic_kind="line", magic_name="sslive")
+        ok = True
+    except Exception as e:
+        _SESSION["_magic_reg_err"] = f"register_function: {e}"
+
+    # 2) Fallback: Magics class
+    if not ok:
+        try:
+            from IPython.core.magic import Magics, magics_class, line_magic
+
+            @magics_class
+            class SSliveMagics(Magics):
+                @line_magic("slive")
+                def slive_magic(self, line: str = ""):
+                    return _run_slive_from_magic(line)
+
+                @line_magic("sslive")
+                def sslive_magic(self, line: str = ""):
+                    return _run_slive_from_magic(line)
+
             ip.register_magics(SSliveMagics(ip))
-            ip._sslive_magics_loaded = True  # type: ignore[attr-defined]
+            ok = True
+        except Exception as e:
+            _SESSION["_magic_reg_err"] = f"Magics class: {e}"
+
+    # Critical under %gpu: route magic to host, not remote kernel
+    _mark_slive_local_magic()
+    _ensure_local_magic()
+
+    # Verify
+    try:
+        lm = ip.magics_manager.magics.get("line", {})
+        if "slive" not in lm and "sslive" not in lm:
+            ok = False
+            if not quiet:
+                print(
+                    "sslive: %slive failed to register — use: await slive()"
+                )
+        elif not quiet:
+            print("sslive: %slive ready (local magic — works under %gpu)")
     except Exception:
         pass
-    _ensure_local_magic()
+
+    ip._sslive_magics_loaded = ok  # type: ignore[attr-defined]
+    return ok
+
+
+def register_slive() -> bool:
+    """Public: re-register ``%slive`` (call after ``%gpu`` if magic is missing)."""
+    return _register_slive_magic(quiet=False)
 
 
 def load_ipython_extension(ip=None) -> None:
     """``%load_ext sslive`` / auto on ``%run`` when possible."""
-    _register_slive_magic()
+    _register_slive_magic(quiet=True)
 
 
-# Auto-register when the file is %run
+# Auto-register when the file is %run (must run at end of module)
 try:
     if get_ipython is not None and get_ipython() is not None:
-        _register_slive_magic()
-except Exception:
-    pass
+        _ok = _register_slive_magic(quiet=True)
+        if not _ok and _SESSION.get("_magic_reg_err"):
+            print(f"sslive: magic registration issue: {_SESSION['_magic_reg_err']}")
+            print("sslive: use  await slive()  or  register_slive()")
+except Exception as _e:
+    try:
+        print(f"sslive: could not auto-register %slive ({_e}); use await slive()")
+    except Exception:
+        pass
 
 
 # Wire name for %run
@@ -4002,6 +4055,7 @@ __all__ = [
     "parse_note_to_elements",
     "slive",
     "session",
+    "register_slive",
     "hide_from_ai",
     "load_ipython_extension",
     "sstop",
