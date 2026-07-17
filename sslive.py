@@ -28,9 +28,10 @@ import socket
 import threading
 import time
 import warnings
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, AsyncIterator, Callable, Literal
 
 # IPython warns when embedding <iframe srcdoc=...> via HTML(); we need srcdoc
 # for SolveIt and cannot use display.IFrame (URL-only). Silence that noise.
@@ -777,7 +778,12 @@ async def _finalize_layout_note(mid: str, content: str) -> None:
     await _ensure_layout_skipped(mid)
 
 
-async def save_layout(layout: dict | None = None, *, force_create: bool = False) -> bool:
+async def save_layout(
+    layout: dict | None = None,
+    *,
+    force_create: bool = False,
+    quiet: bool = False,
+) -> bool:
     """Persist overlay into **exactly one** ``#| sslive-layout`` dialog note.
 
     Rules:
@@ -785,27 +791,32 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
         Never create a second note (that was the multi-note bug).
       * Create only when zero layout notes exist (or force_create and zero).
       * Extra layout notes + old "safe to delete" stubs are deleted.
+
+    ``quiet=True``: no slide-restore postMessage / no console chatter (used during
+    ``%slive`` startup so the preview does not flash or steal focus).
     """
     if layout is None:
         deck = _SESSION.get("deck")
         layout = deck.layout if deck is not None else _empty_layout()
     if update_msg is None and add_msg is None:
         _SESSION["_layout_save_err"] = "update_msg/add_msg unavailable"
-        print("sslive: layout save failed — dialoghelper add_msg/update_msg missing")
+        if not quiet:
+            print("sslive: layout save failed — dialoghelper add_msg/update_msg missing")
         return False
     content = _layout_msg_content(layout)
-    try:
-        await _sync_slide_index_from_parent()
-    except Exception:
-        pass
-    # Long enough for create/update + SolveIt UI re-layout
-    _arm_focus_guard(5000)
+    if not quiet:
+        try:
+            await _sync_slide_index_from_parent()
+        except Exception:
+            pass
     n_els = len((layout or {}).get("elements") or {})
 
     def _mark_ok(mid: str, *, created: bool) -> None:
         _SESSION["layout_msg_id"] = mid
         _SESSION["_layout_save_ok_ts"] = time.time()
         _SESSION.pop("_layout_save_err", None)
+        if quiet:
+            return
         verb = "created" if created else "updated"
         # Quiet updates; announce creates and first update only
         if created or not _SESSION.get("_layout_save_announced"):
@@ -816,68 +827,76 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
             )
 
     try:
-        existing = await _list_layout_msgs()
+        async with hold_dialog_focus(
+            ms=5000, refocus=not quiet, soft=True, settle=0.08 if not quiet else 0.0
+        ):
+            existing = await _list_layout_msgs()
 
-        # ── UPDATE PATH: never create when a real note is already present ──
-        if existing and not force_create:
-            prefer = _SESSION.get("layout_msg_id")
-            keeper = None
-            if prefer:
-                for mid, _ in existing:
-                    if _layout_ids_match(mid, str(prefer)):
-                        keeper = str(mid)
-                        break
-            if keeper is None:
+            # ── UPDATE PATH: never create when a real note is already present ──
+            if existing and not force_create:
+                prefer = _SESSION.get("layout_msg_id")
+                keeper = None
+                if prefer:
+                    for mid, _ in existing:
+                        if _layout_ids_match(mid, str(prefer)):
+                            keeper = str(mid)
+                            break
+                if keeper is None:
+                    keeper = str(
+                        max(existing, key=lambda t: len((t[1].get("elements") or {})))[0]
+                    )
+                if update_msg is not None:
+                    await _finalize_layout_note(keeper, content)
+                    _mark_ok(keeper, created=False)
+                    removed = await _cleanup_extra_layout_notes(keeper)
+                    if removed and not quiet:
+                        print(
+                            f"sslive: removed {removed} extra layout/stub note(s) "
+                            f"(keeping id={keeper})"
+                        )
+                    if not quiet:
+                        _push_slide_index_restore(keep_edit=False)
+                    return True
+
+            # force_create with existing → still just update (ignore force)
+            if existing and force_create:
                 keeper = str(
                     max(existing, key=lambda t: len((t[1].get("elements") or {})))[0]
                 )
-            if update_msg is not None:
                 await _finalize_layout_note(keeper, content)
                 _mark_ok(keeper, created=False)
-                removed = await _cleanup_extra_layout_notes(keeper)
-                if removed:
-                    print(
-                        f"sslive: removed {removed} extra layout/stub note(s) "
-                        f"(keeping id={keeper})"
-                    )
-                _push_slide_index_restore(keep_edit=False)
+                await _cleanup_extra_layout_notes(keeper)
+                if not quiet:
+                    _push_slide_index_restore(keep_edit=False)
                 return True
 
-        # force_create with existing → still just update (ignore force)
-        if existing and force_create:
-            keeper = str(
-                max(existing, key=lambda t: len((t[1].get("elements") or {})))[0]
-            )
-            await _finalize_layout_note(keeper, content)
-            _mark_ok(keeper, created=False)
-            await _cleanup_extra_layout_notes(keeper)
-            _push_slide_index_restore(keep_edit=False)
+            # ── CREATE PATH: only when zero layout notes exist ──
+            if add_msg is None:
+                _SESSION["_layout_save_err"] = "add_msg unavailable"
+                if not quiet:
+                    print("sslive: cannot create #| sslive-layout — add_msg unavailable")
+                return False
+            new_id = await _create_layout_msg(content)
+            if not new_id:
+                err = _SESSION.get("_layout_add_err") or "add_msg returned no id"
+                _SESSION["_layout_save_err"] = err
+                if not quiet:
+                    print(f"sslive: failed to create #| sslive-layout — {err}")
+                return False
+            await _finalize_layout_note(new_id, content)
+            _mark_ok(new_id, created=True)
+            await _cleanup_extra_layout_notes(new_id)
+            if not quiet:
+                _push_slide_index_restore(keep_edit=False)
             return True
-
-        # ── CREATE PATH: only when zero layout notes exist ──
-        if add_msg is None:
-            _SESSION["_layout_save_err"] = "add_msg unavailable"
-            print("sslive: cannot create #| sslive-layout — add_msg unavailable")
-            return False
-        new_id = await _create_layout_msg(content)
-        if not new_id:
-            err = _SESSION.get("_layout_add_err") or "add_msg returned no id"
-            _SESSION["_layout_save_err"] = err
-            print(f"sslive: failed to create #| sslive-layout — {err}")
-            return False
-        await _finalize_layout_note(new_id, content)
-        _mark_ok(new_id, created=True)
-        # Sweep any race-created extras + historical stubs
-        await _cleanup_extra_layout_notes(new_id)
-        _push_slide_index_restore(keep_edit=False)
-        return True
     except Exception as e:
         _SESSION["_layout_save_err"] = str(e)
-        print(f"sslive: layout save failed: {e}")
+        if not quiet:
+            print(f"sslive: layout save failed: {e}")
         return False
 
 
-async def ensure_layout_note() -> str | None:
+async def ensure_layout_note(*, quiet: bool = True) -> str | None:
     """Ensure exactly one ``#| sslive-layout`` note; create only if none exist.
 
     On a warm re-``%slive`` when a single good note already exists, **do not**
@@ -902,24 +921,26 @@ async def ensure_layout_note() -> str | None:
             needs_write = len(existing) > 1 or bool(stubs)
             if needs_write:
                 # Merge / dedupe only when something is actually wrong
-                await save_layout(lay)
+                await save_layout(lay, quiet=quiet)
             # else: leave the note alone — deck.layout was already loaded from it
             return keeper
 
         # None — create once
         _SESSION.pop("layout_msg_id", None)
-        ok = await save_layout(lay)
+        ok = await save_layout(lay, quiet=quiet)
         mid = _SESSION.get("layout_msg_id")
         if not ok or not mid:
-            print(
-                "sslive: could not create #| sslive-layout note — "
-                f"err={_SESSION.get('_layout_save_err') or _SESSION.get('_layout_add_err')}"
-            )
+            if not quiet:
+                print(
+                    "sslive: could not create #| sslive-layout note — "
+                    f"err={_SESSION.get('_layout_save_err') or _SESSION.get('_layout_add_err')}"
+                )
             return None
         return str(mid)
     except Exception as e:
         _SESSION["_layout_ensure_err"] = str(e)
-        print(f"sslive: ensure_layout_note failed: {e}")
+        if not quiet:
+            print(f"sslive: ensure_layout_note failed: {e}")
         return None
 
 
@@ -984,27 +1005,42 @@ async def _drain_layout_queue_only() -> list[dict]:
         return []
 
 
-async def flush_layout_save() -> bool:
+async def flush_layout_save(*, quiet: bool = False, force: bool = False) -> bool:
     """Cancel debounce and write layout to the dialog now.
 
-    Call before ``%slive`` / ``reload_deck`` so a drag just before rebuild is
-    not lost. Also useful after a long edit session.
+    Skips the dialog write when nothing is dirty (avoids focusing the layout
+    note on a clean re-``%slive``). Use ``force=True`` to always write.
+
+    ``quiet=True`` avoids slide-restore postMessage / console noise.
     """
     prev = _SESSION.get("_layout_save_task")
-    if prev is not None and not prev.done():
+    had_pending_task = prev is not None and not prev.done()
+    if had_pending_task:
         try:
             prev.cancel()
         except Exception:
             pass
         _SESSION["_layout_save_task"] = None
-    # Apply any patches still sitting in the parent queue (not yet polled)
+
+    layout_patches: list[dict] = []
     try:
         layout_patches = await _drain_layout_queue_only()
         if layout_patches:
             _apply_slide_layout_patches(layout_patches)
     except Exception as e:
         _SESSION["_layout_flush_err"] = str(e)
-    ok = await save_layout()
+
+    dirty = (
+        force
+        or had_pending_task
+        or bool(_SESSION.get("_layout_save_pending"))
+        or bool(layout_patches)
+    )
+    if not dirty:
+        _SESSION["_layout_save_pending"] = False
+        return True
+
+    ok = await save_layout(quiet=quiet)
     _SESSION["_layout_save_pending"] = False
     return ok
 
@@ -4258,7 +4294,11 @@ def _apply_source_to_deck(cell_id: str, source: str) -> None:
 
 
 async def write_back_cell(cell_id: str, content: str) -> bool:
-    """Write source into the SolveIt dialog message (unified source of truth)."""
+    """Write source into the SolveIt dialog message (unified source of truth).
+
+    Callers that already wrap a batch in ``hold_dialog_focus`` can pass
+    through this helper as-is (nested holds only extend the guard).
+    """
     if update_msg is None:
         return False
     last_err = None
@@ -4560,17 +4600,60 @@ def _arm_focus_guard(ms: int = 2000) -> None:
         pass
 
 
-async def _refocus_after_dialog_writes(*, delay: float = 0.25) -> None:
-    """Single soft refocus after dialog writes (no multi-pulse flashing)."""
-    _arm_focus_guard(4000)
+@asynccontextmanager
+async def hold_dialog_focus(
+    *,
+    ms: int = 4000,
+    refocus: bool = True,
+    soft: bool = True,
+    settle: float = 0.05,
+) -> AsyncIterator[None]:
+    """Keep focus on the slide preview while dialoghelper mutates messages.
+
+    Same pattern used when writing code-cell sources back to the dialog after
+    ▶ Run: arm the parent focus/scroll guard so ``update_msg`` / ``add_msg``
+    cannot jump to the changed cell, then soft-refocus ``#sslive-frame``.
+
+    Usage::
+
+        async with hold_dialog_focus():
+            await update_msg(id=mid, content=...)
+            await update_msg(id=layout_id, content=...)
+
+    Nested holds only extend the guard window. Fullscreen skips refocus
+    (would thrash the FS UI). User pointer/key in the dialog still wins
+    (see ``__sslive_user_ts`` on the parent bridge).
+    """
+    _arm_focus_guard(ms)
+    in_fs = False
     try:
-        await asyncio.sleep(delay)
+        in_fs = await _parent_in_fullscreen()
     except Exception:
-        pass
+        in_fs = False
     try:
-        refocus_presenter(soft=True)
-    except Exception:
-        pass
+        yield
+    finally:
+        # Cover late SolveIt focus jobs that fire after update_msg returns
+        _arm_focus_guard(ms)
+        if refocus and not in_fs:
+            if settle and settle > 0:
+                try:
+                    await asyncio.sleep(settle)
+                except Exception:
+                    pass
+            try:
+                refocus_presenter(soft=soft)
+            except Exception:
+                pass
+
+
+async def dialog_call(awaitable, *, ms: int = 4000, refocus: bool = True):
+    """Run one async dialoghelper call under ``hold_dialog_focus``."""
+    async with hold_dialog_focus(ms=ms, refocus=refocus):
+        result = awaitable
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
 
 async def _read_parent_slide_index() -> int | None:
@@ -4657,13 +4740,16 @@ async def _flush_pending_dialog_sync(*, refocus: bool = True) -> int:
     if not pending:
         return 0
     _SESSION["pending_dialog_sync"] = {}
-    _arm_focus_guard(2000 + 500 * len(pending))
     n = 0
-    for cid, src in pending.items():
-        if await write_back_cell(cid, src):
-            n += 1
-    if n and refocus:
-        refocus_presenter()
+    async with hold_dialog_focus(
+        ms=2000 + 500 * len(pending),
+        refocus=refocus,
+        soft=True,
+        settle=0.1 if refocus else 0.0,
+    ):
+        for cid, src in pending.items():
+            if await write_back_cell(cid, src):
+                n += 1
     return n
 
 
@@ -4726,18 +4812,18 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
         async def _deferred_dialog_write(cid=cell_id, src=source):
             try:
                 await asyncio.sleep(0.2)
-                in_fs = await _parent_in_fullscreen()
-                if not in_fs:
-                    _arm_focus_guard(2000)
                 pending = dict(_SESSION.get("pending_dialog_sync") or {})
                 pending[cid] = src
                 _SESSION["pending_dialog_sync"] = {}
-                for pcid, psrc in pending.items():
-                    await write_back_cell(pcid, psrc)
-                if not in_fs:
-                    for delay in (0.1, 0.4):
-                        await asyncio.sleep(delay)
-                        refocus_presenter()
+                # One hold for the whole batch — same as layout/skip writes
+                async with hold_dialog_focus(
+                    ms=2000 + 500 * max(1, len(pending)),
+                    refocus=True,
+                    soft=True,
+                    settle=0.12,
+                ):
+                    for pcid, psrc in pending.items():
+                        await write_back_cell(pcid, psrc)
             except Exception as e:
                 _SESSION["_dialog_sync_err"] = str(e)
 
@@ -4745,8 +4831,8 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
             loop.create_task(_deferred_dialog_write())
         except RuntimeError:
             try:
-                _arm_focus_guard(2000)
-                await write_back_cell(cell_id, source)
+                async with hold_dialog_focus(ms=2500, refocus=True, soft=True):
+                    await write_back_cell(cell_id, source)
             except Exception:
                 pass
 
@@ -4757,7 +4843,7 @@ async def sync_dialog() -> int:
     """Write current deck code sources into SolveIt dialog cells.
 
     Also flushes sources queued during fullscreen Runs.
-    May move focus in the SolveIt UI (host behavior).
+    Uses ``hold_dialog_focus`` so SolveIt does not jump to each updated cell.
     """
     deck = _SESSION.get("deck")
     if deck is None:
@@ -4768,15 +4854,19 @@ async def sync_dialog() -> int:
             _apply_source_to_deck(cid, src)
     _SESSION["pending_dialog_sync"] = {}
 
-    _arm_focus_guard(2000 + 500 * len(deck.ordered_code_ids))
     n = 0
-    for cid in deck.ordered_code_ids:
-        src = deck.cells[cid].source
-        if await write_back_cell(cid, src):
-            n += 1
-            print(f"sslive: dialog sync {cid} ({len(src)} chars)")
+    async with hold_dialog_focus(
+        ms=2000 + 500 * max(1, len(deck.ordered_code_ids)),
+        refocus=True,
+        soft=True,
+        settle=0.12,
+    ):
+        for cid in deck.ordered_code_ids:
+            src = deck.cells[cid].source
+            if await write_back_cell(cid, src):
+                n += 1
+                print(f"sslive: dialog sync {cid} ({len(src)} chars)")
     print(f"sslive: synced {n}/{len(deck.ordered_code_ids)} code cells → dialog")
-    refocus_presenter()
     return n
 
 
@@ -5390,18 +5480,22 @@ async def _skip_msg(mid: str | None, *, quiet: bool = False, settle: float = 1.0
         # Brief settle so the output iframe is attached (keep short to avoid flash)
         if settle and settle > 0:
             await asyncio.sleep(settle)
-        # Guard must cover the update_msg (and a short tail of UI churn)
-        _arm_focus_guard(int(max(3000, settle * 1000 + 2500)))
-        # Normalize: SolveIt DOM often uses _prefix; API accepts either
-        mid_try = str(mid)
-        try:
-            await _call_update_msg(id=mid_try, skipped=1)
-        except Exception:
-            alt = mid_try[1:] if mid_try.startswith("_") else "_" + mid_try
-            await _call_update_msg(id=alt, skipped=1)
-            mid_try = alt
-        _SESSION["skipped_launcher_id"] = mid_try
-        return mid_try
+        # Same hold as code-cell write-back: guard + soft refocus to #sslive-frame
+        async with hold_dialog_focus(
+            ms=int(max(3500, settle * 1000 + 2500)),
+            refocus=not quiet,
+            soft=True,
+            settle=0.05 if not quiet else 0.0,
+        ):
+            mid_try = str(mid)
+            try:
+                await _call_update_msg(id=mid_try, skipped=1)
+            except Exception:
+                alt = mid_try[1:] if mid_try.startswith("_") else "_" + mid_try
+                await _call_update_msg(id=alt, skipped=1)
+                mid_try = alt
+            _SESSION["skipped_launcher_id"] = mid_try
+            return mid_try
     except Exception as e:
         if not quiet:
             print(f"sslive: skip failed for {mid}: {e}")
@@ -5515,10 +5609,11 @@ async def slive(
         use_http = not _in_solveit()
 
     theme_dict = theme if isinstance(theme, dict) else dict(THEME_DARK)
-    # Persist any in-flight edit-mode positions before we rebuild the deck
+    # Only flush layout if a debounced save is actually pending (dirty).
+    # Always flushing on re-%slive rewrote the layout note → focus layout → preview.
     if _SESSION.get("deck") is not None:
         try:
-            await flush_layout_save()
+            await flush_layout_save(quiet=True, force=False)
         except Exception as e:
             _SESSION["_layout_flush_err"] = str(e)
     try:
@@ -5533,16 +5628,6 @@ async def slive(
     _SESSION["executor"] = executor
     _SESSION["echo_to_dialog"] = echo_to_dialog
     _SESSION["theme"] = theme_dict
-    # Soft notice when overlay has keys that no longer match elements (S2-D drift)
-    try:
-        st = layout_status(deck)
-        if st.get("n_orphans"):
-            print(
-                f"sslive: layout has {st['n_orphans']} orphan id(s) "
-                "(note edits renumber pieces) — see layout_status()"
-            )
-    except Exception:
-        pass
 
     port: int | None = None
     if use_http:
@@ -5574,60 +5659,44 @@ async def slive(
     _SESSION.setdefault("pending_dialog_sync", {})
     _SESSION["auto_sync_dialog"] = True  # deferred update_msg after Run
 
-    wrote_dialog = False
     if embed:
-        # show → sleep → skipped=1 so LLM does not ingest the srcdoc HTML
+        # ── Single paint of the deck ──────────────────────────────────────
+        # Skip / layout housekeeping is deferred and wrapped in hold_dialog_focus
+        # (same helper as code-cell write-back) so focus stays on the preview.
         _show_presenter(port, height=height)
-        # Bridge is installed in _show_presenter — arm immediately so skip /
-        # layout writes cannot scroll the dialog to the first cell.
-        _arm_focus_guard(6000)
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         _SESSION["launcher_msg_id"] = mid
-        # Shorter settle; long settle + multi-refocus made the preview flash
-        await _skip_msg(mid, settle=0.35, quiet=True)
-        wrote_dialog = True
-    else:
-        mid = await _resolve_launcher_msg_id(launcher_msg_id)
-        if mid:
-            _arm_focus_guard(4000)
-            await _skip_msg(mid, settle=0.0, quiet=True)
-            wrote_dialog = True
-        _SESSION["launcher_msg_id"] = mid
 
-    # Layout note: create if missing; skip rewrite when already present (warm re-open)
-    try:
-        _arm_focus_guard(6000)
-        before = _SESSION.get("layout_msg_id")
-        n_before = len(await _list_layout_msgs()) if find_msgs else 0
-        mid_layout = await ensure_layout_note()
-        n_after = len(await _list_layout_msgs()) if find_msgs else 0
-        # Only count as a write when we created/merged (ensure skips silent no-ops)
-        if mid_layout and (n_before != n_after or before != mid_layout):
-            wrote_dialog = True
-        if mid_layout is None:
-            print(
-                "sslive: warning — no #| sslive-layout note "
-                f"(err={_SESSION.get('_layout_save_err') or _SESSION.get('_layout_add_err')})"
-            )
-    except Exception as e:
-        _SESSION["_layout_ensure_err"] = str(e)
-        print(f"sslive: layout note ensure failed: {e}")
-
-    # One soft reclaim after any dialog write — not a multi-pulse flash train
-    if wrote_dialog:
-        try:
-            await _refocus_after_dialog_writes(delay=0.2)
-        except Exception:
+        async def _deferred_slive_housekeeping(launcher_mid=mid):
             try:
-                refocus_presenter(soft=True)
-            except Exception:
-                pass
-    else:
-        # Still gently focus the new/updated preview once
+                # Let the first iframe paint settle before any update_msg
+                await asyncio.sleep(0.7)
+                async with hold_dialog_focus(
+                    ms=8000, refocus=True, soft=True, settle=0.1
+                ):
+                    # quiet skip: outer hold owns refocus (avoid double refocus)
+                    await _skip_msg(launcher_mid, settle=0.0, quiet=True)
+                    await ensure_layout_note(quiet=True)
+            except Exception as e:
+                _SESSION["_slive_housekeeping_err"] = str(e)
+
         try:
-            refocus_presenter(soft=True)
-        except Exception:
-            pass
+            asyncio.get_running_loop().create_task(_deferred_slive_housekeeping())
+        except RuntimeError:
+            try:
+                await _deferred_slive_housekeeping()
+            except Exception as e:
+                _SESSION["_slive_housekeeping_err"] = str(e)
+    else:
+        mid = await _resolve_launcher_msg_id(launcher_msg_id)
+        _SESSION["launcher_msg_id"] = mid
+        try:
+            async with hold_dialog_focus(ms=5000, refocus=True, soft=True):
+                if mid:
+                    await _skip_msg(mid, settle=0.0, quiet=True)
+                await ensure_layout_note(quiet=True)
+        except Exception as e:
+            _SESSION["_layout_ensure_err"] = str(e)
 
     _SESSION["session"] = session
     return session if return_session else None
@@ -5879,6 +5948,7 @@ __all__ = [
     "deck_summary",
     "refresh_presenter",
     "refocus_presenter",
+    "hold_dialog_focus",
     "render_output_html",
     "generate_presenter_html",
     "get_craft_exec_mgr",
