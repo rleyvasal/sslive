@@ -721,13 +721,48 @@ def _as_str(val: Any) -> str:
 
 
 def get_craft_exec_mgr():
-    """Discover CRAFT RemoteExecutionManager from the IPython user namespace."""
+    """Discover CRAFT RemoteExecutionManager (local host client → remote GPU).
+
+    Under ``%gpu``, code cells run on the remote kernel, but the CRAFT *client*
+    (``_exec_mgr``) still lives in the SolveIt host namespace. Probe common
+    names so ▶ Run works after a normal CRAFT + ``%gpu`` setup.
+    """
     if get_ipython is None:
         return None
     try:
-        return get_ipython().user_ns.get("_exec_mgr")
+        ns = get_ipython().user_ns or {}
     except Exception:
         return None
+    for key in (
+        "_exec_mgr",
+        "exec_mgr",
+        "remote_exec_mgr",
+        "craft_exec_mgr",
+        "_craft_exec_mgr",
+        "REM",
+    ):
+        mgr = ns.get(key)
+        if mgr is not None and (
+            hasattr(mgr, "remote_kc") or hasattr(mgr, "execute_interactive")
+        ):
+            return mgr
+    # Nested under a craft/gpudev handle
+    for key in ("craft", "gpudev", "_craft", "CRAFT"):
+        obj = ns.get(key)
+        if obj is None:
+            continue
+        for attr in ("_exec_mgr", "exec_mgr", "remote_mgr", "mgr"):
+            mgr = getattr(obj, attr, None)
+            if mgr is not None and hasattr(mgr, "remote_kc"):
+                return mgr
+    # Last resort: scan for object with remote_kc
+    for val in list(ns.values()):
+        try:
+            if hasattr(val, "remote_kc") and getattr(val, "remote_kc", None) is not None:
+                return val
+        except Exception:
+            continue
+    return None
 
 
 def make_capture_hook(
@@ -985,32 +1020,40 @@ def _pick_port(start: int = 8100, span: int = 50) -> int:
 
 
 def _ensure_local_magic():
-    """Keep ``slive`` registered as a *local* magic when CRAFT is loaded.
+    """Register ``%slive`` as a *local* magic so it works under ``%gpu`` mode.
 
-    Slide **code** still runs on the GPU via CRAFT; only the host driver
-    (``await slive()``, bridge, dialog writes) must stay on %local.
+    Like other CRAFT host tools: dialog stays in GPU mode for torch/cells, but
+    ``%slive`` runs on the SolveIt host (dialoghelper + iframe), then ▶ Run
+    uses the remote kernel via CRAFT.
     """
     if get_ipython is None:
         return
+    ip = get_ipython()
     try:
-        reg = get_ipython().user_ns.get("register_local_magic")
+        reg = (ip.user_ns or {}).get("register_local_magic")
         if callable(reg):
             reg("%slive")
             reg("slive")
+            reg("%sslive")
     except Exception:
         pass
+    # Magics class registered in load_ipython_extension / _register_slive_magic
 
 
 def _host_ok() -> tuple[bool, str]:
-    """Whether the sslive *host* can run (SolveIt local + dialoghelper)."""
+    """Whether the sslive *host* can run (SolveIt host + dialoghelper).
+
+    Does **not** require ``%local`` mode: under ``%gpu``, local magics still
+    run on the host. We only need dialoghelper available on that host kernel.
+    """
     if not _in_solveit():
         return True, "not in SolveIt (HTTP/dev host ok)"
     if update_msg is None and find_msgs is None:
         return False, (
-            "dialoghelper missing — run the host under %local in SolveIt "
-            "(slide ▶ Run still uses the GPU kernel)"
+            "dialoghelper missing on host — load sslive on the SolveIt kernel "
+            "(use %slive / register_local_magic; do not run the host only on remote)"
         )
-    return True, "local host"
+    return True, "host"
 
 
 def _math_is_display(raw: str) -> bool:
@@ -2614,10 +2657,12 @@ def _presenter_iframe_html(height: str = "720px", port: int | None = None) -> st
     deck = _SESSION.get("deck") or Deck()
     ex = _SESSION.get("executor") or LiveExecutor()
     ok, msg = ex.kernel_ok()
-    label = f"gpu · {msg}" if ok else f"gpu · {msg}"
-    # On SolveIt, browser cannot reach JupyUvi — label says kernel-side run
-    if _in_solveit() or not port:
-        label = f"gpu · {msg} · edit in slide · ▶ Run"
+    # Soft-start: show deck even if GPU offline; badge reflects attach state
+    if ok:
+        label = f"gpu · ready · ▶ Run"
+    else:
+        short = (msg or "offline")[:40]
+        label = f"gpu · offline · {short}"
     initial = int(_SESSION.get("slide_index") or 0)
     html = generate_presenter_html(
         deck, backend_label=label, port=port or 0, initial_slide=initial
@@ -3679,34 +3724,33 @@ async def slive(
     embed: bool = True,
     use_http: bool | None = None,
     return_session: bool = False,
+    require_gpu: bool = False,
 ):
-    """Start the live deck (host under ``%local``; slide Run uses GPU).
+    """Start the live deck (host magic; slide ▶ Run uses GPU).
 
-    ::
+    Preferred under **``%gpu`` mode** (stay there for torch / pointcloud)::
 
-        %local
-        %run path/to/sslive.py
         %gpu
-        %local
-        await slive()
-        # edit in the slide → ▶ / Shift+Enter → CRAFT GPU → in-place output
+        %run path/to/sslive.py   # once — registers %slive as a *local* magic
+        %slive                   # or: await slive()
+        # deck displays like %pointcloud; ▶ Run → remote GPU via CRAFT
 
-    Returns ``None`` by default so the cell output is only the slide iframe
-    (session is stored as ``_SESSION['session']``). Pass ``return_session=True``
-    if you need the ``LiveSession`` object.
+    ``%slive`` is registered as a **local magic** so it runs on the SolveIt
+    host even when the dialog is in GPU mode (same pattern as other CRAFT
+    host tools). Slide code still executes on the remote kernel.
 
-    The host (iframe, dialoghelper, layout skip) must run under **%local**.
-    Cell bodies run on the **GPU** via CRAFT — you do not need ``await slive()``
-    under ``%gpu``.
+    Soft-start: if the CRAFT client is not attached yet, the deck still opens
+    (notes/layout/reveal work); ▶ Run reports offline until GPU is ready.
+    Pass ``require_gpu=True`` to hard-fail instead.
 
-    After embed, the calling cell is ``skipped=1`` (red eye) so the preview
-    HTML is not sent to the LLM. Fallback: ``await hide_from_ai()``.
+    Returns ``None`` by default (clean cell output). Session: ``session()``.
     """
     # Sync probe first (may be empty under await — full resolve after embed).
     launcher_msg_id = _find_caller_msg_id()
     _SESSION["launcher_msg_id"] = launcher_msg_id
 
     _ensure_local_magic()
+    _register_slive_magic()
 
     host_ok, host_msg = _host_ok()
     if not host_ok:
@@ -3714,11 +3758,13 @@ async def slive(
         return None
 
     ok, msg = LiveExecutor().kernel_ok()
-    if not ok:
+    _SESSION["gpu_ok"] = ok
+    _SESSION["gpu_msg"] = msg
+    if not ok and require_gpu:
         print(f"sslive: GPU not ready — {msg}")
         print(
-            "Load CRAFT and run %gpu once so the remote kernel is up, "
-            "then call await slive() again under %local."
+            "Load CRAFT on the SolveIt host so `_exec_mgr` exists, run %gpu, "
+            "then %slive again."
         )
         return None
 
@@ -3751,7 +3797,7 @@ async def slive(
     else:
         _SESSION["port"] = None
 
-    session = LiveSession(port=port or 0, backend="gpu", deck=deck)
+    session = LiveSession(port=port or 0, backend="gpu" if ok else "offline", deck=deck)
 
     n_code = len(deck.ordered_code_ids)
     if n_code == 0 and len(deck.slides) == 0:
@@ -3775,7 +3821,6 @@ async def slive(
             await _skip_msg(mid, settle=0.0, quiet=True)
 
     _SESSION["session"] = session
-    # Default: no LiveSession line under the preview (still available via session()).
     return session if return_session else None
 
 
@@ -3869,6 +3914,82 @@ def session() -> LiveSession | None:
     return _SESSION.get("session")
 
 
+def _register_slive_magic() -> None:
+    """Install ``%slive`` line magic + mark it local for ``%gpu`` mode."""
+    if get_ipython is None:
+        return
+    ip = get_ipython()
+    try:
+        from IPython.core.magic import Magics, magics_class, line_magic
+    except Exception:
+        return
+
+    @magics_class
+    class SSliveMagics(Magics):
+        @line_magic("slive")
+        def slive_magic(self, line: str = ""):
+            """Open the live deck (host). Works under %gpu as a local magic.
+
+            Usage::
+
+                %slive
+                %slive 800
+                %slive height=720
+            """
+            height = "720px"
+            line = (line or "").strip()
+            if line:
+                # "%slive 800" or "%slive 800px" or "%slive height=900"
+                m = re.search(r"(?:height\s*=\s*)?(\d+)\s*(px)?", line, re.I)
+                if m:
+                    height = f"{m.group(1)}px"
+            coro = slive(height=height, return_session=False)
+
+            async def _run():
+                return await coro
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(_run())
+
+            # Notebook already has a loop (SolveIt / IPython async)
+            try:
+                import nest_asyncio  # type: ignore
+
+                nest_asyncio.apply()
+                return loop.run_until_complete(_run())
+            except Exception:
+                # Fire task; display still happens inside slive
+                return loop.create_task(_run())
+
+        @line_magic("sslive")
+        def sslive_magic(self, line: str = ""):
+            """Alias for %slive."""
+            return self.slive_magic(line)
+
+    try:
+        if not getattr(ip, "_sslive_magics_loaded", False):
+            ip.register_magics(SSliveMagics(ip))
+            ip._sslive_magics_loaded = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    _ensure_local_magic()
+
+
+def load_ipython_extension(ip=None) -> None:
+    """``%load_ext sslive`` / auto on ``%run`` when possible."""
+    _register_slive_magic()
+
+
+# Auto-register when the file is %run
+try:
+    if get_ipython is not None and get_ipython() is not None:
+        _register_slive_magic()
+except Exception:
+    pass
+
+
 # Wire name for %run
 __all__ = [
     "Deck",
@@ -3882,6 +4003,7 @@ __all__ = [
     "slive",
     "session",
     "hide_from_ai",
+    "load_ipython_extension",
     "sstop",
     "run_cell",
     "run_cell_index",

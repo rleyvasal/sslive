@@ -1,98 +1,96 @@
 # sslive **0.1.0** (working)
 
-Live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https://github.com/rleyvasal/gpudev) / CRAFT: edit and run **in the slide**, layout and reveal like a deck, keep the dialog as the source of truth.
+Live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https://github.com/rleyvasal/gpudev) / CRAFT.
+
+Stay in **`%gpu` mode** for your usual work (`torch`, `%pointcloud`, …). Open the deck with **`%slive`** — a **local magic** (like other CRAFT host tools) that displays the slides in the cell output and runs slide code on the remote GPU.
 
 ## Architecture
 
-| Layer | Where | Role |
-|-------|--------|------|
-| **Host** | SolveIt **`%local`** | `await slive()`, iframe, dialoghelper, layout persist, AI-hide |
-| **Slide code** | CRAFT **GPU** (`%gpu` kernel) | ▶ Run / Shift+Enter via `remote_kc` |
-
-You do **not** run `await slive()` under `%gpu`. Connect GPU once with `%gpu`, then drive the deck under `%local`. In-slide Run still executes on the remote kernel.
-
 ```text
-%local await slive()
-  → presenter iframe (srcdoc)
-  → edit / ▶ Run → postMessage → Python bridge
-  → CRAFT GPU execute
-  → in-place output + debounced dialog write-back
+%gpu mode (dialog stays here)
+    │
+    ├─ normal cells / %pointcloud  →  remote GPU kernel
+    │
+    └─ %slive  (local magic on SolveIt host)
+           → iframe deck + dialoghelper + layout
+           → ▶ Run  →  CRAFT client (_exec_mgr)  →  same remote GPU
 ```
+
+| Piece | Where |
+|-------|--------|
+| `%slive` / `await slive()`, layout, AI-hide | SolveIt **host** (local magic) |
+| Code from ▶ Run / Shift+Enter | **Remote GPU** via CRAFT |
+
+You do **not** need to flip back to `%local` for the deck if `%slive` is registered as a local magic (done automatically when you `%run` this file on the host).
+
+## Usage (GPU-mode first)
+
+```python
+%gpu
+# load CRAFT the way you usually do in this dialog so _exec_mgr exists on the host
+
+%gpu
+%run path/to/sslive.py    # registers %slive as a local magic — don't paste the file
+
+%slive                    # open deck (clean iframe, like %pointcloud)
+# or: await slive()
+```
+
+1. Click the slide iframe  
+2. Edit a code box  
+3. **▶ Run** / **Shift+Enter** → remote GPU  
+4. Output updates in place; dialog source syncs shortly after  
+
+**Soft-start:** if the CRAFT client is not attached yet, the deck still opens (notes, layout, reveal). The badge shows `gpu · offline`; ▶ Run will explain until GPU is ready.
 
 ## What works
 
 | Feature | Status |
 |---------|--------|
-| Edit code **in the slide** | ✅ |
-| ▶ Run / Shift+Enter on GPU (CRAFT) | ✅ |
-| Output updates under the cell | ✅ |
-| Sync source → SolveIt dialog cell | ✅ |
-| Fullscreen keeps current slide | ✅ |
-| Preview keep-focus after Run | ✅ focus guard |
-| Layout: move / size / font / reveal | ✅ `e` + floating toolbar |
-| Note cells split (title, bullets, display math, images…) | ✅ |
-| Markdown + LaTeX notes | ✅ mistletoe + latex2mathml (fallback basic) |
-| Preview cell hidden from LLM | ✅ `skipped=1` (red eye) |
+| `%slive` local magic under `%gpu` | ✅ |
+| Edit code in the slide | ✅ |
+| ▶ Run on GPU (CRAFT) | ✅ |
+| Soft-start without GPU (view/layout) | ✅ |
+| Layout / floating toolbar / reveal | ✅ |
+| Note split (title, bullets, display math, images) | ✅ |
+| Preview cell AI-hidden (`skipped=1`) | ✅ |
+| Markdown + LaTeX | ✅ mistletoe + latex2mathml |
 
-## Usage
+## LLM context
 
-```python
-%local
-%run path/to/sslive.py   # prefer path; do not paste the whole file into a cell
-
-%gpu                     # once — bring CRAFT remote up
-
-%local
-await slive()
-```
-
-1. Click the **slide iframe**  
-2. Edit a code box  
-3. **▶ Run** or **Shift+Enter**  
-4. Output updates; dialog source updates shortly after  
-
-## LLM context (keep it small)
-
-SolveIt only feeds **non-skipped** messages to the model. sslive uses that:
-
-| Message | LLM? | Notes |
-|---------|------|--------|
-| Notes + code under `#\| s` | **Yes** | Your real deck content |
-| `#\| sslive-layout` JSON | **No** | auto `skipped=1` |
-| `await slive()` cell (huge iframe) | **No** | auto `skipped=1` after embed |
-| Pasted `sslive.py` / CRAFT logs / git dumps | **If you leave them open** | Hide them |
+| Message | In LLM? |
+|---------|---------|
+| Deck notes/code under `#\| s` | Yes |
+| `#\| sslive-layout` | No (`skipped=1`) |
+| `%slive` / `await slive()` cell (iframe) | No (auto-skip) |
 
 ```python
-await hide_from_ai()              # current / last launcher cell
-await hide_from_ai("_ea017cb0")   # explicit message id
+await hide_from_ai()            # if the eye stayed open
+await hide_from_ai("_msg_id")
 ```
 
-If the eye on the preview cell is **not** red after `slive()`, call `await hide_from_ai()` so the srcdoc HTML does not burn tokens.
-
-**Hygiene:** never paste the full library into the dialog; only `%run` it. Keep noise cells skipped.
+Do not paste `sslive.py` into a dialog cell — only `%run` it.
 
 ## Commands
 
 | Call | Role |
 |------|------|
-| `await slive()` | Start presentation (**%local**) |
-| `await run_cell_index(i)` | Programmatic run (GPU) |
-| `await pump_slide_runs()` | Drain stuck Run queue |
-| `await sync_dialog()` | Batch write sources to dialog |
-| `await hide_from_ai(id?)` | Mark message skipped (LLM hide) |
-| `refocus_presenter()` | Focus slide iframe |
-| `layout_ids()` | List layoutable element ids |
-| `await set_layout(el_id, …)` | Position/style (live + persist) |
-| `await clear_layout(…)` | Reset layout overrides |
-
-Layout is design-space px on a 1920×1080 stage; overrides live in the skipped layout note.
+| `%slive` / `%slive 800` | Open deck (local magic) |
+| `await slive()` | Same (async API) |
+| `session()` | Last `LiveSession` |
+| `await hide_from_ai()` | Force AI-hide |
+| `await sync_dialog()` | Batch source write-back |
+| `await set_layout(...)` | Programmatic layout |
+| `layout_ids()` | List element ids |
 
 ### Edit mode
 
-Press **`e`** (or ✎): select elements. Floating toolbar sits **next to** the selection (A−/A+, font, **reveal**, reset). Drag notes/outputs; code cells drag from the toolbar strip. Corner/edge handles resize. **← / →** advance reveal steps, then slides. Fragment step is not shown in the nav counter (slide `n / N` only).
+**`e`** or ✎: select elements; toolbar floats next to the selection. **← / →** reveal then slides. Nav shows `n / N` only (no fragment counter).
 
-Note ids look like `el-0-_abc123` (index + cell id). Structural edits to a note can shift indices — re-check layout after big content changes.
+## Troubleshooting
 
-## Preview focus
-
-After dialog write-back, SolveIt may try to focus the updated cell. sslive arms a short parent-page **focus guard** before `update_msg` so focus stays on the slide iframe when possible. Real dialog interaction always wins.
+| Symptom | Fix |
+|---------|-----|
+| `_exec_mgr not found` | CRAFT client not on **host** namespace — load CRAFT bootstrap in this dialog, then `%gpu`, then `%slive` |
+| Magic not found under `%gpu` | `%run sslive.py` again on host so local magic registers |
+| Eye not red | `await hide_from_ai()` |
