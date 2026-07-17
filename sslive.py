@@ -26,9 +26,18 @@ import re
 import socket
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
+
+# IPython warns when embedding <iframe srcdoc=...> via HTML(); we need srcdoc
+# for SolveIt and cannot use display.IFrame (URL-only). Silence that noise.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*IPython\.display\.IFrame.*",
+    category=UserWarning,
+)
 
 __version__ = "0.1.0"
 
@@ -2622,6 +2631,20 @@ def _presenter_iframe_html(height: str = "720px", port: int | None = None) -> st
     )
 
 
+def _display_presenter_html(html_str: str, *, update: bool = False):
+    """Display srcdoc HTML without IPython's IFrame UserWarning clutter."""
+    if display is None or IPyHTML is None:
+        return None
+    obj = IPyHTML(html_str)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        handle = _SESSION.get("presenter_handle")
+        if update and handle is not None:
+            handle.update(obj)
+            return handle
+        return display(obj, display_id=True)
+
+
 def refresh_presenter(height: str | None = None) -> None:
     """Re-draw the srcdoc deck (call after run_cell so outputs update)."""
     if display is None:
@@ -2629,14 +2652,10 @@ def refresh_presenter(height: str | None = None) -> None:
     h = height or _SESSION.get("height") or "720px"
     port = _SESSION.get("port")
     try:
-        from IPython.display import HTML as IPyHTML
-
-        handle = _SESSION.get("presenter_handle")
-        iframe = IPyHTML(_presenter_iframe_html(h, port=port))
+        html_str = _presenter_iframe_html(h, port=port)
+        handle = _display_presenter_html(html_str, update=True)
         if handle is not None:
-            handle.update(iframe)
-        else:
-            _SESSION["presenter_handle"] = display(iframe, display_id=True)
+            _SESSION["presenter_handle"] = handle
     except Exception as e:
         print(f"sslive: refresh_presenter failed: {e}")
 
@@ -3334,17 +3353,10 @@ def _show_presenter(port: int | None, height: str = "720px"):
     _start_bridge()
 
     try:
-        if display is not None and IPyHTML is not None:
-            import warnings
-
-            iframe = IPyHTML(_presenter_iframe_html(height, port=port))
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message=".*IFrame.*",
-                    category=UserWarning,
-                )
-                handle = display(iframe, display_id=True)
+        handle = _display_presenter_html(
+            _presenter_iframe_html(height, port=port), update=False
+        )
+        if handle is not None:
             _SESSION["presenter_handle"] = handle
     except Exception as e:
         print(f"sslive: srcdoc embed failed: {e}")
@@ -3666,6 +3678,7 @@ async def slive(
     echo_to_dialog: bool = False,
     embed: bool = True,
     use_http: bool | None = None,
+    return_session: bool = False,
 ):
     """Start the live deck (host under ``%local``; slide Run uses GPU).
 
@@ -3677,6 +3690,10 @@ async def slive(
         %local
         await slive()
         # edit in the slide → ▶ / Shift+Enter → CRAFT GPU → in-place output
+
+    Returns ``None`` by default so the cell output is only the slide iframe
+    (session is stored as ``_SESSION['session']``). Pass ``return_session=True``
+    if you need the ``LiveSession`` object.
 
     The host (iframe, dialoghelper, layout skip) must run under **%local**.
     Cell bodies run on the **GPU** via CRAFT — you do not need ``await slive()``
@@ -3757,8 +3774,9 @@ async def slive(
         if mid:
             await _skip_msg(mid, settle=0.0, quiet=True)
 
-    # Return session without dumping Deck into the cell output (see LiveSession.__repr__).
-    return session
+    _SESSION["session"] = session
+    # Default: no LiveSession line under the preview (still available via session()).
+    return session if return_session else None
 
 
 async def run_cell(
@@ -3846,6 +3864,11 @@ def deck_summary(deck: Deck | None = None) -> str:
     return "\n".join(lines)
 
 
+def session() -> LiveSession | None:
+    """Active ``LiveSession`` from the last ``await slive()`` (if any)."""
+    return _SESSION.get("session")
+
+
 # Wire name for %run
 __all__ = [
     "Deck",
@@ -3857,6 +3880,7 @@ __all__ = [
     "build_deck",
     "parse_note_to_elements",
     "slive",
+    "session",
     "hide_from_ai",
     "sstop",
     "run_cell",
