@@ -64,6 +64,8 @@ Optional: `await sync_dialog()` to push all deck sources later.
 
 Layout is design-space px on the 1920×1080 stage; overrides persist in a
 hidden `#| sslive-layout` note in the dialog (auto-created, `skipped=1`).
+The `await slive()` cell is also marked `skipped=1` after the preview embeds
+(red eye / Toggle AI visibility) so the giant iframe HTML is not sent to the LLM.
 Example: `await set_layout('el-output-_abc123', x=1000, y=400, w=700)` moves
 that screenshot/output block live — no rebuild, focus stays put.
 

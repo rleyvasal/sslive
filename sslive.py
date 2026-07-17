@@ -3294,6 +3294,60 @@ def _show_presenter(port: int | None, height: str = "720px"):
 # Piece 6 — Entry
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _find_caller_msg_id() -> str | None:
+    """Walk the stack for SolveIt's ``__msg_id`` (cell that invoked us).
+
+    A single ``f_back`` is enough for sync ``sshow()``-style calls, but
+    ``await slive()`` often has async/IPython frames between ``slive`` and
+    the cell — so walk until we find ``__msg_id``.
+    """
+    frame = inspect.currentframe()
+    try:
+        f = frame.f_back if frame is not None else None
+        while f is not None:
+            mid = f.f_globals.get("__msg_id")
+            if mid:
+                return str(mid)
+            f = f.f_back
+    finally:
+        del frame
+    return None
+
+
+async def _skip_caller_msg(*, quiet: bool = False) -> str | None:
+    """Mark the calling dialog cell ``skipped=1`` (red eye — hidden from AI).
+
+    Same dialoghelper API as sslides / manual::
+
+        await update_msg(id=..., skipped=1)
+    """
+    if update_msg is None:
+        if not quiet:
+            print("sslive: update_msg unavailable — cannot AI-hide preview cell")
+        return None
+    mid = _find_caller_msg_id()
+    if not mid:
+        if not quiet:
+            print(
+                "sslive: no __msg_id in call stack — run under %local; "
+                "preview cell stays in LLM context (eye stays open)"
+            )
+        return None
+    try:
+        # Brief settle so the iframe display is attached to this message first
+        # (sslides uses time.sleep(1) after show).
+        await asyncio.sleep(0.3)
+        await update_msg(id=mid, skipped=1)
+        if not quiet:
+            print(f"sslive: AI-hidden (skipped=1) msg {mid} — eye should be red")
+        _SESSION["skipped_launcher_id"] = mid
+        return mid
+    except Exception as e:
+        if not quiet:
+            print(f"sslive: skip failed for {mid}: {e}")
+        return None
+
+
 @dataclass
 class LiveSession:
     port: int
@@ -3404,15 +3458,10 @@ async def slive(
     if embed:
         _show_presenter(port, height=height)
 
-    # D6 — hide launcher from dialog context
-    if update_msg is not None:
-        try:
-            caller_globals = inspect.currentframe().f_back.f_globals
-            mid = caller_globals.get("__msg_id")
-            if mid:
-                await update_msg(id=mid, skipped=1)
-        except Exception:
-            pass
+    # Hide preview cell from LLM context (SolveIt red eye / Toggle AI visibility).
+    # Must run after display so the giant srcdoc lives on this message, then
+    # skipped=1 drops it from dialoghelper context — same as sslides sshow().
+    await _skip_caller_msg()
 
     return session
 
