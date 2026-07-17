@@ -4203,22 +4203,50 @@ def generate_presenter_html(
         }});
         rIn.addEventListener('pointerdown', (ev) => ev.stopPropagation());
       }}
+      // Full clear → original document-flow size + position (no absolute box).
+      const CLEAR_LAYOUT = {{
+        x: null, y: null, w: null, h: null, z: null,
+        order: null, reveal: null, fs: null, ff: null, align: null
+      }};
+      function restoreFlowLayout(el) {{
+        if (!el) return;
+        el.style.cssText = '';
+        el.removeAttribute('data-reveal');
+        // Explicitly drop absolute geometry so the element re-enters the slide
+        // flex stack in DOM order (title → code → output).
+        ['position','left','top','width','height','margin','overflow',
+         'zIndex','order','fontSize','fontFamily','textAlign'].forEach((p) => {{
+          try {{ el.style[p] = ''; }} catch (e) {{}}
+        }});
+        try {{ el.style.removeProperty('--code-fs'); }} catch (e) {{}}
+        if (el.classList.contains('code-wrap') || el.dataset.type === 'code') {{
+          closeLiveCodePop({{ sync: true }});
+          forceCodeTaCollapsed(el.querySelector('textarea.code-ta'));
+        }}
+      }}
+      function layoutPairOf(el) {{
+        // Code + its output share a cell id; reset them together so one does
+        // not jump into the middle while the other is still absolutely placed.
+        const id = (el && (el.dataset.elId || el.id)) || '';
+        if (id.indexOf('el-code-') === 0)
+          return document.getElementById('el-output-' + id.slice(8));
+        if (id.indexOf('el-output-') === 0)
+          return document.getElementById('el-code-' + id.slice(10));
+        return null;
+      }}
       document.getElementById('tb-reset').addEventListener('click', () => {{
         if (!editSel) return;
-        const elId = selElId();
-        editSel.style.cssText = '';
-        editSel.removeAttribute('data-reveal');
-        // Code cells: always restore the one-line bar (never leave a tall editor)
-        if (editSel.classList.contains('code-wrap') || editSel.dataset.type === 'code') {{
-          closeLiveCodePop({{ sync: true }});
-          const ta = editSel.querySelector('textarea.code-ta');
-          forceCodeTaCollapsed(ta);
-          // Drop any residual absolute height so the chrome hugs the one-line ta
-          editSel.style.height = '';
-          editSel.style.overflow = '';
+        const el = editSel;
+        const elId = el.dataset.elId || el.id;
+        const pair = layoutPairOf(el);
+        restoreFlowLayout(el);
+        sendLayoutPatch(elId, Object.assign({{}}, CLEAR_LAYOUT));
+        if (pair) {{
+          restoreFlowLayout(pair);
+          sendLayoutPatch(pair.dataset.elId || pair.id, Object.assign({{}}, CLEAR_LAYOUT));
         }}
-        sendLayoutPatch(elId, {{ x: null, y: null, w: null, h: null, z: null,
-                                order: null, reveal: null, fs: null, ff: null, align: null }});
+        // Keep selection on the element the user reset; refresh handles
+        selectEl(el);
         updateToolbar();
       }});
     }})();
@@ -4345,7 +4373,7 @@ def generate_presenter_html(
       <input type="number" id="tb-reveal" min="0" step="1" placeholder="—" />
     </span>
     <span class="tb-sep"></span>
-    <button type="button" id="tb-reset" title="clear all overrides">reset</button>
+    <button type="button" id="tb-reset" title="Restore original size &amp; position (code+output together)">reset</button>
   </div>
   <div id="live-code-pop" hidden>
     <div class="live-code-pop-head">

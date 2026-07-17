@@ -27,7 +27,7 @@ End-to-end working version for SolveIt + CRAFT. **Do not paste this file into th
 
 - Live code stays a one-line bar; click/focus opens floating ~6-line editor (editable, SE-resize, Run/Shift+Enter, Esc)
 - Layout height no longer makes code chrome tall; edit-mode resize ignores height on code cells
-- **reset** on a code cell restores the one-line bar (clears tall leftover height)
+- **reset** restores original **size and position** (back to document flow); code+output reset **together** so one does not jump while the other stays absolute
 
 ### Export (0.1.1)
 
