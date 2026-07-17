@@ -1,6 +1,23 @@
 # sslive **0.1.0** (working)
 
-RISE-like live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https://github.com/rleyvasal/gpudev) / CRAFT.
+Live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https://github.com/rleyvasal/gpudev) / CRAFT: edit and run **in the slide**, layout and reveal like a deck, keep the dialog as the source of truth.
+
+## Architecture
+
+| Layer | Where | Role |
+|-------|--------|------|
+| **Host** | SolveIt **`%local`** | `await slive()`, iframe, dialoghelper, layout persist, AI-hide |
+| **Slide code** | CRAFT **GPU** (`%gpu` kernel) | ▶ Run / Shift+Enter via `remote_kc` |
+
+You do **not** run `await slive()` under `%gpu`. Connect GPU once with `%gpu`, then drive the deck under `%local`. In-slide Run still executes on the remote kernel.
+
+```text
+%local await slive()
+  → presenter iframe (srcdoc)
+  → edit / ▶ Run → postMessage → Python bridge
+  → CRAFT GPU execute
+  → in-place output + debounced dialog write-back
+```
 
 ## What works
 
@@ -10,89 +27,72 @@ RISE-like live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https:/
 | ▶ Run / Shift+Enter on GPU (CRAFT) | ✅ |
 | Output updates under the cell | ✅ |
 | Sync source → SolveIt dialog cell | ✅ |
-| Stay on current slide in **fullscreen** | ✅ |
-| Preview mode keep-focus after Run | ✅ pre-emptive focus guard (see below) |
-| Move/size/font/order elements (S2-A API) | ✅ `await set_layout(...)` |
-| Edit mode: drag/nudge **in the slide** (S2-B) | ✅ press `e` |
-| Toolbar: font size/family, resize, reveal (S2-C) | ✅ select an element |
-| Note cells split into pieces (S2-D) | ✅ title / bullet / math / image / table each selectable |
-| Markdown + LaTeX in notes | ✅ mistletoe + latex2mathml (falls back to plain) |
+| Fullscreen keeps current slide | ✅ |
+| Preview keep-focus after Run | ✅ focus guard |
+| Layout: move / size / font / reveal | ✅ `e` + floating toolbar |
+| Note cells split (title, bullets, display math, images…) | ✅ |
+| Markdown + LaTeX notes | ✅ mistletoe + latex2mathml (fallback basic) |
+| Preview cell hidden from LLM | ✅ `skipped=1` (red eye) |
 
 ## Usage
 
 ```python
 %local
-%run sslive/sslive.py
+%run path/to/sslive.py   # prefer path; do not paste the whole file into a cell
 
-%gpu
+%gpu                     # once — bring CRAFT remote up
 
 %local
 await slive()
 ```
 
 1. Click the **slide iframe**  
-2. Edit the code textarea  
+2. Edit a code box  
 3. **▶ Run** or **Shift+Enter**  
-4. Output updates; dialog code cell source updates  
+4. Output updates; dialog source updates shortly after  
 
-```text
-Slide edit → postMessage → Python bridge
-  → CRAFT GPU execute
-  → in-place output push
-  → update_msg (dialog source)
-  → refocus slide iframe
+## LLM context (keep it small)
+
+SolveIt only feeds **non-skipped** messages to the model. sslive uses that:
+
+| Message | LLM? | Notes |
+|---------|------|--------|
+| Notes + code under `#\| s` | **Yes** | Your real deck content |
+| `#\| sslive-layout` JSON | **No** | auto `skipped=1` |
+| `await slive()` cell (huge iframe) | **No** | auto `skipped=1` after embed |
+| Pasted `sslive.py` / CRAFT logs / git dumps | **If you leave them open** | Hide them |
+
+```python
+await hide_from_ai()              # current / last launcher cell
+await hide_from_ai("_ea017cb0")   # explicit message id
 ```
 
-## Preview focus (pre-emptive guard)
+If the eye on the preview cell is **not** red after `slive()`, call `await hide_from_ai()` so the srcdoc HTML does not burn tokens.
 
-After dialog write-back, SolveIt tries to **focus the updated dialog cell** (same class of issue as HTMX live-preview swaps focusing dialog content). `update_msg` has no opt-out, so in **inline preview** the parent bridge arms a short *focus guard* right before each write-back: for ~2 s, `focus()` / `scrollIntoView()` calls targeting anything outside `#sslive-frame` are swallowed, and a `focusin` backstop bounces stray focus back within the same tick — so focus never visibly leaves the slide. Real clicks/keys in the dialog always win (guard yields to user gestures), and fullscreen is untouched. A light reactive refocus remains as fallback for host paths the guard can't intercept.
-
-Optional: `await sync_dialog()` to push all deck sources later.
+**Hygiene:** never paste the full library into the dialog; only `%run` it. Keep noise cells skipped.
 
 ## Commands
 
 | Call | Role |
 |------|------|
-| `await slive()` | Start presentation |
-| `await run_cell_index(i)` | Programmatic run |
+| `await slive()` | Start presentation (**%local**) |
+| `await run_cell_index(i)` | Programmatic run (GPU) |
 | `await pump_slide_runs()` | Drain stuck Run queue |
 | `await sync_dialog()` | Batch write sources to dialog |
-| `refocus_presenter()` | Manually return focus to slides |
-| `layout_ids()` | List element ids you can lay out |
-| `await set_layout(el_id, x=, y=, w=, fs=, ff=, z=, order=, align=)` | Position/style an element (live + persisted) |
-| `await clear_layout(el_id \| None)` | Reset one/all elements to flow layout |
+| `await hide_from_ai(id?)` | Mark message skipped (LLM hide) |
+| `refocus_presenter()` | Focus slide iframe |
+| `layout_ids()` | List layoutable element ids |
+| `await set_layout(el_id, …)` | Position/style (live + persist) |
+| `await clear_layout(…)` | Reset layout overrides |
 
-Layout is design-space px on the 1920×1080 stage; overrides persist in a
-hidden `#| sslive-layout` note in the dialog (auto-created, `skipped=1`).
-The `await slive()` cell is also marked `skipped=1` after the preview embeds
-(red eye / Toggle AI visibility) so the giant iframe HTML is not sent to the LLM.
-Example: `await set_layout('el-output-_abc123', x=1000, y=400, w=700)` moves
-that screenshot/output block live — no rebuild, focus stays put.
+Layout is design-space px on a 1920×1080 stage; overrides live in the skipped layout note.
 
-### Edit mode (in the slide)
+### Edit mode
 
-Press **`e`** (or the ✎ nav button): elements get dashed outlines.
-**Drag** notes/outputs anywhere; **code cells drag by their toolbar strip**
-(textarea/Run keep working). Click selects; **arrows nudge 1px**
-(Shift = 10px); **Esc exits edit mode** (✎/`e` toggle it back). A plain
-click never changes an element's layout mode — only actual movement pins it.
-Every drop/nudge flows through the bridge into the overlay and persists to
-the dialog (debounced, focus-guarded). First drag of a flow element freezes
-its current width so the text keeps its wrap.
+Press **`e`** (or ✎): select elements. Floating toolbar sits **next to** the selection (A−/A+, font, **reveal**, reset). Drag notes/outputs; code cells drag from the toolbar strip. Corner/edge handles resize. **← / →** advance reveal steps, then slides. Fragment step is not shown in the nav counter (slide `n / N` only).
 
-Notes render full markdown (bold, lists, images, code) and LaTeX
-(`$...$` / `$$...$$` → MathML) when `mistletoe` + `latex2mathml` are
-installed — same pipeline as sslides. Each note cell is **split into
-elements** (heading, each bullet, math, images/screenshots, tables, …)
-so you can drag/resize/reveal them independently. Ids look like
-`el-0-_abc123` (index + cell id); insert/delete blocks may shift indices
-so re-check layout after structural edits. Old `el-note-*` layout keys
-are ignored.
+Note ids look like `el-0-_abc123` (index + cell id). Structural edits to a note can shift indices — re-check layout after big content changes.
 
-Selecting an element shows the **floating toolbar** (viewport-fixed, never
-scaled): **A− / A+** font size, **font** dropdown, **reveal** step (blank =
-always visible; `1` appears on first →, `2` on second →, …), and **reset**.
-**← / →** advance *reveal steps first*, then slides. Resize uses an **external
-frame** with 8 handles *outside* the element (not clipped by cell overflow).
+## Preview focus
 
-Keep driver cells under **`%local`**.
+After dialog write-back, SolveIt may try to focus the updated cell. sslive arms a short parent-page **focus guard** before `update_msg` so focus stays on the slide iframe when possible. Real dialog interaction always wins.

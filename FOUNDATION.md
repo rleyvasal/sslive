@@ -90,13 +90,17 @@ must use `await`:
 - `await build_deck()`
 - `await slive()`
 
-Call from a SolveIt cell as `await slive()` under `%local`.  
+Call from a SolveIt cell as `await slive()` under **`%local`**.
+
+- **Host** = local (presenter, dialoghelper, skip/layout).  
+- **Slide Run** = CRAFT GPU (remote_kc). Do not put the host under `%gpu`.
+
+See README for current feature status (write-back, layout editor, reveal are implemented beyond this early map).
 
 
-## Explicit non-goals (foundation)
+## Explicit non-goals (foundation-era; some later shipped)
 
-- Write-back to SolveIt  
-- Local kernel backend  
+- Local kernel backend (GPU path only)  
 - Reveal.js  
-- Drag/drop layout editor  
 - Package publish  
+

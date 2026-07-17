@@ -1,20 +1,18 @@
-"""sslive — RISE-like live GPU slides for SolveIt.
+"""sslive — live GPU slides for SolveIt + CRAFT.
 
-**Working version 0.1.0** — in-slide edit + Run on GPU + dialog source sync.
+**Working version 0.1.0** — in-slide edit, layout, reveal; Run on GPU; dialog sync.
 
-Edit code **inside the slide**, hit ▶ Run / Shift+Enter:
-  → executes on CRAFT GPU
-  → updates slide output in place
-  → syncs source into the SolveIt dialog cell
+Architecture: **host on %local** (presenter, dialoghelper, bridge);
+**slide code on the CRAFT GPU** (▶ Run / Shift+Enter).
 
 Usage::
 
     %local
-    %run sslive/sslive.py
-    %gpu
+    %run path/to/sslive.py   # do not paste this file into the dialog
+    %gpu                     # connect remote kernel once
     %local
-    await slive()
-    # click the slide iframe, edit the code, press ▶ or Shift+Enter
+    await slive()            # host must stay under %local
+    # edit in the slide → ▶ Run → GPU execute → in-place output
 """
 
 from __future__ import annotations
@@ -978,7 +976,11 @@ def _pick_port(start: int = 8100, span: int = 50) -> int:
 
 
 def _ensure_local_magic():
-    """Keep slive local under %gpu when CRAFT is loaded."""
+    """Keep ``slive`` registered as a *local* magic when CRAFT is loaded.
+
+    Slide **code** still runs on the GPU via CRAFT; only the host driver
+    (``await slive()``, bridge, dialog writes) must stay on %local.
+    """
     if get_ipython is None:
         return
     try:
@@ -988,6 +990,18 @@ def _ensure_local_magic():
             reg("slive")
     except Exception:
         pass
+
+
+def _host_ok() -> tuple[bool, str]:
+    """Whether the sslive *host* can run (SolveIt local + dialoghelper)."""
+    if not _in_solveit():
+        return True, "not in SolveIt (HTTP/dev host ok)"
+    if update_msg is None and find_msgs is None:
+        return False, (
+            "dialoghelper missing — run the host under %local in SolveIt "
+            "(slide ▶ Run still uses the GPU kernel)"
+        )
+    return True, "local host"
 
 
 def _math_is_display(raw: str) -> bool:
@@ -1436,7 +1450,7 @@ def _parse_note_to_elements_basic(source: str, cell_id: str) -> list[dict]:
 
 
 def _code_block_html(cell: Cell, *, style: str = "", extra_attrs: str = "") -> str:
-    """In-slide editable code (textarea) + Run — RISE-style."""
+    """In-slide editable code (textarea) + Run."""
     cid = html_module.escape(cell.id)
     # raw id for JS (safe: dialog ids are alphanumeric + underscore)
     raw_id = cell.id
@@ -1705,10 +1719,7 @@ def generate_presenter_html(
       const el = document.getElementById('slide-counter');
       if (!el) return;
       const n = slides().length;
-      const maxR = maxReveal(slides()[currentSlide]);
-      let t = (currentSlide + 1) + ' / ' + Math.max(n, 1);
-      if (maxR > 0 && !editing) t += ' · ' + fragStep + '/' + maxR;
-      el.textContent = t;
+      el.textContent = (currentSlide + 1) + ' / ' + Math.max(n, 1);
     }}
 
     function selectCell(id) {{
@@ -3326,10 +3337,10 @@ def _show_run_panel(deck: Deck) -> None:
     html = """
 <div style="font:14px system-ui;color:#e5e7eb;margin:10px 0;padding:12px 14px;
             background:#0b1220;border:1px solid #374151;border-radius:8px">
-  <b>RISE-style:</b> edit in the slide → <b>▶ Run</b> / <b>Shift+Enter</b>
+  <b>sslive:</b> edit in the slide → <b>▶ Run</b> / <b>Shift+Enter</b>
   → GPU (in place) → dialog source updates shortly after.
   <div style="margin-top:8px;font-size:12px;color:#9ca3af">
-    No full preview rebuild on Run. Manual: <code>await sync_dialog()</code>
+    Host under <code>%local</code>; slide code runs on GPU. Manual: <code>await sync_dialog()</code>
   </div>
 </div>
 """
@@ -3616,6 +3627,22 @@ async def _skip_caller_msg(*, quiet: bool = False, mid: str | None = None) -> st
     return await _skip_msg(mid, quiet=quiet)
 
 
+async def hide_from_ai(msg_id: str | None = None, *, settle: float = 0.0) -> str | None:
+    """Mark a dialog message ``skipped=1`` (red eye — excluded from LLM context).
+
+    ::
+
+        await hide_from_ai()                 # current / launcher cell
+        await hide_from_ai('_ea017cb0')      # explicit id
+        await hide_from_ai()  # after %run, if that cell is still current
+
+    Use this for giant outputs (preview, CRAFT bootstrap logs, git dumps).
+    Layout already lives in a skipped ``#| sslive-layout`` note.
+    """
+    mid = msg_id or await _resolve_launcher_msg_id(_SESSION.get("launcher_msg_id"))
+    return await _skip_msg(mid, quiet=False, settle=settle)
+
+
 @dataclass
 class LiveSession:
     port: int
@@ -3654,17 +3681,23 @@ async def slive(
     embed: bool = True,
     use_http: bool | None = None,
 ):
-    """Load deck with **in-slide editable code** (RISE-style).
+    """Start the live deck (host under ``%local``; slide Run uses GPU).
 
     ::
 
         %local
+        %run path/to/sslive.py
+        %gpu
+        %local
         await slive()
-        # Click the slide iframe, edit the code box, press ▶ or Shift+Enter
-        # → writes source to SolveIt cell + runs on GPU + refreshes outputs
+        # edit in the slide → ▶ / Shift+Enter → CRAFT GPU → in-place output
 
-    Fallback if bridge stalls: ``await pump_slide_runs()`` or ``await run_cell_index(0)``.
-    After embed, the calling cell is ``skipped=1`` (red eye) like sslides ``sshow``.
+    The host (iframe, dialoghelper, layout skip) must run under **%local**.
+    Cell bodies run on the **GPU** via CRAFT — you do not need ``await slive()``
+    under ``%gpu``.
+
+    After embed, the calling cell is ``skipped=1`` (red eye) so the preview
+    HTML is not sent to the LLM. Fallback: ``await hide_from_ai()``.
     """
     # Sync probe first (may be empty under await — full resolve after embed).
     launcher_msg_id = _find_caller_msg_id()
@@ -3672,10 +3705,18 @@ async def slive(
 
     _ensure_local_magic()
 
+    host_ok, host_msg = _host_ok()
+    if not host_ok:
+        print(f"sslive: host not ready — {host_msg}")
+        return None
+
     ok, msg = LiveExecutor().kernel_ok()
     if not ok:
         print(f"sslive: GPU not ready — {msg}")
-        print("Load CRAFT and run %gpu, then call await slive() again under %local.")
+        print(
+            "Load CRAFT and run %gpu once so the remote kernel is up, "
+            "then call await slive() again under %local."
+        )
         return None
 
     if use_http is None:
@@ -3712,7 +3753,7 @@ async def slive(
     n_code = len(deck.ordered_code_ids)
     print(
         f"sslive: {len(deck.slides)} slides, {n_code} code cells, "
-        f"backend=gpu ({msg}), IN_SOLVEIT={_in_solveit()}"
+        f"host={host_msg}, gpu=({msg})"
         + (f", msg={launcher_msg_id}" if launcher_msg_id else "")
     )
     if n_code == 0 and len(deck.slides) == 0:
@@ -3727,12 +3768,11 @@ async def slive(
         )
     print("In-slide: edit · ▶ Run / Shift+Enter → GPU (in-place)")
     print("Dialog source: auto-sync shortly after Run (no rebuild/refocus)")
-    print("Manual: await sync_dialog()  if needed")
+    print("Manual: await sync_dialog()  ·  await hide_from_ai() if eye stays open")
 
     if embed:
-        # sslides pattern: show → sleep(1) → update_msg(..., skipped=1)
+        # show → sleep → skipped=1 so LLM does not ingest the srcdoc HTML
         _show_presenter(port, height=height)
-        # Resolve current msg via dialoghelper if __msg_id was never injected.
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         _SESSION["launcher_msg_id"] = mid
         await _skip_msg(mid, settle=1.0)
@@ -3842,6 +3882,7 @@ __all__ = [
     "build_deck",
     "parse_note_to_elements",
     "slive",
+    "hide_from_ai",
     "sstop",
     "run_cell",
     "run_cell_index",
