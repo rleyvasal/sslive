@@ -880,19 +880,32 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
 async def ensure_layout_note() -> str | None:
     """Ensure exactly one ``#| sslive-layout`` note; create only if none exist.
 
-    Also deletes old "safe to delete" stub notes left by earlier builds.
+    On a warm re-``%slive`` when a single good note already exists, **do not**
+    call ``update_msg`` (that was focusing the layout cell then the preview).
+    Only write when creating, merging duplicates, or cleaning stubs.
     """
     try:
         existing = await _list_layout_msgs()
         deck = _SESSION.get("deck")
         lay = deck.layout if deck is not None else _empty_layout()
+        stubs: list[str] = []
+        try:
+            stubs = await _list_layout_stub_ids()
+        except Exception:
+            stubs = []
+
         if existing:
             keeper = str(
                 max(existing, key=lambda t: len((t[1].get("elements") or {})))[0]
             )
             _SESSION["layout_msg_id"] = keeper
-            await save_layout(lay)  # update only + cleanup extras/stubs
-            return _SESSION.get("layout_msg_id") or keeper
+            needs_write = len(existing) > 1 or bool(stubs)
+            if needs_write:
+                # Merge / dedupe only when something is actually wrong
+                await save_layout(lay)
+            # else: leave the note alone — deck.layout was already loaded from it
+            return keeper
+
         # None — create once
         _SESSION.pop("layout_msg_id", None)
         ok = await save_layout(lay)
@@ -4455,64 +4468,72 @@ def _run_and_refresh(
     return result
 
 
-def _refocus_presenter_js() -> str:
-    """JS to steal focus back from the dialog cell to the slide iframe.
+def _refocus_presenter_js(*, soft: bool = True) -> str:
+    """JS to return focus to the slide iframe after dialog ``update_msg`` churn.
 
-    SolveIt focuses the message updated by ``update_msg`` (same class of issue
-    as HTMX live-preview focus jumps). We blur that and focus #sslive-frame.
-
-    On ``%slive`` open we only focus the iframe (not a code textarea) so the
-    dialog does not look like it jumped to "first cell" editing.
+    ``soft``: only focus if needed; avoid scrollIntoView when the frame is
+    already on-screen (repeated scroll was flashing the preview on %slive).
     """
-    return r"""
-(function () {
-  function findFrame() {
+    soft_js = "true" if soft else "false"
+    return f"""
+(function () {{
+  var soft = {soft_js};
+  function findFrame() {{
     return document.getElementById('sslive-frame')
       || document.querySelector('iframe[data-sslive="1"]')
       || document.querySelector('iframe[srcdoc]');
-  }
-  function focusFrame() {
-    // Never run this thrash while document is fullscreen (would exit FS)
+  }}
+  function inView(el) {{
+    try {{
+      var r = el.getBoundingClientRect();
+      var vh = window.innerHeight || document.documentElement.clientHeight;
+      return r.top < vh * 0.85 && r.bottom > vh * 0.15;
+    }} catch (e) {{ return false; }}
+  }}
+  function focusFrame() {{
     var fs = document.fullscreenElement || document.webkitFullscreenElement;
     if (fs) return true;
-
     var ifr = findFrame();
     if (!ifr) return false;
 
-    // Blur whatever SolveIt just focused (often the first dialog cell)
-    try {
+    // Already focused on the slides — do nothing (no flash)
+    if (document.activeElement === ifr) return true;
+
+    try {{
       var ae = document.activeElement;
       if (ae && ae !== document.body && ae !== ifr
-          && ae.id !== 'sslive-frame' && ae.getAttribute('data-sslive') !== '1') {
-        try { ae.blur(); } catch (e) {}
-      }
-    } catch (e) {}
+          && ae.id !== 'sslive-frame' && ae.getAttribute('data-sslive') !== '1') {{
+        try {{ ae.blur(); }} catch (e) {{}}
+      }}
+    }} catch (e) {{}}
 
-    // Keep the presentation visible — but never scroll *away* from it
-    try {
-      ifr.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
-    } catch (e) {
-      try { ifr.scrollIntoView(false); } catch (e2) {}
-    }
-    try { ifr.focus({ preventScroll: true }); } catch (e) {
-      try { ifr.focus(); } catch (e2) {}
-    }
-    try {
+    // Only scroll if the preview is mostly off-screen (soft mode)
+    if (!soft || !inView(ifr)) {{
+      try {{
+        ifr.scrollIntoView({{ block: 'nearest', inline: 'nearest', behavior: 'instant' }});
+      }} catch (e) {{
+        try {{ ifr.scrollIntoView(false); }} catch (e2) {{}}
+      }}
+    }}
+    try {{ ifr.focus({{ preventScroll: true }}); }} catch (e) {{
+      try {{ ifr.focus(); }} catch (e2) {{}}
+    }}
+    try {{
       if (ifr.contentWindow) ifr.contentWindow.focus();
-    } catch (e) {}
+    }} catch (e) {{}}
     return true;
-  }
+  }}
   focusFrame();
-})();
+}})();
 """
 
 
-def refocus_presenter() -> None:
+def refocus_presenter(*, soft: bool = True) -> None:
     """Best-effort: return focus to the slide iframe (preview mode)."""
     if iife is None:
         return
     try:
-        iife(_refocus_presenter_js())
+        iife(_refocus_presenter_js(soft=soft))
     except Exception:
         pass
 
@@ -4539,19 +4560,17 @@ def _arm_focus_guard(ms: int = 2000) -> None:
         pass
 
 
-async def _refocus_after_dialog_writes(*, pulses: int = 4, gap: float = 0.2) -> None:
-    """Re-arm guard + refocus the slide iframe after dialog churn settles."""
-    _arm_focus_guard(int(4000 + pulses * gap * 1000))
-    for i in range(max(1, pulses)):
-        try:
-            refocus_presenter()
-        except Exception:
-            pass
-        if i + 1 < pulses:
-            try:
-                await asyncio.sleep(gap)
-            except Exception:
-                break
+async def _refocus_after_dialog_writes(*, delay: float = 0.25) -> None:
+    """Single soft refocus after dialog writes (no multi-pulse flashing)."""
+    _arm_focus_guard(4000)
+    try:
+        await asyncio.sleep(delay)
+    except Exception:
+        pass
+    try:
+        refocus_presenter(soft=True)
+    except Exception:
+        pass
 
 
 async def _read_parent_slide_index() -> int | None:
@@ -5106,7 +5125,11 @@ def _show_run_panel(deck: Deck) -> None:
 
 
 def _show_presenter(port: int | None, height: str = "720px"):
-    """Embed deck (srcdoc) with in-slide editors + Run bridge — no extra chatter."""
+    """Embed deck (srcdoc) with in-slide editors + Run bridge — no extra chatter.
+
+    Reuses the existing display handle when present so a second ``%slive`` does
+    not stack / flash multiple iframe loads.
+    """
     if isinstance(height, int):
         height = f"{height}px"
     _SESSION["height"] = height
@@ -5114,8 +5137,9 @@ def _show_presenter(port: int | None, height: str = "720px"):
     _start_bridge()
 
     try:
+        reuse = _SESSION.get("presenter_handle") is not None
         handle = _display_presenter_html(
-            _presenter_iframe_html(height, port=port), update=False
+            _presenter_iframe_html(height, port=port), update=reuse
         )
         if handle is not None:
             _SESSION["presenter_handle"] = handle
@@ -5357,7 +5381,13 @@ async def _skip_msg(mid: str | None, *, quiet: bool = False, settle: float = 1.0
             print("sslive: update_msg unavailable — cannot AI-hide preview cell")
         return None
     try:
-        # sslides sleeps 1s after show so the output is attached, then skips.
+        # Already red-eyed this session — skip a second update_msg (focus thrash)
+        prev = _SESSION.get("skipped_launcher_id")
+        if prev and str(prev).lstrip("_") == str(mid).lstrip("_"):
+            _SESSION["skipped_launcher_id"] = str(prev)
+            return str(prev)
+
+        # Brief settle so the output iframe is attached (keep short to avoid flash)
         if settle and settle > 0:
             await asyncio.sleep(settle)
         # Guard must cover the update_msg (and a short tail of UI churn)
@@ -5544,28 +5574,36 @@ async def slive(
     _SESSION.setdefault("pending_dialog_sync", {})
     _SESSION["auto_sync_dialog"] = True  # deferred update_msg after Run
 
+    wrote_dialog = False
     if embed:
         # show → sleep → skipped=1 so LLM does not ingest the srcdoc HTML
         _show_presenter(port, height=height)
         # Bridge is installed in _show_presenter — arm immediately so skip /
         # layout writes cannot scroll the dialog to the first cell.
-        _arm_focus_guard(8000)
+        _arm_focus_guard(6000)
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         _SESSION["launcher_msg_id"] = mid
-        await _skip_msg(mid, settle=1.0, quiet=True)
-        refocus_presenter()
+        # Shorter settle; long settle + multi-refocus made the preview flash
+        await _skip_msg(mid, settle=0.35, quiet=True)
+        wrote_dialog = True
     else:
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         if mid:
             _arm_focus_guard(4000)
             await _skip_msg(mid, settle=0.0, quiet=True)
+            wrote_dialog = True
         _SESSION["launcher_msg_id"] = mid
 
-    # After preview id is known: ensure exactly one #| sslive-layout note exists
-    # under / near the %slive cell (create if user deleted them all).
+    # Layout note: create if missing; skip rewrite when already present (warm re-open)
     try:
-        _arm_focus_guard(8000)
+        _arm_focus_guard(6000)
+        before = _SESSION.get("layout_msg_id")
+        n_before = len(await _list_layout_msgs()) if find_msgs else 0
         mid_layout = await ensure_layout_note()
+        n_after = len(await _list_layout_msgs()) if find_msgs else 0
+        # Only count as a write when we created/merged (ensure skips silent no-ops)
+        if mid_layout and (n_before != n_after or before != mid_layout):
+            wrote_dialog = True
         if mid_layout is None:
             print(
                 "sslive: warning — no #| sslive-layout note "
@@ -5575,12 +5613,19 @@ async def slive(
         _SESSION["_layout_ensure_err"] = str(e)
         print(f"sslive: layout note ensure failed: {e}")
 
-    # update_msg / add_msg for skip + layout always fight for focus — reclaim it
-    try:
-        await _refocus_after_dialog_writes(pulses=5, gap=0.15)
-    except Exception:
+    # One soft reclaim after any dialog write — not a multi-pulse flash train
+    if wrote_dialog:
         try:
-            refocus_presenter()
+            await _refocus_after_dialog_writes(delay=0.2)
+        except Exception:
+            try:
+                refocus_presenter(soft=True)
+            except Exception:
+                pass
+    else:
+        # Still gently focus the new/updated preview once
+        try:
+            refocus_presenter(soft=True)
         except Exception:
             pass
 
