@@ -3297,47 +3297,83 @@ def _show_presenter(port: int | None, height: str = "720px"):
 def _find_caller_msg_id() -> str | None:
     """Walk the stack for SolveIt's ``__msg_id`` (cell that invoked us).
 
-    A single ``f_back`` is enough for sync ``sshow()``-style calls, but
-    ``await slive()`` often has async/IPython frames between ``slive`` and
-    the cell — so walk until we find ``__msg_id``.
+    Checks both ``f_globals`` and ``f_locals`` — SolveIt may inject the id
+    either place. Walk the full stack (not just one ``f_back``) because
+    ``await slive()`` inserts async frames between the cell and ``slive``.
+    Falls back to IPython ``user_ns`` (where SolveIt often parks ``__msg_id``).
     """
     frame = inspect.currentframe()
     try:
         f = frame.f_back if frame is not None else None
         while f is not None:
-            mid = f.f_globals.get("__msg_id")
-            if mid:
-                return str(mid)
+            for ns in (f.f_locals, f.f_globals):
+                mid = ns.get("__msg_id") if isinstance(ns, dict) else None
+                if mid:
+                    return str(mid)
             f = f.f_back
     finally:
         del frame
+    # IPython / SolveIt interactive namespace
+    if get_ipython is not None:
+        try:
+            ip = get_ipython()
+            if ip is not None:
+                mid = (ip.user_ns or {}).get("__msg_id")
+                if mid:
+                    return str(mid)
+        except Exception:
+            pass
     return None
 
 
-async def _skip_caller_msg(*, quiet: bool = False) -> str | None:
-    """Mark the calling dialog cell ``skipped=1`` (red eye — hidden from AI).
-
-    Same dialoghelper API as sslides / manual::
-
-        await update_msg(id=..., skipped=1)
-    """
-    if update_msg is None:
-        if not quiet:
-            print("sslive: update_msg unavailable — cannot AI-hide preview cell")
+def _resolve_update_msg():
+    """Fresh ``update_msg`` from dialoghelper (module import can be stale/None)."""
+    global update_msg
+    um = update_msg
+    if um is not None:
+        return um
+    try:
+        from dialoghelper.core import update_msg as um2
+        update_msg = um2
+        return um2
+    except Exception:
         return None
-    mid = _find_caller_msg_id()
+
+
+async def _call_update_msg(**kwargs) -> Any:
+    """Call dialoghelper ``update_msg`` whether it is sync (sslides) or async."""
+    um = _resolve_update_msg()
+    if um is None:
+        raise RuntimeError("update_msg unavailable")
+    result = um(**kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _skip_msg(mid: str | None, *, quiet: bool = False, settle: float = 1.0) -> str | None:
+    """Mark a dialog cell ``skipped=1`` (red eye — hidden from AI).
+
+    Mirrors sslides ``sshow``::
+
+        show(...); time.sleep(1); update_msg(id=..., skipped=1)
+    """
     if not mid:
         if not quiet:
             print(
-                "sslive: no __msg_id in call stack — run under %local; "
-                "preview cell stays in LLM context (eye stays open)"
+                "sslive: no __msg_id — run under %local in a dialog cell; "
+                "preview stays in LLM context (eye stays open)"
             )
         return None
+    if _resolve_update_msg() is None:
+        if not quiet:
+            print("sslive: update_msg unavailable — cannot AI-hide preview cell")
+        return None
     try:
-        # Brief settle so the iframe display is attached to this message first
-        # (sslides uses time.sleep(1) after show).
-        await asyncio.sleep(0.3)
-        await update_msg(id=mid, skipped=1)
+        # sslides sleeps 1s after show so the output is attached, then skips.
+        if settle and settle > 0:
+            await asyncio.sleep(settle)
+        await _call_update_msg(id=mid, skipped=1)
         if not quiet:
             print(f"sslive: AI-hidden (skipped=1) msg {mid} — eye should be red")
         _SESSION["skipped_launcher_id"] = mid
@@ -3346,6 +3382,11 @@ async def _skip_caller_msg(*, quiet: bool = False) -> str | None:
         if not quiet:
             print(f"sslive: skip failed for {mid}: {e}")
         return None
+
+
+async def _skip_caller_msg(*, quiet: bool = False, mid: str | None = None) -> str | None:
+    """Skip the calling cell. Prefer a mid captured *before* any await in slive."""
+    return await _skip_msg(mid or _find_caller_msg_id(), quiet=quiet)
 
 
 @dataclass
@@ -3396,7 +3437,13 @@ async def slive(
         # → writes source to SolveIt cell + runs on GPU + refreshes outputs
 
     Fallback if bridge stalls: ``await pump_slide_runs()`` or ``await run_cell_index(0)``.
+    After embed, the calling cell is ``skipped=1`` (red eye) like sslides ``sshow``.
     """
+    # Capture SolveIt cell id *before* any await — after the first yield the
+    # cell frame can leave the stack and __msg_id is no longer findable.
+    launcher_msg_id = _find_caller_msg_id()
+    _SESSION["launcher_msg_id"] = launcher_msg_id
+
     _ensure_local_magic()
 
     ok, msg = LiveExecutor().kernel_ok()
@@ -3440,6 +3487,7 @@ async def slive(
     print(
         f"sslive: {len(deck.slides)} slides, {n_code} code cells, "
         f"backend=gpu ({msg}), IN_SOLVEIT={_in_solveit()}"
+        + (f", msg={launcher_msg_id}" if launcher_msg_id else ", msg=?(no __msg_id yet)")
     )
     if n_code == 0 and len(deck.slides) == 0:
         print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
@@ -3456,12 +3504,15 @@ async def slive(
     print("Manual: await sync_dialog()  if needed")
 
     if embed:
+        # sslides pattern: show → sleep(1) → update_msg(..., skipped=1)
         _show_presenter(port, height=height)
-
-    # Hide preview cell from LLM context (SolveIt red eye / Toggle AI visibility).
-    # Must run after display so the giant srcdoc lives on this message, then
-    # skipped=1 drops it from dialoghelper context — same as sslides sshow().
-    await _skip_caller_msg()
+        # Re-probe after display in case id only appears now; prefer early capture.
+        mid = launcher_msg_id or _find_caller_msg_id() or _SESSION.get("launcher_msg_id")
+        await _skip_msg(mid, settle=1.0)
+    else:
+        mid = launcher_msg_id or _find_caller_msg_id()
+        if mid:
+            await _skip_msg(mid, settle=0.0)
 
     return session
 
