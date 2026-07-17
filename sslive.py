@@ -1196,6 +1196,27 @@ class LiveExecutor:
 # Output → HTML fragment (presenter swap target)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _scrub_output_html(html: str) -> str:
+    """Neutralize bits that break the slide iframe (HTMX OOB, extra Plotly CDN)."""
+    if not html:
+        return ""
+    html = re.sub(
+        r"\s+hx-swap-oob=(['\"]).*?\1",
+        "",
+        html,
+        flags=re.I | re.DOTALL,
+    )
+    html = re.sub(r"\s+data-hx-swap-oob=(['\"]).*?\1", "", html, flags=re.I | re.DOTALL)
+    # Presenter already loads Plotly — drop duplicate CDN tags (avoid 404 / race)
+    html = re.sub(
+        r"<script[^>]+src=[\"'][^\"']*plotly[^\"']*[\"'][^>]*>\s*</script>",
+        "",
+        html,
+        flags=re.I,
+    )
+    return html
+
+
 def render_output_html(
     parts: list[OutputPart],
     cell_id: str,
@@ -1232,10 +1253,10 @@ def render_output_html(
                 f'<img src="data:image/png;base64,{p.b64}" style="{img_st}" alt="output"/>'
             )
         elif p.kind == "text/html":
-            # Viewers (%pointcloud etc.) often inject iframes — give them room
+            body = _scrub_output_html(p.text or "")
             chunks.append(
                 f'<div class="sslive-html" style="width:100%;min-height:360px;'
-                f'overflow:auto">{p.text}</div>'
+                f'overflow:auto">{body}</div>'
             )
         elif p.kind == "text/plain":
             chunks.append(f'<pre style="{out_st}">{html_module.escape(p.text)}</pre>')
@@ -1801,9 +1822,10 @@ def _code_block_html(cell: Cell, *, style: str = "", extra_attrs: str = "") -> s
     # raw id for JS (safe: dialog ids are alphanumeric + underscore)
     raw_id = cell.id
     src = html_module.escape(cell.source)
-    n_lines = max(3, min(24, cell.source.count("\n") + 2))
-    # ~1.45em line height in code-ta
-    ta_h = max(72, int(n_lines * 22))
+    # Default to a single visible line so long viz scripts don't dominate the
+    # slide; user can focus (expands for edit) or drag the resize handle.
+    n_lines = 1
+    ta_h = 34  # ~one line at 14px / 1.45 line-height
     return f"""
     <div id="el-code-{cid}" class="code-wrap" data-el-id="el-code-{cid}" data-type="code"
          data-cell-id="{cid}" data-runnable="1"{extra_attrs}{_style_attr(style)}
@@ -1818,7 +1840,9 @@ def _code_block_html(cell: Cell, *, style: str = "", extra_attrs: str = "") -> s
       <textarea class="code-ta" id="ta-{cid}" data-cell-id="{cid}"
         spellcheck="false" rows="{n_lines}"
         style="height:{ta_h}px"
-        onfocus="selectCell('{cid}')"
+        data-collapsed-h="{ta_h}"
+        onfocus="selectCell('{cid}'); codeTaFocus(this)"
+        onblur="codeTaBlur(this)"
         onkeydown="onCodeKey(event,'{raw_id}')">{src}</textarea>
     </div>
     """
@@ -1957,7 +1981,8 @@ def generate_presenter_html(
       font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45;
       font-size:var(--code-fs, 14px); white-space:pre;
       color:#e5e7eb; background:#111827; border:1px solid #4b5563; border-radius:6px;
-      padding:10px; outline:none; }}
+      padding:6px 10px; outline:none; min-height:34px; max-height:70vh;
+      overflow:auto; transition:height 0.12s ease; }}
     .code-ta:focus {{ border-color:#60a5fa; }}
     #chrome {{ position:fixed; left:12px; top:12px; z-index:20; display:flex; gap:10px; align-items:center;
       background:rgba(0,0,0,0.55); color:#fff; padding:6px 12px; border-radius:8px; font-size:13px; }}
@@ -2135,6 +2160,39 @@ def generate_presenter_html(
       return ta ? ta.value : '';
     }}
 
+    // Compact code boxes by default (1 line); expand while focused for editing.
+    function codeTaFocus(ta) {{
+      if (!ta || ta.dataset.userSized === '1') return;
+      const lines = Math.min(18, Math.max(3, (ta.value.match(/\\n/g) || []).length + 2));
+      const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
+      const pad = 12;
+      ta.style.height = Math.round(lines * lh + pad) + 'px';
+    }}
+    function codeTaBlur(ta) {{
+      if (!ta || ta.dataset.userSized === '1') return;
+      const h = parseInt(ta.dataset.collapsedH || '34', 10) || 34;
+      ta.style.height = h + 'px';
+      ta.scrollTop = 0;
+    }}
+    // If the user drags the native resize handle, stop auto collapse/expand.
+    document.addEventListener('pointerup', (e) => {{
+      const ta = e.target && e.target.classList && e.target.classList.contains('code-ta')
+        ? e.target : null;
+      if (!ta) return;
+      const base = parseInt(ta.dataset.collapsedH || '34', 10) || 34;
+      if (Math.abs(ta.offsetHeight - base) > 8 && document.activeElement === ta) {{
+        // expanded for edit is fine; only mark userSized if clearly hand-resized tall
+        if (ta.offsetHeight > base + 80) ta.dataset.userSized = '1';
+      }}
+    }}, true);
+
+    const runTimers = {{}};  // cellId → timeout id (clear stuck spinners)
+
+    function setRunBtn(cellId, disabled) {{
+      const btn = document.querySelector('.run-btn[data-cell-id="' + cellId + '"]');
+      if (btn) btn.disabled = !!disabled;
+    }}
+
     function setRunning(cellId, msg) {{
       const out = document.getElementById('el-output-' + cellId);
       if (out) {{
@@ -2142,16 +2200,58 @@ def generate_presenter_html(
           'font:13px/1.4 ui-monospace,monospace;border-radius:6px">' +
           (msg || 'Running…') + '</pre>';
       }}
-      const btn = document.querySelector('.run-btn[data-cell-id="' + cellId + '"]');
-      if (btn) btn.disabled = true;
+      setRunBtn(cellId, true);
+      if (runTimers[cellId]) clearTimeout(runTimers[cellId]);
+      // Never leave the spinner forever if the host drops the result
+      runTimers[cellId] = setTimeout(function () {{
+        setRunBtn(cellId, false);
+        const o = document.getElementById('el-output-' + cellId);
+        if (o && /Running/i.test(o.textContent || '')) {{
+          o.innerHTML = '<pre style="background:#7f1d1d;color:#fecaca;padding:0.5rem;' +
+            'font:13px/1.4 ui-monospace,monospace;border-radius:6px">' +
+            'Timed out waiting for result (check kernel / Plotly output size).</pre>';
+        }}
+        const badge = document.getElementById('status-badge');
+        if (badge) {{ badge.textContent = 'gpu · timeout'; badge.className = 'bad'; }}
+      }}, 120000);
+    }}
+
+    // Re-run <script> tags after HTML inject (innerHTML does not execute them).
+    // Also strip HTMX OOB attrs that break when swapped into the slide iframe.
+    function sanitizeAndActivateOutput(root) {{
+      if (!root) return;
+      root.querySelectorAll('[hx-swap-oob],[data-hx-swap-oob]').forEach(function (n) {{
+        n.removeAttribute('hx-swap-oob');
+        n.removeAttribute('data-hx-swap-oob');
+      }});
+      root.querySelectorAll('script').forEach(function (old) {{
+        const s = document.createElement('script');
+        for (let i = 0; i < old.attributes.length; i++) {{
+          const a = old.attributes[i];
+          try {{ s.setAttribute(a.name, a.value); }} catch (e) {{}}
+        }}
+        s.text = old.textContent || '';
+        old.parentNode.replaceChild(s, old);
+      }});
+      // Plotly figures often need a resize after becoming visible
+      try {{
+        if (window.Plotly && root.querySelector) {{
+          root.querySelectorAll('.js-plotly-plot, .plotly-graph-div').forEach(function (gd) {{
+            try {{ window.Plotly.Plots.resize(gd); }} catch (e) {{}}
+          }});
+        }}
+      }} catch (e) {{}}
     }}
 
     function applyRunResult(msg) {{
       // In-place only — never reload document (preserves slide + fullscreen)
       if (!msg || !msg.cell_id) return;
+      const cellId = msg.cell_id;
+      // Always clear stuck spinner / disabled button first
+      if (runTimers[cellId]) {{ clearTimeout(runTimers[cellId]); delete runTimers[cellId]; }}
+      setRunBtn(cellId, false);
       if (msg.t && msg.t <= lastResultT) return;
       if (msg.t) lastResultT = msg.t;
-      const cellId = msg.cell_id;
       const out = document.getElementById('el-output-' + cellId);
       if (out && msg.html) {{
         const tmp = document.createElement('div');
@@ -2160,11 +2260,10 @@ def generate_presenter_html(
         if (neu) {{
           const wasSel = (typeof editSel !== 'undefined' && editSel === out);
           out.replaceWith(neu);
+          sanitizeAndActivateOutput(neu);
           if (wasSel) selectEl(neu);  // keep selection/handle on the fresh node
         }}
       }}
-      const btn = document.querySelector('.run-btn[data-cell-id="' + cellId + '"]');
-      if (btn) btn.disabled = false;
       selectCell(cellId);
       const ta = document.querySelector('textarea.code-ta[data-cell-id="' + cellId + '"]');
       // keep user's edited text if Python also sent source
@@ -2752,6 +2851,8 @@ def generate_presenter_html(
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>sslive</title>
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <!-- Plotly figures from GPU/HTML outputs need this global in the slide iframe -->
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <style>{css}</style>
 </head>
 <body>
@@ -3139,19 +3240,28 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
     deck = _SESSION.get("deck")
     theme = (deck.theme if deck else None) or THEME_DARK
     if deck is not None and cell_id in deck.cells:
-        deck.cells[cell_id].outputs = list(result.parts)
+        deck.cells[cell_id].outputs = list(result.parts or [])
         if source is not None:
             _apply_source_to_deck(cell_id, source)
 
     # Keep overlay position/size/reveal when the output block is replaced in-place
     out_spec = _layout_spec(deck, f"el-output-{cell_id}")
-    html = render_output_html(
-        result.parts or [],
-        cell_id,
-        theme,
-        style=_el_style(out_spec),
-        extra_attrs=_reveal_attr(out_spec),
-    )
+    try:
+        html = render_output_html(
+            result.parts or [],
+            cell_id,
+            theme,
+            style=_el_style(out_spec),
+            extra_attrs=_reveal_attr(out_spec),
+        )
+    except Exception as e:
+        html = render_output_html(
+            [OutputPart(kind="error", text=f"render failed: {e}")],
+            cell_id,
+            theme,
+            style=_el_style(out_spec),
+            extra_attrs=_reveal_attr(out_spec),
+        )
     payload = {
         "type": "sslive_result",
         "cell_id": cell_id,
@@ -3162,9 +3272,20 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
         "t": int(time.time() * 1000),
         "slide_index": int(_SESSION.get("slide_index") or 0),
     }
+    # Prefer postMessage (handles large Plotly HTML better than embedding in iife)
+    try:
+        raw = json.dumps(payload)
+    except Exception as e:
+        # Fallback: drop huge/unserializable bits
+        payload["html"] = render_output_html(
+            [OutputPart(kind="error", text=f"output too large or invalid: {e}")],
+            cell_id,
+            theme,
+        )
+        raw = json.dumps(payload)
     js = f"""
 (function() {{
-  var msg = {json.dumps(payload)};
+  var msg = {raw};
   window.__sslive_last_result = msg;
   if (msg.slide_index != null) window.__sslive_slide_index = msg.slide_index;
   document.querySelectorAll('iframe').forEach(function(f) {{
@@ -3178,6 +3299,26 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
             return
         except Exception as e:
             _SESSION["_last_push_err"] = str(e)
+            # Last-ditch: tiny payload so the spinner always clears
+            try:
+                tiny = {
+                    "type": "sslive_result",
+                    "cell_id": cell_id,
+                    "html": render_output_html(
+                        [OutputPart(kind="error", text=f"push failed: {e}")],
+                        cell_id,
+                        theme,
+                    ),
+                    "ok": False,
+                    "t": int(time.time() * 1000),
+                }
+                iife(
+                    f"window.__sslive_last_result={json.dumps(tiny)};"
+                    "document.querySelectorAll('iframe').forEach(function(f){"
+                    "try{f.contentWindow.postMessage(window.__sslive_last_result,'*');}catch(e){}});"
+                )
+            except Exception as e2:
+                _SESSION["_last_push_err"] = f"{e} / {e2}"
 
 
 def _run_and_refresh(
