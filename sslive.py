@@ -159,10 +159,26 @@ class Deck:
 # Piece 1 — Content loader (sslides logic; load only — no write-back)
 # ═══════════════════════════════════════════════════════════════════════════
 
+_HOST_LOAD_HELP = """
+sslive host must load on the SolveIt kernel (not the remote GPU).
+
+  %local
+  %run sslive/sslive.py
+  register_slive()     # marks %slive as a local magic
+  %gpu                 # optional — stay here for torch / %pointcloud
+  %slive               # or: await slive()
+
+If you %run under %gpu, this file executes on the remote kernel where
+dialoghelper does not exist — that causes this error.
+""".strip()
+
+
 async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[dict]:
     """Cells after `#| s` marker. Requires dialoghelper (async API)."""
     if find_msgs is None:
-        raise RuntimeError("dialoghelper not available — run inside SolveIt")
+        raise RuntimeError(
+            "dialoghelper not available — host ran on remote GPU?\n" + _HOST_LOAD_HELP
+        )
     all_msgs = await find_msgs()
     marker_idx = None
     for i, m in enumerate(all_msgs):
@@ -1058,16 +1074,14 @@ def _ensure_local_magic():
 def _host_ok() -> tuple[bool, str]:
     """Whether the sslive *host* can run (SolveIt host + dialoghelper).
 
-    Does **not** require ``%local`` mode: under ``%gpu``, local magics still
-    run on the host. We only need dialoghelper available on that host kernel.
+    Under ``%gpu``, *code cells* run remotely — including ``%run sslive`` and
+    bare ``await slive()`` unless they are local magics. dialoghelper only
+    exists on the SolveIt host, so the module must be loaded with ``%local``.
     """
+    if find_msgs is None or update_msg is None:
+        return False, "dialoghelper missing (loaded on remote GPU kernel?)"
     if not _in_solveit():
-        return True, "not in SolveIt (HTTP/dev host ok)"
-    if update_msg is None and find_msgs is None:
-        return False, (
-            "dialoghelper missing on host — load sslive on the SolveIt kernel "
-            "(use %slive / register_local_magic; do not run the host only on remote)"
-        )
+        return True, "dev host"
     return True, "host"
 
 
@@ -3743,22 +3757,16 @@ async def slive(
 ):
     """Start the live deck (host magic; slide ▶ Run uses GPU).
 
-    Preferred under **``%gpu`` mode** (stay there for torch / pointcloud)::
+    Load the module on the **host** first, then use ``%slive`` under ``%gpu``::
 
-        %gpu
-        %run path/to/sslive.py   # once — registers %slive as a *local* magic
-        %slive                   # or: await slive()
-        # deck displays like %pointcloud; ▶ Run → remote GPU via CRAFT
+        %local
+        %run path/to/sslive.py   # MUST be %local — not under %gpu
+        register_slive()         # mark %slive as local magic
+        %gpu                     # stay here for torch / %pointcloud
+        %slive                   # local magic → host deck, Run → GPU
 
-    ``%slive`` is registered as a **local magic** so it runs on the SolveIt
-    host even when the dialog is in GPU mode (same pattern as other CRAFT
-    host tools). Slide code still executes on the remote kernel.
-
-    Soft-start: if the CRAFT client is not attached yet, the deck still opens
-    (notes/layout/reveal work); ▶ Run reports offline until GPU is ready.
-    Pass ``require_gpu=True`` to hard-fail instead.
-
-    Returns ``None`` by default (clean cell output). Session: ``session()``.
+    Soft-start: if CRAFT is offline, the deck still opens; ▶ Run waits until ready.
+    Returns ``None`` by default (clean output). Session: ``session()``.
     """
     # Sync probe first (may be empty under await — full resolve after embed).
     launcher_msg_id = _find_caller_msg_id()
@@ -3769,6 +3777,7 @@ async def slive(
     host_ok, host_msg = _host_ok()
     if not host_ok:
         print(f"sslive: host not ready — {host_msg}")
+        print(_HOST_LOAD_HELP)
         return None
 
     ok, msg = LiveExecutor().kernel_ok()
@@ -3786,7 +3795,13 @@ async def slive(
         use_http = not _in_solveit()
 
     theme_dict = theme if isinstance(theme, dict) else dict(THEME_DARK)
-    deck = await build_deck(theme=theme_dict)
+    try:
+        deck = await build_deck(theme=theme_dict)
+    except RuntimeError as e:
+        if "dialoghelper" in str(e).lower():
+            print(f"sslive: {e}")
+            return None
+        raise
     executor = LiveExecutor()
     _SESSION["deck"] = deck
     _SESSION["executor"] = executor

@@ -23,28 +23,25 @@ Stay in **`%gpu` mode** for your usual work (`torch`, `%pointcloud`, …). Open 
 
 You do **not** need to flip back to `%local` for the deck if `%slive` is registered as a local magic (done automatically when you `%run` this file on the host).
 
-## Usage (GPU-mode first)
+## Usage (critical order)
+
+**`%run sslive` must happen under `%local`.**  
+If you `%run` while already in `%gpu` mode, the file loads on the **remote** kernel (no dialoghelper) and everything breaks.
 
 ```python
-%gpu
-# CRAFT already loaded in this dialog (so host has _exec_mgr)
+%local
+%run sslive/sslive.py      # host kernel only
+register_slive()           # %slive is a *local* magic under %gpu
 
-%run path/to/sslive.py    # registers %slive + marks it *local* for %gpu mode
-# if you %run *before* %gpu, re-mark after:
-#   register_slive()
-
-%slive                    # open deck (like %pointcloud)
-# or: await slive()
+%gpu                       # your normal mode for torch / %pointcloud
+%slive                     # opens deck on host; ▶ Run → remote GPU
 ```
 
-If you see **`%slive` not found** under `%gpu`:
-
-```python
-register_slive()   # re-register + mark local
-%slive
-```
-
-Or skip the magic: `await slive()` on the host (same effect).
+| Symptom | Cause | Fix |
+|---------|--------|-----|
+| `dialoghelper not available` | `%run` or `await slive()` under `%gpu` (remote) | `%local` → `%run` → `register_slive()` → `%gpu` → `%slive` |
+| `%slive` not found | Magic not on host / not marked local | `%local` → `%run` → `register_slive()` |
+| `_exec_mgr not found` | CRAFT client missing on host | Load CRAFT bootstrap on host, then `%gpu` |
 
 1. Click the slide iframe  
 2. Edit a code box  
