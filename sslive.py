@@ -332,7 +332,9 @@ async def build_deck(
 LAYOUT_MARKER = "#| sslive-layout"
 _UNSET = object()
 _ALIGN_VALUES = {"left", "center", "right", "justify"}
-_LAYOUT_KEYS = ("x", "y", "w", "h", "z", "order", "fs", "ff", "align")
+# ``reveal`` = segmented reveal step (1,2,3…);  omit/0 = always visible.
+# ``order``/``z`` remain for low-level CSS (API); toolbar uses ``reveal`` only.
+_LAYOUT_KEYS = ("x", "y", "w", "h", "z", "order", "reveal", "fs", "ff", "align")
 _FF_SAFE_RE = re.compile(r"[^\w\s,'\"-]")
 
 
@@ -472,7 +474,7 @@ def _apply_layout_patch(deck: "Deck", el_id: str, patch: dict) -> dict:
             continue
         if v is None:
             spec.pop(k, None)
-        elif k in ("z", "order"):
+        elif k in ("z", "order", "reveal"):
             spec[k] = int(v)
         elif k == "ff":
             spec[k] = str(v)
@@ -546,15 +548,36 @@ def _style_attr(style: str) -> str:
     return f' style="{html_module.escape(style)}"' if style else ""
 
 
+def _reveal_attr(spec: dict) -> str:
+    """`` data-reveal="N"`` when a positive reveal step is set."""
+    r = spec.get("reveal")
+    if r is None:
+        return ""
+    try:
+        n = int(r)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    return f' data-reveal="{n}"'
+
+
 def _push_layout(el_id: str) -> None:
     """Apply one element's overlay style in the live iframe (no rebuild)."""
     deck = _SESSION.get("deck")
     seq = int(_SESSION.get("_layout_push_seq") or int(time.time() * 1000)) + 1
     _SESSION["_layout_push_seq"] = seq
+    spec = _layout_spec(deck, el_id)
+    rev = spec.get("reveal")
+    try:
+        rev = int(rev) if rev is not None else None
+    except (TypeError, ValueError):
+        rev = None
     payload = {
         "type": "sslive_layout_apply",
         "el_id": el_id,
-        "style": _el_style(_layout_spec(deck, el_id)),
+        "style": _el_style(spec),
+        "reveal": rev if (rev is not None and rev > 0) else None,
         "t": seq,
     }
     if iife is None:
@@ -583,6 +606,7 @@ async def set_layout(
     h: Any = _UNSET,
     z: Any = _UNSET,
     order: Any = _UNSET,
+    reveal: Any = _UNSET,
     fs: Any = _UNSET,
     ff: Any = _UNSET,
     align: Any = _UNSET,
@@ -595,11 +619,13 @@ async def set_layout(
         await set_layout('el-note-_abc123', x=120, y=80, w=800, fs=36)
         await set_layout('el-output-_def456', x=1100, y=200, w=700)
         await set_layout('el-note-_abc123', x=None, y=None)  # back to flow
+        await set_layout('el-note-_abc123', reveal=1)  # appear on first → press
 
     Omit a param to leave it unchanged; pass ``None`` to clear it.
-    ``x``/``y`` position absolutely; without them the element stays in flow
-    and ``order`` controls its flex position. ``fs`` px, ``ff`` CSS family,
-    ``z`` stacking, ``align`` left/center/right/justify.
+    ``x``/``y`` position absolutely; without them the element stays in flow.
+    ``reveal`` is the segmented-reveal step (1, 2, 3…); omit/0 = always shown.
+    Right arrow advances reveal steps before changing slides. ``fs`` px,
+    ``ff`` CSS family, ``z`` stacking, ``align`` left/center/right/justify.
     Applied live in the iframe; persisted (debounced) to the dialog.
     """
     deck: Deck | None = _SESSION.get("deck")
@@ -609,7 +635,7 @@ async def set_layout(
         raise KeyError(f"unknown element {el_id!r} — see layout_ids() for options")
     updates = {
         "x": x, "y": y, "w": w, "h": h, "z": z,
-        "order": order, "fs": fs, "ff": ff, "align": align,
+        "order": order, "reveal": reveal, "fs": fs, "ff": ff, "align": align,
     }
     spec = _apply_layout_patch(
         deck, el_id, {k: v for k, v in updates.items() if v is not _UNSET}
@@ -834,7 +860,12 @@ class LiveExecutor:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def render_output_html(
-    parts: list[OutputPart], cell_id: str, theme: dict | None = None, *, style: str = ""
+    parts: list[OutputPart],
+    cell_id: str,
+    theme: dict | None = None,
+    *,
+    style: str = "",
+    extra_attrs: str = "",
 ) -> str:
     """Return HTML for #el-output-{cell_id}. No FastHTML required."""
     theme = theme or THEME_DARK
@@ -875,7 +906,8 @@ def render_output_html(
     eid = html_module.escape(f"el-output-{cell_id}")
     return (
         f'<div id="{eid}" data-el-id="{eid}" '
-        f'data-type="output" data-cell-id="{html_module.escape(cell_id)}"{_style_attr(style)}>'
+        f'data-type="output" data-cell-id="{html_module.escape(cell_id)}"'
+        f'{extra_attrs}{_style_attr(style)}>'
         f"{inner}</div>"
     )
 
@@ -1023,7 +1055,7 @@ def _note_to_html_basic(source: str) -> str:
     return h
 
 
-def _code_block_html(cell: Cell, *, style: str = "") -> str:
+def _code_block_html(cell: Cell, *, style: str = "", extra_attrs: str = "") -> str:
     """In-slide editable code (textarea) + Run — RISE-style."""
     cid = html_module.escape(cell.id)
     # raw id for JS (safe: dialog ids are alphanumeric + underscore)
@@ -1034,7 +1066,7 @@ def _code_block_html(cell: Cell, *, style: str = "") -> str:
     ta_h = max(72, int(n_lines * 22))
     return f"""
     <div id="el-code-{cid}" class="code-wrap" data-el-id="el-code-{cid}" data-type="code"
-         data-cell-id="{cid}" data-runnable="1"{_style_attr(style)}
+         data-cell-id="{cid}" data-runnable="1"{extra_attrs}{_style_attr(style)}
          tabindex="0" onclick="selectCell('{cid}')">
       <div class="code-toolbar">
         <span class="drag-grip" data-drag-for="el-code-{cid}" title="drag to move">⠿</span>
@@ -1058,21 +1090,30 @@ def _slide_html(deck: Deck, slide: Slide, *, active: bool = False) -> str:
         cell = deck.cells[cid]
         if cell.kind == "note":
             eid = html_module.escape(f"el-note-{cid}")
-            style = _el_style(_layout_spec(deck, f"el-note-{cid}"))
+            spec = _layout_spec(deck, f"el-note-{cid}")
+            style = _el_style(spec)
             parts.append(
                 f'<div id="{eid}" class="note-block" data-el-id="{eid}" '
-                f'data-cell-id="{html_module.escape(cid)}"{_style_attr(style)}>'
+                f'data-cell-id="{html_module.escape(cid)}"{_reveal_attr(spec)}'
+                f'{_style_attr(style)}>'
                 f"{_note_to_html(cell.source)}</div>"
             )
         else:
+            cspec = _layout_spec(deck, f"el-code-{cid}")
+            ospec = _layout_spec(deck, f"el-output-{cid}")
             parts.append(
-                _code_block_html(cell, style=_el_style(_layout_spec(deck, f"el-code-{cid}")))
+                _code_block_html(
+                    cell,
+                    style=_el_style(cspec),
+                    extra_attrs=_reveal_attr(cspec),
+                )
             )
             # always emit output mount (seeded from last outputs / notebook)
             parts.append(
                 render_output_html(
                     cell.outputs, cell.id, deck.theme or THEME_DARK,
-                    style=_el_style(_layout_spec(deck, f"el-output-{cid}")),
+                    style=_el_style(ospec),
+                    extra_attrs=_reveal_attr(ospec),
                 )
             )
     cls = "slide title-slide" if slide.is_title else "slide"
@@ -1197,30 +1238,75 @@ def generate_presenter_html(
     #edit-toolbar .tb-field {{ color:#9ca3af; font-size:11px; display:inline-flex; align-items:center; gap:4px; }}
     #edit-toolbar .tb-sep {{ width:1px; height:18px; background:#374151; }}
     #edit-toolbar #tb-fs-val {{ min-width:32px; text-align:center; }}
-    /* Google Slides–style resize: 8 handles on selection box */
-    body.editing .el-editsel {{ position:relative; }}
-    .rs-handle {{ position:absolute; width:12px; height:12px; background:#60a5fa;
+    /* Segmented reveal: hidden until → advances past data-reveal step */
+    .frag-hidden {{ opacity:0 !important; visibility:hidden !important; pointer-events:none !important; }}
+    body.editing .frag-hidden {{ opacity:0.35 !important; visibility:visible !important; pointer-events:auto !important; }}
+    body.editing [data-reveal]:not([data-reveal=""]):not([data-reveal="0"])::before {{
+      content: attr(data-reveal); position:absolute; top:-10px; left:-10px; z-index:8;
+      min-width:18px; height:18px; padding:0 4px; border-radius:9px; font:700 11px/18px system-ui,sans-serif;
+      background:#f59e0b; color:#111; text-align:center; pointer-events:none; }}
+    body.editing .note-block[data-reveal], body.editing .code-wrap[data-reveal],
+    body.editing [data-type="output"][data-reveal] {{ position:relative; }}
+    /* External resize frame — lives on the slide, OUTSIDE the element (not clipped) */
+    #rs-box {{ position:absolute; pointer-events:none; z-index:40;
+      border:2px solid #60a5fa; box-sizing:border-box; margin:0; padding:0; }}
+    #rs-box .rs-handle {{ position:absolute; width:14px; height:14px; background:#60a5fa;
       border:2px solid #fff; border-radius:2px; box-sizing:border-box;
-      touch-action:none; z-index:6; box-shadow:0 0 0 1px rgba(0,0,0,0.35); }}
-    .rs-handle.rs-nw {{ left:-7px; top:-7px; cursor:nwse-resize; }}
-    .rs-handle.rs-n  {{ left:50%; top:-7px; transform:translateX(-50%); cursor:ns-resize; }}
-    .rs-handle.rs-ne {{ right:-7px; top:-7px; cursor:nesw-resize; }}
-    .rs-handle.rs-e  {{ right:-7px; top:50%; transform:translateY(-50%); cursor:ew-resize; }}
-    .rs-handle.rs-se {{ right:-7px; bottom:-7px; cursor:nwse-resize; }}
-    .rs-handle.rs-s  {{ left:50%; bottom:-7px; transform:translateX(-50%); cursor:ns-resize; }}
-    .rs-handle.rs-sw {{ left:-7px; bottom:-7px; cursor:nesw-resize; }}
-    .rs-handle.rs-w  {{ left:-7px; top:50%; transform:translateY(-50%); cursor:ew-resize; }}
+      touch-action:none; z-index:41; pointer-events:auto;
+      box-shadow:0 0 0 1px rgba(0,0,0,0.35); }}
+    /* Handles sit fully outside the frame */
+    #rs-box .rs-nw {{ left:-9px; top:-9px; cursor:nwse-resize; }}
+    #rs-box .rs-n  {{ left:50%; top:-9px; transform:translateX(-50%); cursor:ns-resize; }}
+    #rs-box .rs-ne {{ right:-9px; top:-9px; cursor:nesw-resize; }}
+    #rs-box .rs-e  {{ right:-9px; top:50%; transform:translateY(-50%); cursor:ew-resize; }}
+    #rs-box .rs-se {{ right:-9px; bottom:-9px; cursor:nwse-resize; }}
+    #rs-box .rs-s  {{ left:50%; bottom:-9px; transform:translateX(-50%); cursor:ns-resize; }}
+    #rs-box .rs-sw {{ left:-9px; bottom:-9px; cursor:nesw-resize; }}
+    #rs-box .rs-w  {{ left:-9px; top:50%; transform:translateY(-50%); cursor:ew-resize; }}
+    body.editing .el-editsel {{ outline:2px solid #f59e0b; outline-offset:2px; }}
     """
 
     js = f"""
     let currentSlide = {initial_slide};
     let selectedCellId = {json.dumps(first_code)};
     let lastResultT = 0;
+    let fragStep = 0;  // how far into this slide's reveal sequence we are
     const slides = () => document.querySelectorAll('[data-slide]');
+
+    function slideEls(slideEl) {{
+      if (!slideEl) return [];
+      return slideEl.querySelectorAll('.note-block, .code-wrap, [data-type="output"]');
+    }}
+    function revealOf(el) {{
+      const r = parseInt(el.getAttribute('data-reveal'), 10);
+      return (Number.isFinite(r) && r > 0) ? r : 0;
+    }}
+    function maxReveal(slideEl) {{
+      let m = 0;
+      slideEls(slideEl).forEach(el => {{ m = Math.max(m, revealOf(el)); }});
+      return m;
+    }}
+    function applyFragments() {{
+      const ss = slides()[currentSlide];
+      if (!ss) return;
+      // Present: hide until step reaches data-reveal.
+      // Edit: show all, but dim elements that have a reveal step assigned.
+      slideEls(ss).forEach(el => {{
+        const r = revealOf(el);
+        const hide = editing ? (r > 0) : (r > 0 && r > fragStep);
+        el.classList.toggle('frag-hidden', hide);
+      }});
+      updateCounter();
+    }}
 
     function updateCounter() {{
       const el = document.getElementById('slide-counter');
-      if (el) el.textContent = (currentSlide + 1) + ' / ' + slides().length;
+      if (!el) return;
+      const n = slides().length;
+      const maxR = maxReveal(slides()[currentSlide]);
+      let t = (currentSlide + 1) + ' / ' + Math.max(n, 1);
+      if (maxR > 0 && !editing) t += ' · ' + fragStep + '/' + maxR;
+      el.textContent = t;
     }}
 
     function selectCell(id) {{
@@ -1230,7 +1316,7 @@ def generate_presenter_html(
       }});
     }}
 
-    function showSlide(n, {{ selectFirst }} = {{ selectFirst: true }}) {{
+    function showSlide(n, {{ selectFirst, frag }} = {{ selectFirst: true }}) {{
       const ss = slides();
       if (!ss.length) return;
       ss.forEach((s, i) => {{
@@ -1238,7 +1324,8 @@ def generate_presenter_html(
         s.classList.toggle('hidden', i !== n);
       }});
       currentSlide = Math.max(0, Math.min(n, ss.length - 1));
-      updateCounter();
+      fragStep = (frag == null) ? 0 : frag;
+      applyFragments();
       // tell parent our position (for rebuild recovery)
       try {{
         window.parent.__sslive_slide_index = currentSlide;
@@ -1246,6 +1333,23 @@ def generate_presenter_html(
       if (selectFirst) {{
         const first = ss[currentSlide].querySelector('[data-runnable]');
         if (first) selectCell(first.dataset.cellId);
+      }}
+      placeRsBox();
+    }}
+
+    // → advances reveal steps first, then next slide. ← reverses.
+    function goNext() {{
+      if (editing) {{ showSlide(currentSlide + 1); return; }}
+      const maxR = maxReveal(slides()[currentSlide]);
+      if (fragStep < maxR) {{ fragStep++; applyFragments(); return; }}
+      if (currentSlide < slides().length - 1) showSlide(currentSlide + 1);
+    }}
+    function goPrev() {{
+      if (editing) {{ showSlide(currentSlide - 1); return; }}
+      if (fragStep > 0) {{ fragStep--; applyFragments(); return; }}
+      if (currentSlide > 0) {{
+        const prev = currentSlide - 1;
+        showSlide(prev, {{ selectFirst: false, frag: maxReveal(slides()[prev]) }});
       }}
     }}
 
@@ -1311,6 +1415,12 @@ def generate_presenter_html(
       const el = document.getElementById(msg.el_id);
       if (!el) return;
       el.style.cssText = msg.style || '';
+      if ('reveal' in msg) {{
+        if (msg.reveal == null || msg.reveal <= 0) el.removeAttribute('data-reveal');
+        else el.setAttribute('data-reveal', String(msg.reveal));
+      }}
+      applyFragments();
+      placeRsBox();
     }}
 
     // ── S2-B edit mode: select / drag / nudge → layout patches to parent ──
@@ -1324,6 +1434,7 @@ def generate_presenter_html(
       document.body.classList.toggle('editing', editing);
       document.getElementById('edit-btn')?.classList.toggle('on', editing);
       if (!editing) selectEl(null);
+      applyFragments();  // show all while editing; restore hide when done
     }}
 
     function selectEl(el) {{
@@ -1333,7 +1444,7 @@ def generate_presenter_html(
       updateToolbar();
     }}
 
-    // ── S2-C toolbar: font size/family, free z/order, 8-handle resize, reset ──
+    // ── S2-C toolbar: font / reveal step / external resize frame ──
     const TB_FONTS = [
       ['', 'Default'],
       ["Georgia, 'Times New Roman', serif", 'Serif'],
@@ -1344,41 +1455,49 @@ def generate_presenter_html(
     const RS_MIN = 40;
 
     function selElId() {{ return editSel ? (editSel.dataset.elId || editSel.id) : null; }}
-    function isAbs() {{ return !!editSel && editSel.style.position === 'absolute'; }}
     function curFs() {{
       if (!editSel) return 28;
       return Math.round(parseFloat(editSel.style.fontSize)
         || parseFloat(getComputedStyle(editSel).fontSize) || 28);
     }}
-    function curZ() {{
+    function curReveal() {{
       if (!editSel) return 0;
-      const v = parseInt(editSel.style.zIndex, 10);
-      return Number.isFinite(v) ? v : 0;
-    }}
-    function curOrder() {{
-      if (!editSel) return 0;
-      const v = parseInt(editSel.style.order, 10);
-      return Number.isFinite(v) ? v : 0;
+      return revealOf(editSel);
     }}
 
-    function ensureHandle() {{
-      removeHandle();
-      if (!editSel) return;
-      // Handles need a positioned ancestor; don't clobber absolute layout.
-      if (editSel.style.position !== 'absolute') {{
-        // CSS body.editing .el-editsel {{ position:relative }} covers flow.
-      }}
-      RS_DIRS.forEach((dir) => {{
-        const h = document.createElement('div');
-        h.className = 'rs-handle rs-' + dir;
-        h.dataset.dir = dir;
-        h.title = 'drag to resize';
-        editSel.appendChild(h);
-      }});
-    }}
+    // Resize frame lives on the slide (sibling overlay), so handles are never
+    // clipped by overflow:auto / borders inside the element itself.
     function removeHandle() {{
-      document.querySelectorAll('.rs-handle').forEach(x => x.remove());
+      document.getElementById('rs-box')?.remove();
     }}
+    function placeRsBox() {{
+      removeHandle();
+      if (!editing || !editSel) return;
+      const slide = editSel.closest('[data-slide]');
+      if (!slide) return;
+      const sr = slide.getBoundingClientRect();
+      const er = editSel.getBoundingClientRect();
+      const sc = sr.width / 1920 || 1;
+      const left = (er.left - sr.left) / sc;
+      const top = (er.top - sr.top) / sc;
+      const w = er.width / sc;
+      const h = er.height / sc;
+      const box = document.createElement('div');
+      box.id = 'rs-box';
+      box.style.left = left + 'px';
+      box.style.top = top + 'px';
+      box.style.width = w + 'px';
+      box.style.height = h + 'px';
+      RS_DIRS.forEach((dir) => {{
+        const hEl = document.createElement('div');
+        hEl.className = 'rs-handle rs-' + dir;
+        hEl.dataset.dir = dir;
+        hEl.title = 'drag to resize';
+        box.appendChild(hEl);
+      }});
+      slide.appendChild(box);
+    }}
+    function ensureHandle() {{ placeRsBox(); }}
 
     function updateToolbar() {{
       const tb = document.getElementById('edit-toolbar');
@@ -1388,19 +1507,12 @@ def generate_presenter_html(
       document.getElementById('tb-el').textContent = selElId();
       document.getElementById('tb-fs-val').textContent = curFs();
       const sel = document.getElementById('tb-font');
-      sel.value = editSel.style.fontFamily || '';
-      // Free absolute integers on the selected element (not linear-only ±1).
-      const zIn = document.getElementById('tb-z');
-      const oIn = document.getElementById('tb-order');
-      if (zIn && document.activeElement !== zIn) zIn.value = String(curZ());
-      if (oIn && document.activeElement !== oIn) oIn.value = String(curOrder());
-      // Both always available — pick the value you want on this element.
-      document.getElementById('tb-front').disabled = false;
-      document.getElementById('tb-back').disabled = false;
-      document.getElementById('tb-up').disabled = false;
-      document.getElementById('tb-down').disabled = false;
-      if (zIn) zIn.disabled = false;
-      if (oIn) oIn.disabled = false;
+      if (sel) sel.value = editSel.style.fontFamily || '';
+      const rIn = document.getElementById('tb-reveal');
+      if (rIn && document.activeElement !== rIn) {{
+        const r = curReveal();
+        rIn.value = r > 0 ? String(r) : '';
+      }}
       ensureHandle();
     }}
 
@@ -1417,14 +1529,10 @@ def generate_presenter_html(
         }}
       }}
       if ('ff' in patch) editSel.style.fontFamily = patch.ff || '';
-      if ('z' in patch) {{
-        editSel.style.zIndex = patch.z == null ? '' : patch.z;
-        // z-index only paints for positioned boxes; pin relative if still in flow
-        if (patch.z != null && editSel.style.position !== 'absolute') {{
-          editSel.style.position = 'relative';
-        }}
+      if ('reveal' in patch) {{
+        if (patch.reveal == null || patch.reveal <= 0) editSel.removeAttribute('data-reveal');
+        else editSel.setAttribute('data-reveal', String(patch.reveal));
       }}
-      if ('order' in patch) editSel.style.order = patch.order == null ? '' : patch.order;
       if ('w' in patch) editSel.style.width = patch.w == null ? '' : patch.w + 'px';
       if ('h' in patch) editSel.style.height = patch.h == null ? '' : patch.h + 'px';
       if ('x' in patch) editSel.style.left = patch.x == null ? '' : patch.x + 'px';
@@ -1479,6 +1587,7 @@ def generate_presenter_html(
       const nx = cur.x + dx, ny = cur.y + dy;
       editSel.style.left = nx + 'px';
       editSel.style.top = ny + 'px';
+      placeRsBox();
       const elId = editSel.dataset.elId || editSel.id;
       const patch = {{ x: nx, y: ny }};
       if (cur.converted) {{ patch.w = cur.w; updateToolbar(); }}
@@ -1526,15 +1635,23 @@ def generate_presenter_html(
       }}
       state.cx = x; state.cy = y; state.cw = w; state.ch = h;
       state.touchW = touchW; state.touchH = touchH;
+      // Keep external frame in sync while dragging
+      const box = document.getElementById('rs-box');
+      if (box) {{
+        box.style.left = x + 'px';
+        box.style.top = y + 'px';
+        if (touchW) box.style.width = w + 'px';
+        if (touchH) box.style.height = h + 'px';
+      }}
     }}
 
     document.addEventListener('pointerdown', (e) => {{
       if (!editing || e.button !== 0) return;
       if (e.target.closest('#edit-toolbar')) return;  // toolbar clicks never drag/deselect
-      const rh = e.target.closest('.rs-handle');
+      const rh = e.target.closest('#rs-box .rs-handle, .rs-handle');
       if (rh) {{
-        const el = rh.parentElement;
-        selectEl(el);
+        const el = editSel;  // handles live on #rs-box, not inside the element
+        if (!el) return;
         const start = ensureAbs(el);
         const slide = el.closest('[data-slide]');
         const sc = slide ? (slide.getBoundingClientRect().width / 1920 || 1) : 1;
@@ -1595,6 +1712,7 @@ def generate_presenter_html(
       }}
       drag.el.style.left = (drag.ox + (e.clientX - drag.sx) / drag.sc) + 'px';
       drag.el.style.top = (drag.oy + (e.clientY - drag.sy) / drag.sc) + 'px';
+      placeRsBox();
     }});
 
     document.addEventListener('pointerup', (e) => {{
@@ -1691,10 +1809,11 @@ def generate_presenter_html(
         if (e.key === 'ArrowRight') nudgeSel(step, 0);
         if (e.key === 'ArrowUp')    nudgeSel(0, -step);
         if (e.key === 'ArrowDown')  nudgeSel(0, step);
+        placeRsBox();
         return;
       }}
-      if (e.key === 'ArrowRight') {{ e.preventDefault(); showSlide(currentSlide + 1); }}
-      if (e.key === 'ArrowLeft')  {{ e.preventDefault(); showSlide(currentSlide - 1); }}
+      if (e.key === 'ArrowRight') {{ e.preventDefault(); goNext(); }}
+      if (e.key === 'ArrowLeft')  {{ e.preventDefault(); goPrev(); }}
       if (e.key === 'Enter' && e.shiftKey) {{ e.preventDefault(); runSelected(); }}
       if (e.key === 'f' && !e.metaKey && !e.ctrlKey) {{
         document.documentElement.requestFullscreen?.();
@@ -1707,8 +1826,8 @@ def generate_presenter_html(
       }}
     }});
 
-    document.getElementById('prev-btn')?.addEventListener('click', () => showSlide(currentSlide - 1));
-    document.getElementById('next-btn')?.addEventListener('click', () => showSlide(currentSlide + 1));
+    document.getElementById('prev-btn')?.addEventListener('click', () => goPrev());
+    document.getElementById('next-btn')?.addEventListener('click', () => goNext());
     document.getElementById('edit-btn')?.addEventListener('click', () => setEditing(!editing));
 
     (function initToolbar() {{
@@ -1724,39 +1843,34 @@ def generate_presenter_html(
         () => tbPatch({{ fs: Math.max(8, curFs() - 2) }}));
       document.getElementById('tb-fs-plus').addEventListener('click',
         () => tbPatch({{ fs: curFs() + 2 }}));
-      document.getElementById('tb-front').addEventListener('click', () => tbPatch({{ z: curZ() + 1 }}));
-      document.getElementById('tb-back').addEventListener('click', () => tbPatch({{ z: curZ() - 1 }}));
-      document.getElementById('tb-up').addEventListener('click', () => tbPatch({{ order: curOrder() - 1 }}));
-      document.getElementById('tb-down').addEventListener('click', () => tbPatch({{ order: curOrder() + 1 }}));
-      // Free order / z: type any integer on the selected element (not linear-only).
-      const commitNum = (id, key) => {{
-        const inp = document.getElementById(id);
-        if (!inp) return;
-        const apply = () => {{
+      // Reveal step: empty/0 = always visible; 1,2,3… appear on successive →
+      const rIn = document.getElementById('tb-reveal');
+      if (rIn) {{
+        const applyReveal = () => {{
           if (!editSel) return;
-          const raw = (inp.value || '').trim();
-          if (raw === '' || raw === '-') return;
+          const raw = (rIn.value || '').trim();
+          if (raw === '' || raw === '0') {{
+            tbPatch({{ reveal: null }});
+            return;
+          }}
           const n = parseInt(raw, 10);
-          if (!Number.isFinite(n)) return;
-          const patch = {{}};
-          patch[key] = n;
-          tbPatch(patch);
+          if (!Number.isFinite(n) || n < 0) return;
+          tbPatch({{ reveal: n > 0 ? n : null }});
         }};
-        inp.addEventListener('change', apply);
-        inp.addEventListener('keydown', (ev) => {{
-          if (ev.key === 'Enter') {{ ev.preventDefault(); apply(); inp.blur(); }}
-          ev.stopPropagation();  // don't nudge/slide while typing
+        rIn.addEventListener('change', applyReveal);
+        rIn.addEventListener('keydown', (ev) => {{
+          if (ev.key === 'Enter') {{ ev.preventDefault(); applyReveal(); rIn.blur(); }}
+          ev.stopPropagation();
         }});
-        inp.addEventListener('pointerdown', (ev) => ev.stopPropagation());
-      }};
-      commitNum('tb-z', 'z');
-      commitNum('tb-order', 'order');
+        rIn.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+      }}
       document.getElementById('tb-reset').addEventListener('click', () => {{
         if (!editSel) return;
         const elId = selElId();
         editSel.style.cssText = '';
+        editSel.removeAttribute('data-reveal');
         sendLayoutPatch(elId, {{ x: null, y: null, w: null, h: null, z: null,
-                                order: null, fs: null, ff: null, align: null }});
+                                order: null, reveal: null, fs: null, ff: null, align: null }});
         updateToolbar();
       }});
     }})();
@@ -1810,7 +1924,7 @@ def generate_presenter_html(
     <strong>sslive</strong>
     <span id="status-badge" class="ok">{html_module.escape(backend_label)}</span>
     <span id="edit-badge">✎ edit</span>
-    <span style="opacity:0.7">Shift+Enter run · ←/→ slides · f fullscreen · e edit</span>
+    <span style="opacity:0.7">Shift+Enter run · ←/→ reveal then slides · f fullscreen · e edit</span>
   </div>
   <div id="viewport">
     <div id="stage">
@@ -1827,17 +1941,9 @@ def generate_presenter_html(
     <button type="button" id="tb-fs-plus" title="bigger text">A+</button>
     <select id="tb-font" title="font family"></select>
     <span class="tb-sep"></span>
-    <span class="tb-field" title="stacking order (z-index) — any integer">z
-      <input type="number" id="tb-z" step="1" />
+    <span class="tb-field" title="Reveal step: blank = always visible. 1 appears on first →, 2 on second →, …">reveal
+      <input type="number" id="tb-reveal" min="0" step="1" placeholder="—" />
     </span>
-    <button type="button" id="tb-front" title="bring forward (+1 z)">⬆ front</button>
-    <button type="button" id="tb-back" title="send backward (−1 z)">⬇ back</button>
-    <span class="tb-sep"></span>
-    <span class="tb-field" title="flex flow order — set any integer on this element">order
-      <input type="number" id="tb-order" step="1" />
-    </span>
-    <button type="button" id="tb-up" title="earlier in flow (−1 order)">↑</button>
-    <button type="button" id="tb-down" title="later in flow (+1 order)">↓</button>
     <span class="tb-sep"></span>
     <button type="button" id="tb-reset" title="clear all overrides">reset</button>
   </div>
@@ -2190,9 +2296,15 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
         if source is not None:
             _apply_source_to_deck(cell_id, source)
 
-    # Keep overlay position/size when the output block is replaced in-place
-    out_style = _el_style(_layout_spec(deck, f"el-output-{cell_id}"))
-    html = render_output_html(result.parts or [], cell_id, theme, style=out_style)
+    # Keep overlay position/size/reveal when the output block is replaced in-place
+    out_spec = _layout_spec(deck, f"el-output-{cell_id}")
+    html = render_output_html(
+        result.parts or [],
+        cell_id,
+        theme,
+        style=_el_style(out_spec),
+        extra_attrs=_reveal_attr(out_spec),
+    )
     payload = {
         "type": "sslive_result",
         "cell_id": cell_id,

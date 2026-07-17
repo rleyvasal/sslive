@@ -93,8 +93,9 @@ Overlay keyed by `el_id` (absent = flow layout, today's behavior):
    persists `w`/`h`/`x`/`y`; reset sends an all-null patch which drops the spec
    entirely; selection survives output re-render after Run)
 4. **S2-D** finer note-block elements (mistletoe path), image polish
-5. later: reveal-order fragments (`fragment_step` reserved), undo/redo,
-   multi-select, snap guides, per-slide backgrounds
+5. **reveal steps** — layout key `reveal` + →/← navigation — **done**
+   (toolbar field; blank/0 always shown; N appears when frag step ≥ N)
+6. later: undo/redo, multi-select, snap guides, per-slide backgrounds
 
 ## Risks / decisions
 

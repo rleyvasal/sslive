@@ -82,14 +82,9 @@ Notes render full markdown (bold, lists, images, code) and LaTeX
 installed — same pipeline as sslides.
 
 Selecting an element shows the **floating toolbar** (viewport-fixed, never
-scaled): **A− / A+** font size (±2 px, scales headings + body together, code
-follows via `--code-fs`), **font** dropdown (Default/Serif/Sans/Mono),
-**z** number field + **⬆ front / ⬇ back** (any integer stacking order on the
-selected element), **order** number field + **↑ / ↓** (any integer flex
-order — type the value you want, not just linear ±1), and **reset** to clear
-every override. The selected element also grows **Google Slides–style resize
-handles** (8 corners/edges): drag to grow/shrink the box (`w`/`h`); corner-drag
-on notes also scales font with the box (hold **Alt** to force font-scale on
-any element). All of it flows through the same patch bridge and persists.
+scaled): **A− / A+** font size, **font** dropdown, **reveal** step (blank =
+always visible; `1` appears on first →, `2` on second →, …), and **reset**.
+**← / →** advance *reveal steps first*, then slides. Resize uses an **external
+frame** with 8 handles *outside* the element (not clipped by cell overflow).
 
 Keep driver cells under **`%local`**.
