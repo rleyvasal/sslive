@@ -36,6 +36,11 @@ End-to-end working version for SolveIt + CRAFT. **Do not paste this file into th
 - In-memory overlay only while ✎ is on; **leave edit** (`e` / ✎ / Esc) drains patches and writes `#| sslive-layout` once
 - Still flushed before `%slive` / reload if you never left edit
 
+### Plotly keeps layout after Run
+
+- After Run, Plotly used to drop absolute `left`/`top` (new HTML always has `width:100%…`, so it replaced live geometry); matplotlib (empty style) was fine
+- `applyRunResult` now always re-applies the live output box position/size onto the replacement node
+
 ### Export (0.1.1)
 
 - `export_html("talk.html")` / `export_html_str()` / `%slive_export` — static portable player

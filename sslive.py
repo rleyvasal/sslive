@@ -3559,49 +3559,69 @@ def generate_presenter_html(
         const neu = tmp.firstElementChild;
         if (neu) {{
           const wasSel = (typeof editSel !== 'undefined' && editSel === out);
-          // Keep live layout (drag/resize) — but never keep a tiny width for viz
-          const liveStyle = out.getAttribute('style') || '';
-          const neuStyle = neu.getAttribute('style') || '';
-          // Prefer Python-baked style (includes width:100% for plotly); only copy
-          // live left/top/height when the user has positioned the box.
-          if (liveStyle && /position\\s*:\\s*absolute/i.test(liveStyle)) {{
-            const merged = neuStyle || liveStyle;
-            neu.setAttribute('style', merged);
-            // If live box was dragged narrow (< 500px), expand to full column
-            try {{
-              const mw = parseFloat((liveStyle.match(/width\\s*:\\s*([\\d.]+)px/i) || [])[1] || '0');
-              if (mw && mw < 500) {{
-                neu.style.width = '100%';
-                neu.style.maxWidth = '100%';
-              }}
-            }} catch (e) {{}}
+          // Preserve live drag/resize geometry. Plotly HTML always ships a
+          // non-empty style (width:100%;height:…); a naive "neu || live" merge
+          // dropped absolute left/top — matplotlib (empty style) looked fine.
+          const livePos = (out.style && out.style.position) || '';
+          const liveAttr = out.getAttribute('style') || '';
+          const isAbs = livePos === 'absolute'
+            || /(?:^|;)\\s*position\\s*:\\s*absolute/i.test(liveAttr);
+          if (isAbs) {{
+            neu.style.position = 'absolute';
+            neu.style.margin = out.style.margin || '0';
+            if (out.style.left) neu.style.left = out.style.left;
+            if (out.style.top) neu.style.top = out.style.top;
+            if (out.style.width) neu.style.width = out.style.width;
+            if (out.style.height) neu.style.height = out.style.height;
+            if (out.style.zIndex) neu.style.zIndex = out.style.zIndex;
+            if (out.style.overflow) neu.style.overflow = out.style.overflow;
+            if (out.style.maxWidth) neu.style.maxWidth = out.style.maxWidth;
+            // Fallback parse if style object was empty but attribute has values
+            if (!neu.style.left) {{
+              const m = liveAttr.match(/(?:^|;)\\s*left\\s*:\\s*([^;]+)/i);
+              if (m) neu.style.left = m[1].trim();
+            }}
+            if (!neu.style.top) {{
+              const m = liveAttr.match(/(?:^|;)\\s*top\\s*:\\s*([^;]+)/i);
+              if (m) neu.style.top = m[1].trim();
+            }}
+            if (!neu.style.width) {{
+              const m = liveAttr.match(/(?:^|;)\\s*width\\s*:\\s*([^;]+)/i);
+              if (m) neu.style.width = m[1].trim();
+            }}
+            if (!neu.style.height) {{
+              const m = liveAttr.match(/(?:^|;)\\s*height\\s*:\\s*([^;]+)/i);
+              if (m) neu.style.height = m[1].trim();
+            }}
           }}
+          const rev = out.getAttribute('data-reveal');
+          if (rev) neu.setAttribute('data-reveal', rev);
           out.replaceWith(neu);
-          // Ensure plotly host is large even if a prior overlay shrank the box
+          // Size plotly/iframe host to the (possibly user-resized) output box
           try {{
             const host = neu.querySelector('.sslive-plotly-host');
             const slide = neu.closest('[data-slide]');
+            const boxW = parseInt(neu.style.width, 10) || neu.clientWidth || 0;
+            const boxH = parseInt(neu.style.height, 10) || neu.clientHeight || 0;
+            const abs = neu.style.position === 'absolute';
             if (host && slide) {{
-              const colW = Math.max(400, (slide.clientWidth || 1920) - 128);
-              if (!neu.style.width || neu.clientWidth < 500) {{
+              if (!abs && (!neu.style.width || boxW < 500)) {{
                 neu.style.width = '100%';
                 neu.style.maxWidth = '100%';
               }}
-              const targetH = Math.max(
-                640,
-                parseInt(host.style.height, 10) || 0,
-                neu.clientHeight || 0
-              );
+              const targetH = abs && boxH > 80
+                ? boxH
+                : Math.max(640, parseInt(host.style.height, 10) || 0, boxH || 0);
               host.style.width = '100%';
               host.style.height = targetH + 'px';
               host.style.minHeight = targetH + 'px';
-              // if absolute and no left set, keep flow-like full width
-              void colW;
             }}
             const ifr = neu.querySelector('iframe.sslive-viz-frame');
             if (ifr) {{
-              const boxH = neu.clientHeight || 0;
-              const h = boxH > 120 ? Math.max(240, boxH - 4) : (parseInt(ifr.style.height, 10) || 680);
+              const h = (abs && boxH > 120)
+                ? Math.max(240, boxH - 4)
+                : (boxH > 120 ? Math.max(240, boxH - 4)
+                  : (parseInt(ifr.style.height, 10) || 680));
               ifr.style.width = '100%';
               ifr.style.height = h + 'px';
               ifr.style.minHeight = h + 'px';
