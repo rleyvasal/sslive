@@ -89,22 +89,32 @@ Do not paste `sslive.py` into a dialog cell — only `%run` it.
 
 ## Export portable HTML
 
-After authoring in SolveIt (layout + ▶ Run for outputs you want frozen):
-
-```python
-export_html("talk.html")                 # write file
-export_html("talk.html", title="Demo")
-html = export_html_str()                 # string only
-```
-
-Or:
+Under **`%gpu`**, bare Python runs on the remote kernel — `export_html` is **not** defined there. Use the **local magic** (same idea as `%slive`):
 
 ```text
-%slive_export talk.html
+%gpu
+%slive                      # open deck, run cells as needed
+%slive_export talk.html     # host-local — works under %gpu
 %slive_export talk.html title=Demo
 ```
 
+If you prefer a Python call, flip host first:
+
+```text
+%local
+export_html("talk.html")
+%gpu
+```
+
 Open `talk.html` in any browser — **no SolveIt / CRAFT / GPU**. Snapshot only: re-export after you change slides or re-run cells.
+
+Reload host code after pulling changes:
+
+```text
+%local
+%run path/to/sslive.py
+%gpu
+```
 
 | Included | Not included (v1) |
 |----------|-------------------|

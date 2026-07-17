@@ -2222,11 +2222,18 @@ def _pick_port(start: int = 8100, span: int = 50) -> int:
 
 
 def _mark_slive_local_magic() -> None:
-    """Tell CRAFT/SolveIt that %slive must run on the *host* under %gpu mode."""
+    """Tell CRAFT/SolveIt that %slive / %slive_export run on the *host* under %gpu."""
     if get_ipython is None:
         return
     ip = get_ipython()
-    names = ("%slive", "slive", "%sslive", "sslive")
+    names = (
+        "%slive",
+        "slive",
+        "%sslive",
+        "sslive",
+        "%slive_export",
+        "slive_export",
+    )
     # CRAFT helper
     try:
         reg = (ip.user_ns or {}).get("register_local_magic")
@@ -6286,14 +6293,16 @@ def _run_slive_from_magic(line: str = "") -> Any:
 
 
 def _run_slive_export_magic(line: str = "") -> Any:
-    """``%slive_export path.html`` — write portable static HTML of the current deck."""
+    """``%slive_export path.html`` — host-local; works under ``%gpu``.
+
+    Under ``%gpu``, bare ``export_html(...)`` runs on the *remote* kernel and
+    fails with NameError. This magic always runs on the SolveIt host where the
+    deck session lives.
+    """
     line = (line or "").strip()
-    if not line:
-        print("usage: %slive_export talk.html  [title=...]")
-        return None
-    # first token = path; optional title=...
-    parts = line.split()
-    path = parts[0]
+    # first token = path; optional title=... / offline
+    parts = line.split() if line else []
+    path = parts[0] if parts else "sslive-export.html"
     title = None
     offline = False
     for p in parts[1:]:
@@ -6301,6 +6310,14 @@ def _run_slive_export_magic(line: str = "") -> Any:
             title = p.split("=", 1)[1].strip("\"'")
         elif p in ("--offline", "offline=1", "offline"):
             offline = True
+    if _SESSION.get("deck") is None:
+        print(
+            "sslive: no deck in host session — open slides first:\n"
+            "  %slive\n"
+            "then export with:\n"
+            "  %slive_export talk.html"
+        )
+        return None
     try:
         return export_html(path, title=title, offline=offline)
     except Exception as e:
@@ -6308,10 +6325,35 @@ def _run_slive_export_magic(line: str = "") -> Any:
         return None
 
 
-def _register_slive_magic(*, quiet: bool = True) -> bool:
-    """Install ``%slive`` and mark it local for ``%gpu`` mode.
+def _inject_public_api_into_user_ns() -> None:
+    """Expose export helpers on the *host* user_ns (for %local cells).
 
-    Always re-registers (safe) so ``%run`` then ``%gpu`` still finds the magic.
+    Under ``%gpu``, prefer ``%slive_export`` (local magic) — bare names still
+    execute on the remote kernel.
+    """
+    if get_ipython is None:
+        return
+    ip = get_ipython()
+    if ip is None or not isinstance(getattr(ip, "user_ns", None), dict):
+        return
+    ns = ip.user_ns
+    for name, obj in (
+        ("export_html", export_html),
+        ("export_html_str", export_html_str),
+        ("export_html_a", export_html_a),
+        ("generate_export_html", generate_export_html),
+        ("slive", slive),
+        ("hold_dialog_focus", hold_dialog_focus),
+        ("layout_status", layout_status),
+        ("cleanup_layout_notes", cleanup_layout_notes),
+    ):
+        ns[name] = obj
+
+
+def _register_slive_magic(*, quiet: bool = True) -> bool:
+    """Install ``%slive`` / ``%slive_export`` and mark them local for ``%gpu``.
+
+    Always re-registers (safe) so ``%run`` then ``%gpu`` still finds the magics.
     Returns True on success.
     """
     if get_ipython is None:
@@ -6357,15 +6399,11 @@ def _register_slive_magic(*, quiet: bool = True) -> bool:
         except Exception as e:
             _SESSION["_magic_reg_err"] = f"Magics class: {e}"
 
-    # Critical under %gpu: route magic to host, not remote kernel
+    # Critical under %gpu: route magics to host, not remote kernel
     _mark_slive_local_magic()
     _ensure_local_magic()
-    # Also mark export magic local
     try:
-        reg = (ip.user_ns or {}).get("register_local_magic")
-        if callable(reg):
-            reg("%slive_export")
-            reg("slive_export")
+        _inject_public_api_into_user_ns()
     except Exception:
         pass
 
@@ -6379,7 +6417,10 @@ def _register_slive_magic(*, quiet: bool = True) -> bool:
                     "sslive: %slive failed to register — use: await slive()"
                 )
         elif not quiet:
-            print("sslive: %slive ready (local magic — works under %gpu)")
+            print(
+                "sslive: %slive / %slive_export ready "
+                "(local magics — work under %gpu)"
+            )
     except Exception:
         pass
 
