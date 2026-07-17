@@ -1246,17 +1246,25 @@ def _plotly_spec_to_html(spec: Any) -> str:
     # Self-contained: works inside nested iframe OR presenter (has Plotly CDN).
     return (
         f'<div id="{uid}" class="plotly-graph-div js-plotly-plot" '
-        f'style="width:100%;height:400px;"></div>'
+        f'style="width:100%;height:100%;min-height:480px;"></div>'
         f"<script>(function(){{"
         f"var id={json.dumps(uid)};"
         f"var b64={json.dumps(b64)};"
         f"function u8(s){{var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;}}"
         f"var spec=JSON.parse(new TextDecoder('utf-8').decode(u8(atob(b64))));"
-        f"var data=spec.data||[];var layout=spec.layout||{{}};var cfg=Object.assign({{responsive:true}},spec.config||{{}});"
+        f"var data=spec.data||[];var layout=Object.assign({{}},spec.layout||{{}});"
+        # Fill the host iframe — fixed layout.height from fig.show makes tiny plots
+        f"layout.autosize=true;delete layout.height;delete layout.width;"
+        f"var cfg=Object.assign({{responsive:true,displayModeBar:true}},spec.config||{{}});"
         f"function draw(){{var gd=document.getElementById(id);if(!gd)return;"
-        f"if(window.Plotly){{try{{window.Plotly.newPlot(gd,data,layout,cfg);}}catch(e){{gd.textContent=String(e);}}}}"
+        f"if(window.Plotly){{try{{window.Plotly.newPlot(gd,data,layout,cfg).then(function(){{"
+        f"try{{window.Plotly.Plots.resize(gd);}}catch(e){{}};"
+        f"}});}}catch(e){{gd.textContent=String(e);}}}}"
         f"else setTimeout(draw,40);}}"
-        f"draw();}})();</script>"
+        f"draw();"
+        f"window.addEventListener('resize',function(){{var gd=document.getElementById(id);"
+        f"if(gd&&window.Plotly)try{{window.Plotly.Plots.resize(gd);}}catch(e){{}}}});"
+        f"}})();</script>"
     )
 
 
@@ -1364,7 +1372,24 @@ def _scrub_output_html(html: str) -> str:
     return html
 
 
-def _isolate_rich_html(html: str, *, min_height: int = 420) -> str:
+# Default viz frame height in design-space px (stage is 1920×1080).
+_DEFAULT_VIZ_H = 560
+
+
+def _height_px_from_style(style: str) -> int | None:
+    """Parse ``height: Npx`` from an inline style string, if present."""
+    if not style:
+        return None
+    m = re.search(r"(?:^|;)\s*height\s*:\s*([\d.]+)\s*px", style, flags=re.I)
+    if not m:
+        return None
+    try:
+        return max(80, int(float(m.group(1))))
+    except (TypeError, ValueError):
+        return None
+
+
+def _isolate_rich_html(html: str, *, min_height: int | None = None) -> str:
     """Sandbox Plotly/script HTML in a nested iframe (pointcloud-style).
 
     Parent SolveIt uses HTMX; injecting raw Plotly HTML there mangles CDN
@@ -1377,6 +1402,8 @@ def _isolate_rich_html(html: str, *, min_height: int = 420) -> str:
     if not _looks_like_rich_html(html):
         return html
 
+    h = int(min_height or _DEFAULT_VIZ_H)
+    h = max(240, min(h, 1000))
     has_plotly = _looks_like_plotly(html)
     head_extra = ""
     if has_plotly:
@@ -1384,13 +1411,29 @@ def _isolate_rich_html(html: str, *, min_height: int = 420) -> str:
             '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" '
             'charset="utf-8"></script>\n'
         )
+    # 100% chain so Plotly fills the iframe (avoids tiny white plot card)
     doc = (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\n"
         f"{head_extra}"
-        "<style>html,body{margin:0;padding:0;width:100%;min-height:100%;"
-        "background:#0b1220;color:#e5e7eb;overflow:auto}"
-        ".plotly-graph-div,.js-plotly-plot{width:100%!important}</style>\n"
-        f"</head><body>\n{html}\n</body></html>"
+        "<style>"
+        "html,body{margin:0;padding:0;width:100%;height:100%;"
+        "background:#0b1220;color:#e5e7eb;overflow:hidden}"
+        "body{display:flex;flex-direction:column}"
+        ".plotly-graph-div,.js-plotly-plot,"
+        ".plot-container,.svg-container{width:100%!important;height:100%!important;"
+        "flex:1 1 auto;min-height:0}"
+        "/* fig.show() wrappers */ body>div{flex:1 1 auto;min-height:0;width:100%;height:100%}"
+        "</style>\n"
+        f"</head><body>\n{html}\n"
+        "<script>(function(){"
+        "function rz(){if(!window.Plotly)return;"
+        "document.querySelectorAll('.js-plotly-plot,.plotly-graph-div').forEach(function(gd){"
+        "try{window.Plotly.Plots.resize(gd);}catch(e){}});"
+        "}"
+        "window.addEventListener('load',function(){setTimeout(rz,50);setTimeout(rz,300);});"
+        "window.addEventListener('resize',rz);"
+        "})();</script>"
+        "</body></html>"
     )
     raw = doc.encode("utf-8")
     if len(raw) > _MAX_ISOLATED_HTML_BYTES:
@@ -1404,7 +1447,7 @@ def _isolate_rich_html(html: str, *, min_height: int = 420) -> str:
     return (
         f'<iframe class="sslive-viz-frame" '
         f'sandbox="allow-scripts allow-same-origin allow-popups" '
-        f'style="width:100%;min-height:{min_height}px;height:{min_height}px;'
+        f'style="width:100%;height:{h}px;min-height:{h}px;'
         f'border:0;border-radius:8px;background:#0b1220;display:block" '
         f'src="data:text/html;base64,{b64}" '
         f'title="cell output"></iframe>'
@@ -1436,6 +1479,10 @@ def render_output_html(
         "max-width:100%;max-height:24rem;object-fit:contain;display:block;margin:0.5rem 0;",
     )
 
+    # When the output box has an explicit layout height, fill it; else a roomy default.
+    layout_h = _height_px_from_style(style)
+    viz_h = max(240, layout_h - 8) if layout_h else _DEFAULT_VIZ_H
+
     chunks: list[str] = []
     for p in parts:
         if p.kind == "stream":
@@ -1448,10 +1495,11 @@ def render_output_html(
             )
         elif p.kind == "text/html":
             # Isolate Plotly/scripts like %pointcloud (iframe), never dump into parent HTMX
-            body = _isolate_rich_html(p.text or "")
+            body = _isolate_rich_html(p.text or "", min_height=viz_h)
+            fill = "height:100%;" if layout_h else f"min-height:{viz_h}px;"
             chunks.append(
-                f'<div class="sslive-html" style="width:100%;min-height:360px;'
-                f'overflow:auto">{body}</div>'
+                f'<div class="sslive-html sslive-html-viz" style="width:100%;{fill}'
+                f'overflow:hidden">{body}</div>'
             )
         elif p.kind == "text/plain":
             chunks.append(f'<pre style="{out_st}">{html_module.escape(p.text)}</pre>')
@@ -2154,16 +2202,22 @@ def generate_presenter_html(
     .note-block pre code {{ background:none; border:0; padding:0; }}
     .note-block img {{ max-width:100%; }}
     .sslive-html {{ width:100%; max-width:100%; }}
-    .sslive-html iframe, iframe.sslive-viz-frame {{ width:100%; min-height:420px; height:56vh; border:0;
-      border-radius:8px; background:#0b1220; display:block; }}
+    .sslive-html-viz {{ display:flex; flex-direction:column; }}
+    .sslive-html iframe, iframe.sslive-viz-frame {{ width:100%; min-height:560px; border:0;
+      border-radius:8px; background:#0b1220; display:block; flex:1 1 auto; }}
+    /* When the output box has an explicit layout height, fill it */
+    [data-type="output"] {{ display:flex; flex-direction:column; min-height:0; }}
+    [data-type="output"] .sslive-html-viz {{ flex:1 1 auto; min-height:0; }}
+    [data-type="output"] .sslive-html-viz iframe.sslive-viz-frame {{ height:100%; min-height:240px; }}
     .sslive-html canvas, .sslive-html video {{ max-width:100%; height:auto; }}
     .note-block a {{ color:#60a5fa; }}
     .note-block blockquote {{ border-left:3px solid #4b5563; margin:0.5rem 0;
       padding:0 0 0 0.8em; color:{theme.get("muted", "#9ca3af")}; }}
     .note-block .math-block {{ text-align:center; margin:0.8em 0; }}
     .note-block math {{ font-size:1.1em; }}
+    /* Code box: size to toolbar + one-line textarea — do not flex-grow after Run */
     .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
-      padding:8px 12px; outline:none; }}
+      padding:8px 12px; outline:none; flex:0 0 auto; align-self:stretch; max-width:100%; }}
     .code-wrap.selected {{ border-color:#60a5fa; box-shadow:0 0 0 2px rgba(96,165,250,0.35); }}
     .code-toolbar {{ display:flex; align-items:center; gap:12px; margin-bottom:6px; flex-wrap:wrap; }}
     .run-btn {{ cursor:pointer; background:#2563eb; color:white; border:0; border-radius:6px;
@@ -2388,7 +2442,17 @@ def generate_presenter_html(
       if (btn) btn.disabled = !!disabled;
     }}
 
+    function collapseCodeTa(cellId) {{
+      // Keep the code box one-line unless the user hand-resized it (userSized).
+      const ta = document.querySelector('textarea.code-ta[data-cell-id="' + cellId + '"]');
+      if (!ta || ta.dataset.userSized === '1') return;
+      try {{ if (document.activeElement === ta) ta.blur(); }} catch (e) {{}}
+      codeTaBlur(ta);
+    }}
+
     function setRunning(cellId, msg) {{
+      // Collapse code while running so ▶ Run never leaves a tall editor open
+      collapseCodeTa(cellId);
       const out = document.getElementById('el-output-' + cellId);
       if (out) {{
         out.innerHTML = '<pre style="background:#1f2937;color:#fbbf24;padding:0.5rem;' +
@@ -2475,8 +2539,21 @@ def generate_presenter_html(
         const neu = tmp.firstElementChild;
         if (neu) {{
           const wasSel = (typeof editSel !== 'undefined' && editSel === out);
+          // Keep live layout (drag/resize) on the output box across replace
+          const liveStyle = out.getAttribute('style');
+          if (liveStyle) neu.setAttribute('style', liveStyle);
           out.replaceWith(neu);
           sanitizeAndActivateOutput(neu);
+          // Size viz iframe to the output box (layout h or default min)
+          try {{
+            const boxH = neu.clientHeight || 0;
+            const ifr = neu.querySelector('iframe.sslive-viz-frame');
+            if (ifr) {{
+              const h = boxH > 120 ? Math.max(240, boxH - 4) : (parseInt(ifr.style.height, 10) || 560);
+              ifr.style.height = h + 'px';
+              ifr.style.minHeight = h + 'px';
+            }}
+          }} catch (e) {{}}
           if (wasSel) selectEl(neu);  // keep selection/handle on the fresh node
         }}
       }}
@@ -2487,8 +2564,12 @@ def generate_presenter_html(
         // only sync source from Python if textarea was not focused
         if (document.activeElement !== ta) ta.value = msg.source;
       }}
-      if (ta && msg.keep_focus !== false) {{
+      // After Run: stay collapsed (one line). Only expand when the user focuses
+      // to edit, or when they hand-resized (userSized) / keep_focus is true.
+      if (ta && msg.keep_focus === true) {{
         try {{ ta.focus({{ preventScroll: true }}); }} catch (e) {{ try {{ ta.focus(); }} catch (e2) {{}} }}
+      }} else {{
+        collapseCodeTa(cellId);
       }}
       const badge = document.getElementById('status-badge');
       if (badge) {{
@@ -3515,7 +3596,8 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
         # Empty string keeps older slide JS from treating missing html as null
         "html": "",
         "ok": bool(result.ok),
-        "keep_focus": True,
+        # False: keep code box one-line after Run (expand only on user focus/resize)
+        "keep_focus": False,
         "source": source,
         "t": int(time.time() * 1000),
         "slide_index": int(_SESSION.get("slide_index") or 0),
