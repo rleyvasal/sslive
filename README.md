@@ -162,7 +162,7 @@ Edit-mode **move / resize / font / reveal** is stored in **one** hidden dialog n
 { "version": 1, "elements": { "el-code-_abc": {"x":120,"y":80,"w":900}, ... } }
 ```
 
-**When it saves:** while ✎ edit is on, positions update live on the slide (and in memory). The dialog note is written when you **leave edit mode** (`e` / ✎ / Esc). Also flushed automatically before a new `%slive` / reload so you do not lose work if you never toggled edit off.
+**When it saves:** while ✎ edit is on, positions update live on the slide (and in memory). The dialog note is written when you **leave edit mode** (`e` or ✎ again). Also flushed automatically before a new `%slive` / reload so you do not lose work if you never toggled edit off.
 
 - **Created automatically at the end of `%slive`** if none exists (empty overlay is fine).
 - **`skipped=1`** (red eye — not in LLM / not a slide).
