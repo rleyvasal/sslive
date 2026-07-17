@@ -5215,10 +5215,13 @@ def _show_run_panel(deck: Deck) -> None:
 
 
 def _show_presenter(port: int | None, height: str = "720px"):
-    """Embed deck (srcdoc) with in-slide editors + Run bridge — no extra chatter.
+    """Embed deck (srcdoc) — **one** iframe paint, no dialog ``update_msg``.
 
-    Reuses the existing display handle when present so a second ``%slive`` does
-    not stack / flash multiple iframe loads.
+    Callers should red-eye the launcher **before** this (or not at all after),
+    because ``update_msg(skipped=1)`` after display reloads the srcdoc (2nd flash).
+
+    Reuses the existing display handle when present so a re-``%slive`` updates
+    in place instead of stacking outputs.
     """
     if isinstance(height, int):
         height = f"{height}px"
@@ -5228,9 +5231,15 @@ def _show_presenter(port: int | None, height: str = "720px"):
 
     try:
         reuse = _SESSION.get("presenter_handle") is not None
-        handle = _display_presenter_html(
-            _presenter_iframe_html(height, port=port), update=reuse
-        )
+        html_str = _presenter_iframe_html(height, port=port)
+        # First show in this kernel: clear_output(wait=True) so the next display
+        # is a single swap (avoids stacking old previews).
+        if not reuse and clear_output is not None:
+            try:
+                clear_output(wait=True)
+            except Exception:
+                pass
+        handle = _display_presenter_html(html_str, update=reuse)
         if handle is not None:
             _SESSION["presenter_handle"] = handle
     except Exception as e:
@@ -5660,31 +5669,63 @@ async def slive(
     _SESSION["auto_sync_dialog"] = True  # deferred update_msg after Run
 
     if embed:
-        # ── Single paint of the deck ──────────────────────────────────────
-        # Skip / layout housekeeping is deferred and wrapped in hold_dialog_focus
-        # (same helper as code-cell write-back) so focus stays on the preview.
-        _show_presenter(port, height=height)
+        # ── Aim for a single iframe paint ─────────────────────────────────
+        # Flash #2 was always ``update_msg(skipped=1)`` *after* display (SolveIt
+        # re-mounts the cell output). So: red-eye *before* show when needed,
+        # show once, never skip after the iframe is on screen.
+        _start_bridge()
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         _SESSION["launcher_msg_id"] = mid
 
-        async def _deferred_slive_housekeeping(launcher_mid=mid):
+        already_skipped = False
+        if mid:
+            prev = _SESSION.get("skipped_launcher_id")
+            already_skipped = bool(
+                prev and str(prev).lstrip("_") == str(mid).lstrip("_")
+            )
+        if mid and not already_skipped:
+            # Metadata only — no iframe yet, so this is not a second slide load
             try:
-                # Let the first iframe paint settle before any update_msg
-                await asyncio.sleep(0.7)
                 async with hold_dialog_focus(
-                    ms=8000, refocus=True, soft=True, settle=0.1
+                    ms=4000, refocus=False, soft=True, settle=0.0
                 ):
-                    # quiet skip: outer hold owns refocus (avoid double refocus)
-                    await _skip_msg(launcher_mid, settle=0.0, quiet=True)
+                    await _call_update_msg(id=str(mid), skipped=1)
+                _SESSION["skipped_launcher_id"] = str(mid)
+            except Exception:
+                try:
+                    alt = (
+                        str(mid)[1:]
+                        if str(mid).startswith("_")
+                        else "_" + str(mid)
+                    )
+                    async with hold_dialog_focus(
+                        ms=4000, refocus=False, soft=True, settle=0.0
+                    ):
+                        await _call_update_msg(id=alt, skipped=1)
+                    _SESSION["skipped_launcher_id"] = alt
+                except Exception as e:
+                    _SESSION["_skip_before_show_err"] = str(e)
+
+        # The only full preview mount/update in this path
+        _show_presenter(port, height=height)
+
+        # Layout note is a *different* dialog message — create if missing only.
+        # Never touch the launcher cell again (would re-flash the iframe).
+        async def _deferred_layout_only():
+            try:
+                await asyncio.sleep(0.5)
+                async with hold_dialog_focus(
+                    ms=6000, refocus=True, soft=True, settle=0.08
+                ):
                     await ensure_layout_note(quiet=True)
             except Exception as e:
                 _SESSION["_slive_housekeeping_err"] = str(e)
 
         try:
-            asyncio.get_running_loop().create_task(_deferred_slive_housekeeping())
+            asyncio.get_running_loop().create_task(_deferred_layout_only())
         except RuntimeError:
             try:
-                await _deferred_slive_housekeeping()
+                await _deferred_layout_only()
             except Exception as e:
                 _SESSION["_slive_housekeeping_err"] = str(e)
     else:
