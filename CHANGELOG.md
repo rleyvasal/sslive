@@ -28,6 +28,7 @@ End-to-end working version for SolveIt + CRAFT. **Do not paste this file into th
 - Live code stays a one-line bar; click/focus opens floating ~6-line editor (editable, SE-resize, Run/Shift+Enter, Esc)
 - Layout height no longer makes code chrome tall; edit-mode resize ignores height on code cells
 - **reset** restores original **size and position** (back to document flow); code+output reset **together** so one does not jump while the other stays absolute
+- Edit drag: pin **all** in-flow siblings at their visual boxes before one leaves the flex stack; raise z-index of the dragged element (no more code slipping under the plot)
 
 ### Export (0.1.1)
 

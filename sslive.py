@@ -3835,10 +3835,75 @@ def generate_presenter_html(
       }} catch (e) {{}}
     }}
 
-    function ensureAbs(el) {{
-      // Pin a flow element at its current visual spot (no jump); freeze the
-      // rendered width so text keeps its wrap after leaving the flex flow.
+    function slideLayoutEls(slide) {{
+      if (!slide) return [];
+      return Array.from(slide.querySelectorAll(
+        '.note-block, .code-wrap, [data-type="output"]'
+      ));
+    }}
+
+    function pinFlowElements(slide) {{
+      // Freeze every still-in-flow element at its current visual box BEFORE any
+      // one of them leaves the flex stack. Otherwise dragging the plot takes it
+      // out of flow and the code bar reflows into that hole (looks like it
+      // "moved" or slipped behind the viz).
+      if (!slide) return;
+      const sr = slide.getBoundingClientRect();
+      const sc = sr.width / 1920 || 1;
+      const snaps = slideLayoutEls(slide).map((el) => {{
+        const er = el.getBoundingClientRect();
+        const cs = window.getComputedStyle(el);
+        return {{
+          el: el,
+          elId: el.dataset.elId || el.id,
+          x: Math.round((er.left - sr.left) / sc),
+          y: Math.round((er.top - sr.top) / sc),
+          w: Math.max(1, Math.round(er.width / sc)),
+          h: Math.max(1, Math.round(er.height / sc)),
+          needsPin: cs.position !== 'absolute',
+        }};
+      }});
+      snaps.forEach((s) => {{
+        if (!s.needsPin || !s.elId) return;
+        const el = s.el;
+        const isCode = el.classList.contains('code-wrap')
+          || el.dataset.type === 'code';
+        el.style.position = 'absolute';
+        el.style.margin = '0';
+        el.style.left = s.x + 'px';
+        el.style.top = s.y + 'px';
+        el.style.width = s.w + 'px';
+        const patch = {{ x: s.x, y: s.y, w: s.w }};
+        // Code bars stay content-tall (one-line); pin h for notes/outputs only
+        if (!isCode) {{
+          el.style.height = s.h + 'px';
+          el.style.overflow = 'auto';
+          patch.h = s.h;
+        }}
+        sendLayoutPatch(s.elId, patch);
+      }});
+    }}
+
+    function bringToFront(el) {{
+      // Dragged/resized element stacks above siblings (avoids "behind the plot")
+      if (!el) return;
       const slide = el.closest('[data-slide]');
+      if (!slide) return;
+      let maxZ = 0;
+      slideLayoutEls(slide).forEach((e) => {{
+        const z = parseInt(e.style.zIndex || '0', 10);
+        if (Number.isFinite(z) && z > maxZ) maxZ = z;
+      }});
+      const nz = maxZ + 1;
+      el.style.zIndex = String(nz);
+      sendLayoutPatch(el.dataset.elId || el.id, {{ z: nz }});
+    }}
+
+    function ensureAbs(el) {{
+      // Pin all in-flow siblings first (same visual places), then ensure this
+      // element is absolute. Never leave mixed flow+absolute on a drag.
+      const slide = el.closest('[data-slide]');
+      if (slide) pinFlowElements(slide);
       const sr = slide.getBoundingClientRect();
       const er = el.getBoundingClientRect();
       const sc = sr.width / 1920 || 1;
@@ -3851,10 +3916,20 @@ def generate_presenter_html(
         el.style.width = w + 'px';
         el.style.position = 'absolute';
         el.style.margin = '0';
+        el.style.left = x + 'px';
+        el.style.top = y + 'px';
+      }} else {{
+        // Already absolute (possibly just pinned); keep numeric left/top
+        if (!el.style.left) el.style.left = x + 'px';
+        if (!el.style.top) el.style.top = y + 'px';
       }}
-      el.style.left = x + 'px';
-      el.style.top = y + 'px';
-      return {{ x: x, y: y, w: w, h: h, converted: converted }};
+      const fx = Math.round(parseFloat(el.style.left));
+      const fy = Math.round(parseFloat(el.style.top));
+      return {{
+        x: Number.isFinite(fx) ? fx : x,
+        y: Number.isFinite(fy) ? fy : y,
+        w: w, h: h, converted: converted
+      }};
     }}
 
     function beginDrag(el, ev) {{
@@ -3945,6 +4020,7 @@ def generate_presenter_html(
         const el = editSel;  // handles live on #rs-box, not inside the element
         if (!el) return;
         const start = ensureAbs(el);
+        bringToFront(el);
         const slide = el.closest('[data-slide]');
         const sc = slide ? (slide.getBoundingClientRect().width / 1920 || 1) : 1;
         // Prefer explicit layout size; fall back to measured box.
@@ -4000,7 +4076,9 @@ def generate_presenter_html(
       if (!drag) return;
       if (!drag.started) {{
         if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) <= 2) return;
+        // Pin siblings at current spots, then lift this element above them
         const start = ensureAbs(drag.el);
+        bringToFront(drag.el);
         drag.ox = start.x; drag.oy = start.y;
         drag.w = start.w; drag.includeW = start.converted;
         drag.started = true;
