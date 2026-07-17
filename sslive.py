@@ -18,6 +18,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import base64
 import html as html_module
 import inspect
 import json
@@ -807,12 +808,7 @@ def make_capture_hook(
             parts.append(OutputPart(kind="error", text=_strip_ansi(tb)))
         elif msg_type in ("display_data", "update_display_data", "execute_result"):
             data = content.get("data", {}) or {}
-            if "image/png" in data:
-                parts.append(OutputPart(kind="image/png", b64=_as_str(data["image/png"])))
-            elif "text/html" in data:
-                parts.append(OutputPart(kind="text/html", text=_as_str(data["text/html"])))
-            elif "text/plain" in data:
-                parts.append(OutputPart(kind="text/plain", text=_as_str(data["text/plain"])))
+            parts.extend(_display_data_to_parts(data))
         elif msg_type == "clear_output":
             parts.clear()
 
@@ -847,7 +843,11 @@ def _code_has_ipy_magic(code: str) -> bool:
 
 
 def _display_data_to_parts(data: dict) -> list[OutputPart]:
-    """Convert a MIME bundle to OutputPart list (prefer rich types)."""
+    """Convert a MIME bundle to OutputPart list (prefer rich types).
+
+    Prefer ``application/vnd.plotly.v1+json`` over Plotly's full ``text/html``
+    (which embeds CDN tags that SolveIt's parent HTMX mangles).
+    """
     if not data:
         return []
     # Normalize keys that may be AttrDict / bytes
@@ -869,6 +869,18 @@ def _display_data_to_parts(data: dict) -> list[OutputPart]:
     if "image/svg+xml" in data:
         svg = _as_str(data["image/svg+xml"])
         return [OutputPart(kind="text/html", text=svg)]
+    # Structured Plotly figure — compact + safe (no CDN HTML for parent HTMX)
+    for key in (
+        "application/vnd.plotly.v1+json",
+        "application/vnd.plotly.v1+json; charset=utf-8",
+    ):
+        if key in data:
+            return [
+                OutputPart(
+                    kind="text/html",
+                    text=_plotly_spec_to_html(data[key]),
+                )
+            ]
     if "text/html" in data:
         return [OutputPart(kind="text/html", text=_as_str(data["text/html"]))]
     if "application/javascript" in data:
@@ -996,16 +1008,10 @@ class LiveExecutor:
                     published.append(dict(data) if not isinstance(data, dict) else data)
             except Exception:
                 pass
-            # call through to original if present
-            orig = getattr(_on_publish, "_orig", None)
-            if callable(orig):
-                try:
-                    return orig(data, metadata=metadata, source=source, **kwargs)
-                except TypeError:
-                    try:
-                        return orig(data, metadata=metadata)
-                    except Exception:
-                        pass
+            # Do NOT call the original display_pub. Forwarding Plotly/HTML into
+            # SolveIt's dialog lets parent HTMX parse CDN tags (mangled
+            # %22https://cdn.plot.ly … oobSwap errors) and freezes the page
+            # while the slide spinner stays on "Running on GPU…".
             return None
 
         try:
@@ -1203,10 +1209,102 @@ class LiveExecutor:
 # Output → HTML fragment (presenter swap target)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Soft cap for in-slide rich HTML (base64 data-URL). Larger freezes dialoghelper
+# iife / the parent page — pointcloud stays small (URL iframe); Plotly HTML does not.
+_MAX_ISOLATED_HTML_BYTES = 1_800_000
+
+
+def _plotly_spec_to_html(spec: Any) -> str:
+    """Build a thin Plotly mount from structured figure JSON (no CDN tags)."""
+    try:
+        if isinstance(spec, (bytes, bytearray)):
+            spec = spec.decode("utf-8", errors="replace")
+        if isinstance(spec, str):
+            # May already be JSON text
+            try:
+                obj = json.loads(spec)
+            except Exception:
+                obj = None
+                payload = spec
+            else:
+                payload = json.dumps(obj, separators=(",", ":"))
+        else:
+            payload = json.dumps(spec, separators=(",", ":"))
+    except Exception as e:
+        return (
+            f'<pre style="color:#fecaca;background:#7f1d1d;padding:0.5rem;'
+            f'border-radius:6px">plotly spec encode failed: {html_module.escape(str(e))}</pre>'
+        )
+    if len(payload) > _MAX_ISOLATED_HTML_BYTES:
+        return (
+            '<pre style="color:#fecaca;background:#7f1d1d;padding:0.5rem;'
+            f'border-radius:6px;white-space:pre-wrap">Plotly figure too large '
+            f"({len(payload) // 1024} KB). Downsample the series or use a static image.</pre>"
+        )
+    uid = f"pl-{abs(hash(payload)) % (10**12):x}"
+    b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    # Self-contained: works inside nested iframe OR presenter (has Plotly CDN).
+    return (
+        f'<div id="{uid}" class="plotly-graph-div js-plotly-plot" '
+        f'style="width:100%;height:400px;"></div>'
+        f"<script>(function(){{"
+        f"var id={json.dumps(uid)};"
+        f"var b64={json.dumps(b64)};"
+        f"function u8(s){{var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;}}"
+        f"var spec=JSON.parse(new TextDecoder('utf-8').decode(u8(atob(b64))));"
+        f"var data=spec.data||[];var layout=spec.layout||{{}};var cfg=Object.assign({{responsive:true}},spec.config||{{}});"
+        f"function draw(){{var gd=document.getElementById(id);if(!gd)return;"
+        f"if(window.Plotly){{try{{window.Plotly.newPlot(gd,data,layout,cfg);}}catch(e){{gd.textContent=String(e);}}}}"
+        f"else setTimeout(draw,40);}}"
+        f"draw();}})();</script>"
+    )
+
+
+def _looks_like_plotly(html: str) -> bool:
+    h = (html or "").lower()
+    return any(
+        s in h
+        for s in (
+            "plotly.newplot",
+            "plotly.react",
+            "plotly-graph-div",
+            "js-plotly-plot",
+            "cdn.plot.ly",
+            "plotlycdn",
+            "plotly-latest",
+            "plotly-2.",
+        )
+    )
+
+
+def _looks_like_rich_html(html: str) -> bool:
+    """True when content should run in an isolated nested iframe (not parent DOM)."""
+    h = html or ""
+    if not h.strip():
+        return False
+    # Already a single top-level iframe (e.g. %pointcloud) — leave alone
+    stripped = h.strip()
+    if re.match(r"^<iframe\b", stripped, re.I):
+        # only isolate further if it embeds plotly inline rather than a src URL
+        if not _looks_like_plotly(h) and "srcdoc" not in h.lower():
+            return False
+    if _looks_like_plotly(h):
+        return True
+    if re.search(r"<\s*script\b", h, re.I):
+        return True
+    if re.search(r"<!DOCTYPE\s+html|<\s*html\b", h, re.I):
+        return True
+    if len(h) > 80_000:
+        return True
+    return False
+
+
 def _scrub_output_html(html: str) -> str:
     """Neutralize bits that break the slide iframe (HTMX OOB, extra Plotly CDN)."""
     if not html:
         return ""
+    # Undo prior HTMX URL mangling if content was re-captured
+    html = html.replace("%22https://", "https://").replace("%22http://", "http://")
     html = re.sub(
         r"\s+hx-swap-oob=(['\"]).*?\1",
         "",
@@ -1214,14 +1312,103 @@ def _scrub_output_html(html: str) -> str:
         flags=re.I | re.DOTALL,
     )
     html = re.sub(r"\s+data-hx-swap-oob=(['\"]).*?\1", "", html, flags=re.I | re.DOTALL)
-    # Presenter already loads Plotly — drop duplicate CDN tags (avoid 404 / race)
+    # Drop hx-* attrs entirely — never let parent HTMX process slide output
+    html = re.sub(r"\s+hx-([a-zA-Z0-9_-]+)=(['\"]).*?\2", "", html, flags=re.I | re.DOTALL)
+    html = re.sub(r"\s+data-hx-([a-zA-Z0-9_-]+)=(['\"]).*?\2", "", html, flags=re.I | re.DOTALL)
+    # Presenter / nested iframe load Plotly — drop duplicate CDN tags
     html = re.sub(
         r"<script[^>]+src=[\"'][^\"']*plotly[^\"']*[\"'][^>]*>\s*</script>",
         "",
         html,
         flags=re.I,
     )
+    # require.js plotly loaders occasionally appear in notebook HTML
+    html = re.sub(
+        r"<script[^>]*>\s*require\.config\(\s*\{[^}]*plotly[^}]*\}[\s\S]*?</script>",
+        "",
+        html,
+        flags=re.I,
+    )
+
+    # Drop *inline* full plotly.js bundles (fig.show(include_plotlyjs=True) embeds
+    # ~3MB). Nested iframe already loads the CDN; keeping the bundle freezes push.
+    def _drop_fat_plotly_script(m: re.Match) -> str:
+        body = m.group(0)
+        # Keep small Plotly.newPlot bootstrap scripts
+        if len(body) < 80_000:
+            return body
+        if re.search(r"Plotly\.newPlot|plotly-graph-div", body, re.I):
+            # Large script that still *calls* newPlot — only strip if it looks
+            # like the library itself (has module preamble / many internals)
+            if re.search(
+                r"plotly\.js|Plotly\.version|function createPlotlyComponent|"
+                r"exports\.Plotly|__webpack_require__",
+                body,
+                re.I,
+            ):
+                return "<!-- sslive: stripped embedded plotly.js -->"
+        elif re.search(
+            r"plotly\.js|Plotly\.version|__webpack_require__|define\(function",
+            body,
+            re.I,
+        ):
+            return "<!-- sslive: stripped embedded plotly.js -->"
+        return body
+
+    html = re.sub(
+        r"<script\b[^>]*>[\s\S]*?</script>",
+        _drop_fat_plotly_script,
+        html,
+        flags=re.I,
+    )
     return html
+
+
+def _isolate_rich_html(html: str, *, min_height: int = 420) -> str:
+    """Sandbox Plotly/script HTML in a nested iframe (pointcloud-style).
+
+    Parent SolveIt uses HTMX; injecting raw Plotly HTML there mangles CDN
+    URLs (``%22https://cdn.plot.ly…``) and throws oobSwap/insertBefore errors.
+    Nested ``data:text/html;base64,…`` never enters the parent DOM parser.
+    """
+    html = _scrub_output_html(html or "")
+    if not html.strip():
+        return ""
+    if not _looks_like_rich_html(html):
+        return html
+
+    has_plotly = _looks_like_plotly(html)
+    head_extra = ""
+    if has_plotly:
+        head_extra = (
+            '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" '
+            'charset="utf-8"></script>\n'
+        )
+    doc = (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\n"
+        f"{head_extra}"
+        "<style>html,body{margin:0;padding:0;width:100%;min-height:100%;"
+        "background:#0b1220;color:#e5e7eb;overflow:auto}"
+        ".plotly-graph-div,.js-plotly-plot{width:100%!important}</style>\n"
+        f"</head><body>\n{html}\n</body></html>"
+    )
+    raw = doc.encode("utf-8")
+    if len(raw) > _MAX_ISOLATED_HTML_BYTES:
+        return (
+            '<pre style="color:#fecaca;background:#7f1d1d;padding:0.5rem;'
+            'border-radius:6px;white-space:pre-wrap">'
+            f"Plotly/HTML output too large for in-slide display "
+            f"({len(raw) // 1024} KB). Downsample the series or export a static image.</pre>"
+        )
+    b64 = base64.b64encode(raw).decode("ascii")
+    return (
+        f'<iframe class="sslive-viz-frame" '
+        f'sandbox="allow-scripts allow-same-origin allow-popups" '
+        f'style="width:100%;min-height:{min_height}px;height:{min_height}px;'
+        f'border:0;border-radius:8px;background:#0b1220;display:block" '
+        f'src="data:text/html;base64,{b64}" '
+        f'title="cell output"></iframe>'
+    )
 
 
 def render_output_html(
@@ -1260,7 +1447,8 @@ def render_output_html(
                 f'<img src="data:image/png;base64,{p.b64}" style="{img_st}" alt="output"/>'
             )
         elif p.kind == "text/html":
-            body = _scrub_output_html(p.text or "")
+            # Isolate Plotly/scripts like %pointcloud (iframe), never dump into parent HTMX
+            body = _isolate_rich_html(p.text or "")
             chunks.append(
                 f'<div class="sslive-html" style="width:100%;min-height:360px;'
                 f'overflow:auto">{body}</div>'
@@ -1966,7 +2154,7 @@ def generate_presenter_html(
     .note-block pre code {{ background:none; border:0; padding:0; }}
     .note-block img {{ max-width:100%; }}
     .sslive-html {{ width:100%; max-width:100%; }}
-    .sslive-html iframe {{ width:100%; min-height:420px; height:56vh; border:0;
+    .sslive-html iframe, iframe.sslive-viz-frame {{ width:100%; min-height:420px; height:56vh; border:0;
       border-radius:8px; background:#0b1220; display:block; }}
     .sslive-html canvas, .sslive-html video {{ max-width:100%; height:auto; }}
     .note-block a {{ color:#60a5fa; }}
@@ -2223,15 +2411,31 @@ def generate_presenter_html(
       }}, 95000);
     }}
 
+    // Decode base64 payload from parent (avoids HTMX parsing raw Plotly HTML).
+    function decodeHtmlB64(b64) {{
+      if (!b64) return '';
+      try {{
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new TextDecoder('utf-8').decode(bytes);
+      }} catch (e) {{
+        try {{ return atob(b64); }} catch (e2) {{ return ''; }}
+      }}
+    }}
+
     // Re-run <script> tags after HTML inject (innerHTML does not execute them).
-    // Also strip HTMX OOB attrs that break when swapped into the slide iframe.
+    // Nested plotly iframes (data: URLs) need no activation — they self-run.
+    // Strip any HTMX attrs that slipped through.
     function sanitizeAndActivateOutput(root) {{
       if (!root) return;
       root.querySelectorAll('[hx-swap-oob],[data-hx-swap-oob]').forEach(function (n) {{
         n.removeAttribute('hx-swap-oob');
         n.removeAttribute('data-hx-swap-oob');
       }});
+      // Skip script re-injection inside isolated viz iframes (already sandboxed)
       root.querySelectorAll('script').forEach(function (old) {{
+        if (old.closest && old.closest('iframe.sslive-viz-frame')) return;
         const s = document.createElement('script');
         for (let i = 0; i < old.attributes.length; i++) {{
           const a = old.attributes[i];
@@ -2240,7 +2444,7 @@ def generate_presenter_html(
         s.text = old.textContent || '';
         old.parentNode.replaceChild(s, old);
       }});
-      // Plotly figures often need a resize after becoming visible
+      // Plotly figures (non-iframe mounts) often need a resize after inject
       try {{
         if (window.Plotly && root.querySelector) {{
           root.querySelectorAll('.js-plotly-plot, .plotly-graph-div').forEach(function (gd) {{
@@ -2260,9 +2464,14 @@ def generate_presenter_html(
       if (msg.t && msg.t <= lastResultT) return;
       if (msg.t) lastResultT = msg.t;
       const out = document.getElementById('el-output-' + cellId);
-      if (out && msg.html) {{
+      let html = msg.html || '';
+      if (msg.html_b64) {{
+        const decoded = decodeHtmlB64(msg.html_b64);
+        if (decoded) html = decoded;
+      }}
+      if (out && html) {{
         const tmp = document.createElement('div');
-        tmp.innerHTML = msg.html;
+        tmp.innerHTML = html;
         const neu = tmp.firstElementChild;
         if (neu) {{
           const wasSel = (typeof editSel !== 'undefined' && editSel === out);
@@ -3269,27 +3478,65 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
             style=_el_style(out_spec),
             extra_attrs=_reveal_attr(out_spec),
         )
+    # Deliver HTML as base64 so dialoghelper iife / parent HTMX never parse
+    # raw tags (Plotly CDN URLs became %22https… and oobSwap crashed).
+    try:
+        html_b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
+    except Exception as e:
+        html = render_output_html(
+            [OutputPart(kind="error", text=f"output encode failed: {e}")],
+            cell_id,
+            theme,
+        )
+        html_b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
+
+    # Soft cap: multi-MB iife freezes the SolveIt parent (spinner never clears)
+    if len(html_b64) > 2_400_000:
+        html = render_output_html(
+            [
+                OutputPart(
+                    kind="error",
+                    text=(
+                        f"Output too large to push into the slide "
+                        f"({len(html_b64) // 1024} KB base64). "
+                        "Downsample the Plotly series or use a static image."
+                    ),
+                )
+            ],
+            cell_id,
+            theme,
+        )
+        html_b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
+
     payload = {
         "type": "sslive_result",
         "cell_id": cell_id,
-        "html": html,
+        "html_b64": html_b64,
+        # Empty string keeps older slide JS from treating missing html as null
+        "html": "",
         "ok": bool(result.ok),
         "keep_focus": True,
         "source": source,
         "t": int(time.time() * 1000),
         "slide_index": int(_SESSION.get("slide_index") or 0),
     }
-    # Prefer postMessage (handles large Plotly HTML better than embedding in iife)
     try:
-        raw = json.dumps(payload)
+        raw = json.dumps(payload, ensure_ascii=True)
     except Exception as e:
-        # Fallback: drop huge/unserializable bits
-        payload["html"] = render_output_html(
+        tiny_html = render_output_html(
             [OutputPart(kind="error", text=f"output too large or invalid: {e}")],
             cell_id,
             theme,
         )
-        raw = json.dumps(payload)
+        payload = {
+            "type": "sslive_result",
+            "cell_id": cell_id,
+            "html_b64": base64.b64encode(tiny_html.encode("utf-8")).decode("ascii"),
+            "html": "",
+            "ok": False,
+            "t": int(time.time() * 1000),
+        }
+        raw = json.dumps(payload, ensure_ascii=True)
     js = f"""
 (function() {{
   var msg = {raw};
@@ -3308,14 +3555,18 @@ def push_slide_result(cell_id: str, result: ExecResult, *, source: str | None = 
             _SESSION["_last_push_err"] = str(e)
             # Last-ditch: tiny payload so the spinner always clears
             try:
+                tiny_html = render_output_html(
+                    [OutputPart(kind="error", text=f"push failed: {e}")],
+                    cell_id,
+                    theme,
+                )
                 tiny = {
                     "type": "sslive_result",
                     "cell_id": cell_id,
-                    "html": render_output_html(
-                        [OutputPart(kind="error", text=f"push failed: {e}")],
-                        cell_id,
-                        theme,
+                    "html_b64": base64.b64encode(tiny_html.encode("utf-8")).decode(
+                        "ascii"
                     ),
+                    "html": "",
                     "ok": False,
                     "t": int(time.time() * 1000),
                 }
