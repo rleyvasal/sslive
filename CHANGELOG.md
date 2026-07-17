@@ -23,6 +23,12 @@ End-to-end working version for SolveIt + CRAFT. **Do not paste this file into th
 | User slides under `#\| s` | `#\| sslive-layout` (skipped) |
 | CRAFT bootstrap (keep short) | `%slive` preview iframe (skipped) |
 
+### Live code floating editor + reset fix
+
+- Live code stays a one-line bar; click/focus opens floating ~6-line editor (editable, SE-resize, Run/Shift+Enter, Esc)
+- Layout height no longer makes code chrome tall; edit-mode resize ignores height on code cells
+- **reset** on a code cell restores the one-line bar (clears tall leftover height)
+
 ### Export (0.1.1)
 
 - `export_html("talk.html")` / `export_html_str()` / `%slive_export` — static portable player

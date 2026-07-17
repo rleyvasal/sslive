@@ -87,6 +87,10 @@ await hide_from_ai("_msg_id")
 
 Do not paste `sslive.py` into a dialog cell — only `%run` it.
 
+### Live code editing
+
+Code cells stay a **one-line bar** on the slide (so plots stay large). Click the code (or focus the bar) to open a **floating editor** (~6 lines, SE-resize, above the visualization). Edit there, **▶ Run** / Shift+Enter, then Esc / collapse / outside click to close. Layout **reset** restores the one-line bar (it does not leave a tall code box).
+
 ## Export portable HTML
 
 Under **`%gpu`**, bare Python runs on the remote kernel — `export_html` is **not** defined there. Use the **local magic** (same idea as `%slive`):

@@ -1169,6 +1169,32 @@ def _style_attr(style: str) -> str:
     return f' style="{html_module.escape(style)}"' if style else ""
 
 
+def _strip_code_bar_height(style: str) -> str:
+    """Remove layout height/overflow from a code-cell bar style.
+
+    Edit-mode box height is for chrome placement; the bar itself is always
+    one line. Expanded editing uses a floating panel (live + export).
+    """
+    if not style:
+        return ""
+    style_bar = re.sub(
+        r"(?:^|;)\s*height\s*:\s*[^;]+;?",
+        ";",
+        style,
+        flags=re.I,
+    )
+    style_bar = re.sub(r";{2,}", ";", style_bar).strip(";").strip()
+    if style_bar and re.search(r"(?:^|;)\s*overflow\s*:", style_bar, flags=re.I):
+        style_bar = re.sub(
+            r"(?:^|;)\s*overflow\s*:\s*[^;]+;?",
+            ";",
+            style_bar,
+            flags=re.I,
+        )
+        style_bar = re.sub(r";{2,}", ";", style_bar).strip(";").strip()
+    return style_bar
+
+
 def _reveal_attr(spec: dict) -> str:
     """`` data-reveal="N"`` when a positive reveal step is set."""
     r = spec.get("reveal")
@@ -2860,25 +2886,26 @@ def _parse_note_to_elements_basic(source: str, cell_id: str) -> list[dict]:
 
 
 def _code_block_html(cell: Cell, *, style: str = "", extra_attrs: str = "") -> str:
-    """In-slide editable code (textarea) + Run."""
+    """In-slide editable code (one-line bar) + Run; edit opens floating panel."""
     cid = html_module.escape(cell.id)
     # raw id for JS (safe: dialog ids are alphanumeric + underscore)
     raw_id = cell.id
     src = html_module.escape(cell.source)
     # Default to a single visible line so long viz scripts don't dominate the
-    # slide; user can focus (expands for edit) or drag the resize handle.
+    # slide; focus/click opens a floating ~6-line editor (not in-place grow).
     n_lines = 1
     ta_h = 34  # ~one line at 14px / 1.45 line-height
+    style_bar = _strip_code_bar_height(style)
     return f"""
     <div id="el-code-{cid}" class="code-wrap" data-el-id="el-code-{cid}" data-type="code"
-         data-cell-id="{cid}" data-runnable="1"{extra_attrs}{_style_attr(style)}
+         data-cell-id="{cid}" data-runnable="1"{extra_attrs}{_style_attr(style_bar)}
          tabindex="0" onclick="selectCell('{cid}')">
       <div class="code-toolbar">
         <span class="drag-grip" data-drag-for="el-code-{cid}" title="drag to move">⠿</span>
         <button type="button" class="run-btn" data-cell-id="{cid}"
           onclick="event.stopPropagation(); runCellFromSlide('{raw_id}')">▶ Run</button>
         <span class="cell-id">{cid}</span>
-        <span class="hint">edit here · Shift+Enter run · GPU</span>
+        <span class="hint">click code · floating edit · Shift+Enter run</span>
       </div>
       <textarea class="code-ta" id="ta-{cid}" data-cell-id="{cid}"
         spellcheck="false" rows="{n_lines}"
@@ -3023,10 +3050,12 @@ def generate_presenter_html(
       padding:0 0 0 0.8em; color:{theme.get("muted", "#9ca3af")}; }}
     .note-block .math-block {{ text-align:center; margin:0.8em 0; }}
     .note-block math {{ font-size:1.1em; }}
-    /* Code box: size to toolbar + one-line textarea — do not flex-grow after Run */
+    /* Code box: toolbar + one-line bar; editing uses #live-code-pop (floating) */
     .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
-      padding:8px 12px; outline:none; flex:0 0 auto; align-self:stretch; max-width:100%; }}
+      padding:8px 12px; outline:none; flex:0 0 auto; align-self:stretch; max-width:100%;
+      box-sizing:border-box; }}
     .code-wrap.selected {{ border-color:#60a5fa; box-shadow:0 0 0 2px rgba(96,165,250,0.35); }}
+    .code-wrap.code-open {{ border-color:#60a5fa; }}
     .code-toolbar {{ display:flex; align-items:center; gap:12px; margin-bottom:6px; flex-wrap:wrap; }}
     .run-btn {{ cursor:pointer; background:#2563eb; color:white; border:0; border-radius:6px;
       padding:6px 14px; font-size:14px; font-weight:600; }}
@@ -3034,17 +3063,50 @@ def generate_presenter_html(
     .run-btn:disabled {{ opacity:0.5; cursor:wait; }}
     .cell-id {{ font-size:11px; color:{theme.get("muted", "#9ca3af")}; font-family:ui-monospace,monospace; }}
     .hint {{ font-size:11px; color:#6b7280; }}
-    .code-ta {{ width:100%; box-sizing:border-box; margin:0; resize:vertical;
+    .code-ta {{ width:100%; box-sizing:border-box; margin:0; resize:none;
       font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45;
       font-size:var(--code-fs, 14px); white-space:pre;
       color:#e5e7eb; background:#111827; border:1px solid #4b5563; border-radius:6px;
-      padding:6px 10px; outline:none; min-height:34px; max-height:70vh;
-      overflow:auto; transition:height 0.12s ease; }}
+      padding:6px 10px; outline:none; height:34px; min-height:34px; max-height:34px;
+      overflow:hidden; cursor:pointer; }}
     .code-ta:focus {{ border-color:#60a5fa; }}
-    #chrome {{ position:fixed; left:12px; top:12px; z-index:20; display:flex; gap:10px; align-items:center;
+    /* Floating live editor (above plots; body-portaled so stage scale is fine) */
+    #live-code-pop {{
+      position:fixed; z-index:45; display:flex; flex-direction:column;
+      width:min(920px, 90vw); height:200px; min-width:280px; min-height:148px;
+      max-width:95vw; max-height:50vh;
+      background:#0f172a; border:1px solid #60a5fa; border-radius:10px;
+      box-shadow:0 12px 40px rgba(0,0,0,0.55), 0 0 0 1px rgba(96,165,250,0.25);
+      overflow:hidden; box-sizing:border-box;
+    }}
+    #live-code-pop[hidden] {{ display:none !important; }}
+    #live-code-pop .live-code-pop-head {{
+      display:flex; align-items:center; gap:10px; flex:0 0 auto;
+      padding:8px 12px; border-bottom:1px solid #1f2937; background:#111827;
+    }}
+    #live-code-pop .live-code-pop-head .hint {{ flex:1; }}
+    #live-code-pop .live-code-pop-close {{
+      background:#1f2937; border:1px solid #4b5563; color:#e5e7eb; border-radius:6px;
+      font-size:12px; padding:4px 10px; cursor:pointer;
+    }}
+    #live-code-pop .live-code-pop-close:hover {{ border-color:#60a5fa; color:#93c5fd; }}
+    #live-code-pop-ta {{
+      flex:1 1 auto; width:100%; margin:0; padding:10px 14px; border:0; resize:none;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45;
+      font-size:14px; white-space:pre; tab-size:4;
+      color:#e5e7eb; background:#0b1220; outline:none; box-sizing:border-box;
+      overflow:auto; min-height:0;
+    }}
+    #live-code-pop .live-code-pop-rs {{
+      position:absolute; right:2px; bottom:2px; width:14px; height:14px; cursor:se-resize;
+      background:linear-gradient(135deg, transparent 50%, #60a5fa 50%);
+      border-radius:0 0 8px 0; opacity:0.85;
+    }}
+    #live-code-pop .live-code-pop-rs:hover {{ opacity:1; }}
+    #chrome {{ position:fixed; left:12px; top:12px; z-index:50; display:flex; gap:10px; align-items:center;
       background:rgba(0,0,0,0.55); color:#fff; padding:6px 12px; border-radius:8px; font-size:13px; }}
     #chrome .ok {{ color:#86efac; }} #chrome .bad {{ color:#fca5a5; }}
-    #nav {{ position:fixed; right:16px; bottom:16px; z-index:20; display:flex; gap:12px; align-items:center;
+    #nav {{ position:fixed; right:16px; bottom:16px; z-index:50; display:flex; gap:12px; align-items:center;
       background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.35;
       transition:opacity 0.15s; }}
     #nav:hover {{ opacity:1; }}
@@ -3185,6 +3247,7 @@ def generate_presenter_html(
     }}
 
     function showSlide(n, {{ selectFirst, frag }} = {{ selectFirst: true }}) {{
+      closeLiveCodePop({{ sync: true }});
       const ss = slides();
       if (!ss.length) return;
       ss.forEach((s, i) => {{
@@ -3224,50 +3287,161 @@ def generate_presenter_html(
       }}
     }}
 
+    // Floating live code editor (~6 lines default; SE-resize; above plots)
+    const CODE_LINE = 14 * 1.45;
+    const CODE_HEAD = 44;
+    const CODE_DEF_LINES = 6;
+    const CODE_MIN_LINES = 5;
+    let liveCodeOpen = null;  // {{ cellId, wrap, ta }}
+
     function codeSource(cellId) {{
+      if (liveCodeOpen && liveCodeOpen.cellId === cellId) {{
+        const popTa = document.getElementById('live-code-pop-ta');
+        if (popTa) return popTa.value;
+      }}
       const ta = document.querySelector('textarea.code-ta[data-cell-id="' + cellId + '"]');
       return ta ? ta.value : '';
     }}
 
-    // Compact code boxes by default (1 line); expand while focused for editing.
-    function codeTaFocus(ta) {{
-      if (!ta || ta.dataset.userSized === '1') return;
-      const lines = Math.min(18, Math.max(3, (ta.value.match(/\\n/g) || []).length + 2));
-      const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
-      const pad = 12;
-      ta.style.height = Math.round(lines * lh + pad) + 'px';
-    }}
-    function codeTaBlur(ta) {{
-      if (!ta || ta.dataset.userSized === '1') return;
+    function forceCodeTaCollapsed(ta) {{
+      if (!ta) return;
+      delete ta.dataset.userSized;
       const h = parseInt(ta.dataset.collapsedH || '34', 10) || 34;
       ta.style.height = h + 'px';
+      ta.style.maxHeight = h + 'px';
+      ta.style.minHeight = h + 'px';
       ta.scrollTop = 0;
     }}
-    // If the user drags the native resize handle, stop auto collapse/expand.
-    document.addEventListener('pointerup', (e) => {{
-      const ta = e.target && e.target.classList && e.target.classList.contains('code-ta')
-        ? e.target : null;
-      if (!ta) return;
-      const base = parseInt(ta.dataset.collapsedH || '34', 10) || 34;
-      if (Math.abs(ta.offsetHeight - base) > 8 && document.activeElement === ta) {{
-        // expanded for edit is fine; only mark userSized if clearly hand-resized tall
-        if (ta.offsetHeight > base + 80) ta.dataset.userSized = '1';
+
+    function closeLiveCodePop(opts) {{
+      const sync = !opts || opts.sync !== false;
+      const pop = document.getElementById('live-code-pop');
+      const popTa = document.getElementById('live-code-pop-ta');
+      if (liveCodeOpen) {{
+        if (sync && liveCodeOpen.ta && popTa) liveCodeOpen.ta.value = popTa.value;
+        if (liveCodeOpen.wrap) liveCodeOpen.wrap.classList.remove('code-open');
+        forceCodeTaCollapsed(liveCodeOpen.ta);
       }}
-    }}, true);
+      liveCodeOpen = null;
+      if (pop) pop.hidden = true;
+    }}
+
+    function positionLiveCodePop(pop, wrap) {{
+      const bar = wrap.getBoundingClientRect();
+      const w = Math.min(920, Math.floor(window.innerWidth * 0.9));
+      const h = Math.round(CODE_LINE * CODE_DEF_LINES + CODE_HEAD + 16);
+      let left = Math.round(bar.left);
+      let top = Math.round(bar.bottom + 8);
+      if (left + w > window.innerWidth - 12) left = Math.max(12, window.innerWidth - w - 12);
+      if (left < 12) left = 12;
+      if (top + h > window.innerHeight - 12) {{
+        top = Math.max(12, Math.round(bar.top - h - 8));
+      }}
+      pop.style.width = w + 'px';
+      pop.style.height = h + 'px';
+      pop.style.left = left + 'px';
+      pop.style.top = top + 'px';
+    }}
+
+    function openLiveCodePop(fromTa) {{
+      if (!fromTa) return;
+      const cellId = fromTa.dataset.cellId;
+      const wrap = fromTa.closest('.code-wrap');
+      if (!cellId || !wrap) return;
+      const pop = document.getElementById('live-code-pop');
+      const popTa = document.getElementById('live-code-pop-ta');
+      const idEl = document.getElementById('live-code-pop-id');
+      if (!pop || !popTa) return;
+      // Already open for this cell — keep focus in the floating editor
+      if (liveCodeOpen && liveCodeOpen.cellId === cellId) {{
+        try {{ popTa.focus({{ preventScroll: true }}); }} catch (e) {{ try {{ popTa.focus(); }} catch (e2) {{}} }}
+        return;
+      }}
+      // Sync previous open cell before switching
+      closeLiveCodePop({{ sync: true }});
+      liveCodeOpen = {{ cellId: cellId, wrap: wrap, ta: fromTa }};
+      wrap.classList.add('code-open');
+      forceCodeTaCollapsed(fromTa);
+      popTa.value = fromTa.value;
+      if (idEl) idEl.textContent = cellId;
+      pop.dataset.cellId = cellId;
+      pop.hidden = false;
+      positionLiveCodePop(pop, wrap);
+      selectCell(cellId);
+      // Defer focus so the in-slide ta blur settles first
+      requestAnimationFrame(() => {{
+        try {{ popTa.focus({{ preventScroll: true }}); }} catch (e) {{ try {{ popTa.focus(); }} catch (e2) {{}} }}
+      }});
+    }}
+
+    // Focus on the one-line bar → open floating editor (not in-place grow)
+    function codeTaFocus(ta) {{
+      openLiveCodePop(ta);
+    }}
+    function codeTaBlur(ta) {{
+      // In-slide bar always stays one line; floating panel owns editing
+      forceCodeTaCollapsed(ta);
+    }}
+
+    // Outside click closes floating editor (sync source back)
+    document.addEventListener('mousedown', (e) => {{
+      if (!liveCodeOpen) return;
+      const pop = document.getElementById('live-code-pop');
+      if (pop && pop.contains(e.target)) return;
+      if (liveCodeOpen.wrap && liveCodeOpen.wrap.contains(e.target)) {{
+        // Clicking Run / toolbar on same cell keeps panel; re-click bar refocuses
+        if (e.target.closest && e.target.closest('button.run-btn')) return;
+        return;
+      }}
+      closeLiveCodePop({{ sync: true }});
+    }});
+
+    // SE-corner resize for live floating editor
+    (function liveCodePopResize() {{
+      let drag = null;
+      document.addEventListener('mousedown', (e) => {{
+        const h = e.target.closest && e.target.closest('.live-code-pop-rs');
+        if (!h) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const pop = document.getElementById('live-code-pop');
+        if (!pop || pop.hidden) return;
+        const r = pop.getBoundingClientRect();
+        drag = {{ pop: pop, x: e.clientX, y: e.clientY, w: r.width, h: r.height }};
+      }});
+      document.addEventListener('mousemove', (e) => {{
+        if (!drag) return;
+        const minH = Math.round(CODE_LINE * CODE_MIN_LINES + CODE_HEAD + 16);
+        const maxH = Math.floor(window.innerHeight * 0.5);
+        const minW = 280;
+        const maxW = Math.floor(window.innerWidth * 0.95);
+        const nw = Math.max(minW, Math.min(maxW, drag.w + (e.clientX - drag.x)));
+        const nh = Math.max(minH, Math.min(maxH, drag.h + (e.clientY - drag.y)));
+        drag.pop.style.width = nw + 'px';
+        drag.pop.style.height = nh + 'px';
+      }});
+      document.addEventListener('mouseup', () => {{ drag = null; }});
+    }})();
 
     const runTimers = {{}};  // cellId → timeout id (clear stuck spinners)
 
     function setRunBtn(cellId, disabled) {{
-      const btn = document.querySelector('.run-btn[data-cell-id="' + cellId + '"]');
-      if (btn) btn.disabled = !!disabled;
+      document.querySelectorAll('.run-btn[data-cell-id="' + cellId + '"]').forEach((btn) => {{
+        btn.disabled = !!disabled;
+      }});
+      const popRun = document.getElementById('live-code-pop-run');
+      if (popRun && liveCodeOpen && liveCodeOpen.cellId === cellId) {{
+        popRun.disabled = !!disabled;
+      }}
     }}
 
     function collapseCodeTa(cellId) {{
-      // Keep the code box one-line unless the user hand-resized it (userSized).
+      // After Run / collapse: close floating editor and keep bar one-line
+      if (liveCodeOpen && (!cellId || liveCodeOpen.cellId === cellId)) {{
+        closeLiveCodePop({{ sync: true }});
+      }}
       const ta = document.querySelector('textarea.code-ta[data-cell-id="' + cellId + '"]');
-      if (!ta || ta.dataset.userSized === '1') return;
-      try {{ if (document.activeElement === ta) ta.blur(); }} catch (e) {{}}
-      codeTaBlur(ta);
+      forceCodeTaCollapsed(ta);
     }}
 
     function setRunning(cellId, msg) {{
@@ -3432,10 +3606,9 @@ def generate_presenter_html(
         // only sync source from Python if textarea was not focused
         if (document.activeElement !== ta) ta.value = msg.source;
       }}
-      // After Run: stay collapsed (one line). Only expand when the user focuses
-      // to edit, or when they hand-resized (userSized) / keep_focus is true.
+      // After Run: stay collapsed (one-line bar). keep_focus re-opens floating editor.
       if (ta && msg.keep_focus === true) {{
-        try {{ ta.focus({{ preventScroll: true }}); }} catch (e) {{ try {{ ta.focus(); }} catch (e2) {{}} }}
+        openLiveCodePop(ta);
       }} else {{
         collapseCodeTa(cellId);
       }}
@@ -3456,6 +3629,13 @@ def generate_presenter_html(
       const el = document.getElementById(msg.el_id);
       if (!el) return;
       el.style.cssText = msg.style || '';
+      // Code bars ignore layout height (floating editor owns expand size)
+      if (el.classList.contains('code-wrap') || el.dataset.type === 'code') {{
+        el.style.height = '';
+        el.style.overflow = '';
+        const ta = el.querySelector('textarea.code-ta');
+        forceCodeTaCollapsed(ta);
+      }}
       if ('reveal' in msg) {{
         if (msg.reveal == null || msg.reveal <= 0) el.removeAttribute('data-reveal');
         else el.setAttribute('data-reveal', String(msg.reveal));
@@ -3618,6 +3798,8 @@ def generate_presenter_html(
     function tbPatch(patch) {{
       // apply locally (live, no rebuild) + persist via bridge
       if (!editSel) return;
+      const isCode = editSel.classList.contains('code-wrap')
+        || editSel.dataset.type === 'code';
       if ('fs' in patch) {{
         if (patch.fs == null) {{
           editSel.style.fontSize = '';
@@ -3633,7 +3815,10 @@ def generate_presenter_html(
         else editSel.setAttribute('data-reveal', String(patch.reveal));
       }}
       if ('w' in patch) editSel.style.width = patch.w == null ? '' : patch.w + 'px';
-      if ('h' in patch) editSel.style.height = patch.h == null ? '' : patch.h + 'px';
+      // Code bars stay one-line; height is owned by the floating editor
+      if ('h' in patch && !isCode) {{
+        editSel.style.height = patch.h == null ? '' : patch.h + 'px';
+      }}
       if ('x' in patch) editSel.style.left = patch.x == null ? '' : patch.x + 'px';
       if ('y' in patch) editSel.style.top = patch.y == null ? '' : patch.y + 'px';
       sendLayoutPatch(selElId(), patch);
@@ -3732,12 +3917,15 @@ def generate_presenter_html(
       state.el.style.left = x + 'px';
       state.el.style.top = y + 'px';
       if (touchW) state.el.style.width = w + 'px';
-      if (touchH) {{
+      // Code bars stay one-line tall — height is owned by the floating editor
+      const isCode = state.el.classList.contains('code-wrap')
+        || state.el.dataset.type === 'code';
+      if (touchH && !isCode) {{
         state.el.style.height = h + 'px';
         state.el.style.overflow = 'auto';
       }}
       state.cx = x; state.cy = y; state.cw = w; state.ch = h;
-      state.touchW = touchW; state.touchH = touchH;
+      state.touchW = touchW; state.touchH = touchH && !isCode;
       // Keep external frame + floating toolbar in sync while resizing
       const box = document.getElementById('rs-box');
       if (box) {{
@@ -4020,10 +4208,58 @@ def generate_presenter_html(
         const elId = selElId();
         editSel.style.cssText = '';
         editSel.removeAttribute('data-reveal');
+        // Code cells: always restore the one-line bar (never leave a tall editor)
+        if (editSel.classList.contains('code-wrap') || editSel.dataset.type === 'code') {{
+          closeLiveCodePop({{ sync: true }});
+          const ta = editSel.querySelector('textarea.code-ta');
+          forceCodeTaCollapsed(ta);
+          // Drop any residual absolute height so the chrome hugs the one-line ta
+          editSel.style.height = '';
+          editSel.style.overflow = '';
+        }}
         sendLayoutPatch(elId, {{ x: null, y: null, w: null, h: null, z: null,
                                 order: null, reveal: null, fs: null, ff: null, align: null }});
         updateToolbar();
       }});
+    }})();
+
+    // Floating editor chrome (Run / collapse / Shift+Enter)
+    (function liveCodePopChrome() {{
+      const popRun = document.getElementById('live-code-pop-run');
+      const popClose = document.getElementById('live-code-pop-close');
+      const popTa = document.getElementById('live-code-pop-ta');
+      if (popRun) popRun.addEventListener('click', (e) => {{
+        e.preventDefault();
+        e.stopPropagation();
+        if (!liveCodeOpen) return;
+        // sync before run
+        if (liveCodeOpen.ta && popTa) liveCodeOpen.ta.value = popTa.value;
+        runCellFromSlide(liveCodeOpen.cellId);
+      }});
+      if (popClose) popClose.addEventListener('click', (e) => {{
+        e.preventDefault();
+        e.stopPropagation();
+        closeLiveCodePop({{ sync: true }});
+      }});
+      if (popTa) {{
+        popTa.addEventListener('input', () => {{
+          if (liveCodeOpen && liveCodeOpen.ta) liveCodeOpen.ta.value = popTa.value;
+        }});
+        popTa.addEventListener('keydown', (e) => {{
+          if (e.key === 'Escape') {{
+            e.preventDefault();
+            e.stopPropagation();
+            closeLiveCodePop({{ sync: true }});
+            return;
+          }}
+          if (e.key === 'Enter' && e.shiftKey && liveCodeOpen) {{
+            e.preventDefault();
+            e.stopPropagation();
+            if (liveCodeOpen.ta) liveCodeOpen.ta.value = popTa.value;
+            runCellFromSlide(liveCodeOpen.cellId);
+          }}
+        }});
+      }}
     }})();
 
     (() => {{
@@ -4036,6 +4272,10 @@ def generate_presenter_html(
         stage.style.transform = 'scale(' + scale + ')';
         stage.style.left = ((vw - DESIGN_W * scale) / 2) + 'px';
         stage.style.top = ((vh - DESIGN_H * scale) / 2) + 'px';
+        if (liveCodeOpen) {{
+          const pop = document.getElementById('live-code-pop');
+          if (pop && !pop.hidden) positionLiveCodePop(pop, liveCodeOpen.wrap);
+        }}
       }}
       new ResizeObserver(rescale).observe(viewport);
       rescale();
@@ -4107,6 +4347,16 @@ def generate_presenter_html(
     <span class="tb-sep"></span>
     <button type="button" id="tb-reset" title="clear all overrides">reset</button>
   </div>
+  <div id="live-code-pop" hidden>
+    <div class="live-code-pop-head">
+      <button type="button" class="run-btn" id="live-code-pop-run">▶ Run</button>
+      <span class="cell-id" id="live-code-pop-id">—</span>
+      <span class="hint">Shift+Enter run · Esc collapse · ↘ resize</span>
+      <button type="button" class="live-code-pop-close" id="live-code-pop-close">collapse</button>
+    </div>
+    <textarea id="live-code-pop-ta" spellcheck="false"></textarea>
+    <div class="live-code-pop-rs" title="Drag to resize"></div>
+  </div>
   <div id="nav">
     <button type="button" id="edit-btn" title="edit layout (e)" aria-label="Edit layout">✎</button>
     <button type="button" id="prev-btn" aria-label="Previous">‹</button>
@@ -4135,23 +4385,7 @@ def _code_block_html_export(cell: Cell, *, style: str = "", extra_attrs: str = "
     full_esc = html_module.escape(src)
     n_lines = max(1, src.count("\n") + (1 if src else 0))
     more = f" · {n_lines} lines" if n_lines > 1 else ""
-    # Strip layout height so a tall edit-mode box does not force a tall collapsed bar
-    style_bar = re.sub(
-        r"(?:^|;)\s*height\s*:\s*[^;]+;?",
-        ";",
-        style or "",
-        flags=re.I,
-    )
-    style_bar = re.sub(r";{2,}", ";", style_bar).strip(";").strip()
-    # Drop layout overflow too — it was paired with height for a pinned box
-    if style_bar and re.search(r"(?:^|;)\s*overflow\s*:", style_bar, flags=re.I):
-        style_bar = re.sub(
-            r"(?:^|;)\s*overflow\s*:\s*[^;]+;?",
-            ";",
-            style_bar,
-            flags=re.I,
-        )
-        style_bar = re.sub(r";{2,}", ";", style_bar).strip(";").strip()
+    style_bar = _strip_code_bar_height(style)
     first_line = (src.split("\n", 1)[0] if src else "") or " "
     first_esc = html_module.escape(first_line)
     return (
