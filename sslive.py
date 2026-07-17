@@ -1616,29 +1616,30 @@ def generate_presenter_html(
     .drag-grip {{ display:none; cursor:move; user-select:none; color:#9ca3af;
       font-size:18px; padding:2px 6px; touch-action:none; }}
     body.editing .drag-grip {{ display:inline-block; }}
-    /* ── edit toolbar (S2-C): viewport-fixed, unscaled ── */
-    #edit-toolbar {{ position:fixed; top:54px; left:50%; transform:translateX(-50%); z-index:30;
-      display:none; align-items:center; gap:8px; flex-wrap:wrap; justify-content:center;
-      background:rgba(3,7,18,0.92); border:1px solid #374151; color:#e5e7eb;
-      padding:6px 10px; border-radius:10px; font-size:13px;
-      box-shadow:0 4px 16px rgba(0,0,0,0.45); }}
+    /* ── edit toolbar (S2-C): floats next to selection (viewport-fixed, unscaled) ── */
+    #edit-toolbar {{ position:fixed; top:0; left:0; z-index:50;
+      display:none; align-items:center; gap:6px; flex-wrap:wrap;
+      max-width:min(96vw, 520px);
+      background:rgba(3,7,18,0.94); border:1px solid #4b5563; color:#e5e7eb;
+      padding:5px 8px; border-radius:8px; font-size:12px;
+      box-shadow:0 6px 20px rgba(0,0,0,0.5); pointer-events:auto; }}
     body.editing #edit-toolbar.show {{ display:flex; }}
     #edit-toolbar button {{ background:#1f2937; border:1px solid #4b5563; color:#e5e7eb;
-      border-radius:6px; padding:3px 9px; font-size:13px; cursor:pointer; }}
+      border-radius:6px; padding:3px 8px; font-size:12px; cursor:pointer; }}
     #edit-toolbar button:hover:not(:disabled) {{ background:#374151; }}
     #edit-toolbar button:disabled {{ opacity:0.35; cursor:default; }}
     #edit-toolbar select {{ background:#1f2937; border:1px solid #4b5563; color:#e5e7eb;
-      border-radius:6px; padding:3px 6px; font-size:13px; }}
+      border-radius:6px; padding:3px 5px; font-size:12px; }}
     #edit-toolbar input[type=number] {{ background:#1f2937; border:1px solid #4b5563; color:#e5e7eb;
-      border-radius:6px; padding:3px 4px; font-size:13px; width:52px; text-align:center;
+      border-radius:6px; padding:3px 4px; font-size:12px; width:48px; text-align:center;
       -moz-appearance:textfield; }}
     #edit-toolbar input[type=number]::-webkit-outer-spin-button,
     #edit-toolbar input[type=number]::-webkit-inner-spin-button {{ -webkit-appearance:none; margin:0; }}
-    #edit-toolbar .tb-label {{ color:#9ca3af; font-family:ui-monospace,monospace; font-size:11px;
-      max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+    #edit-toolbar .tb-label {{ color:#9ca3af; font-family:ui-monospace,monospace; font-size:10px;
+      max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
     #edit-toolbar .tb-field {{ color:#9ca3af; font-size:11px; display:inline-flex; align-items:center; gap:4px; }}
-    #edit-toolbar .tb-sep {{ width:1px; height:18px; background:#374151; }}
-    #edit-toolbar #tb-fs-val {{ min-width:32px; text-align:center; }}
+    #edit-toolbar .tb-sep {{ width:1px; height:16px; background:#374151; }}
+    #edit-toolbar #tb-fs-val {{ min-width:28px; text-align:center; }}
     /* Segmented reveal: hidden until → advances past data-reveal step */
     .frag-hidden {{ opacity:0 !important; visibility:hidden !important; pointer-events:none !important; }}
     body.editing .frag-hidden {{ opacity:0.35 !important; visibility:visible !important; pointer-events:auto !important; }}
@@ -1900,6 +1901,32 @@ def generate_presenter_html(
     }}
     function ensureHandle() {{ placeRsBox(); }}
 
+    // Float toolbar next to the selected element (Google Slides–style), not
+    // stuck at the top of the viewport — easier when editing many pieces.
+    function placeToolbar() {{
+      const tb = document.getElementById('edit-toolbar');
+      if (!tb || !editing || !editSel) return;
+      if (!tb.classList.contains('show')) return;
+      const er = editSel.getBoundingClientRect();
+      const gap = 8;
+      const pad = 8;
+      // measure after show so width/height are real
+      const tw = tb.offsetWidth || 280;
+      const th = tb.offsetHeight || 40;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      // Prefer just above the selection; fall below if no room.
+      let top = er.top - th - gap;
+      if (top < pad) top = er.bottom + gap;
+      if (top + th > vh - pad) top = Math.max(pad, vh - th - pad);
+      // Align left edges; clamp into the viewport.
+      let left = er.left;
+      if (left + tw > vw - pad) left = vw - tw - pad;
+      if (left < pad) left = pad;
+      tb.style.top = Math.round(top) + 'px';
+      tb.style.left = Math.round(left) + 'px';
+    }}
+
     function updateToolbar() {{
       const tb = document.getElementById('edit-toolbar');
       if (!tb) return;
@@ -1915,6 +1942,11 @@ def generate_presenter_html(
         rIn.value = r > 0 ? String(r) : '';
       }}
       ensureHandle();
+      // Position after layout so size is known (double-rAF for flex wrap)
+      requestAnimationFrame(() => {{
+        placeToolbar();
+        requestAnimationFrame(placeToolbar);
+      }});
     }}
 
     function tbPatch(patch) {{
@@ -1992,6 +2024,7 @@ def generate_presenter_html(
       const elId = editSel.dataset.elId || editSel.id;
       const patch = {{ x: nx, y: ny }};
       if (cur.converted) {{ patch.w = cur.w; updateToolbar(); }}
+      else placeToolbar();
       clearTimeout(nudgeTimer);
       nudgeTimer = setTimeout(() => sendLayoutPatch(elId, patch), 350);
     }}
@@ -2036,7 +2069,7 @@ def generate_presenter_html(
       }}
       state.cx = x; state.cy = y; state.cw = w; state.ch = h;
       state.touchW = touchW; state.touchH = touchH;
-      // Keep external frame in sync while dragging
+      // Keep external frame + floating toolbar in sync while resizing
       const box = document.getElementById('rs-box');
       if (box) {{
         box.style.left = x + 'px';
@@ -2044,6 +2077,7 @@ def generate_presenter_html(
         if (touchW) box.style.width = w + 'px';
         if (touchH) box.style.height = h + 'px';
       }}
+      placeToolbar();
     }}
 
     document.addEventListener('pointerdown', (e) => {{
@@ -2114,6 +2148,7 @@ def generate_presenter_html(
       drag.el.style.left = (drag.ox + (e.clientX - drag.sx) / drag.sc) + 'px';
       drag.el.style.top = (drag.oy + (e.clientY - drag.sy) / drag.sc) + 'px';
       placeRsBox();
+      placeToolbar();
     }});
 
     document.addEventListener('pointerup', (e) => {{
@@ -2230,6 +2265,9 @@ def generate_presenter_html(
     document.getElementById('prev-btn')?.addEventListener('click', () => goPrev());
     document.getElementById('next-btn')?.addEventListener('click', () => goNext());
     document.getElementById('edit-btn')?.addEventListener('click', () => setEditing(!editing));
+    // Keep floating toolbar glued to the selection on viewport changes
+    window.addEventListener('resize', () => {{ placeRsBox(); placeToolbar(); }});
+    document.addEventListener('scroll', () => {{ placeRsBox(); placeToolbar(); }}, true);
 
     (function initToolbar() {{
       const sel = document.getElementById('tb-font');
