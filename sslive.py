@@ -839,7 +839,7 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
                         f"sslive: removed {removed} extra layout/stub note(s) "
                         f"(keeping id={keeper})"
                     )
-                _push_slide_index_restore(keep_edit=True)
+                _push_slide_index_restore(keep_edit=False)
                 return True
 
         # force_create with existing → still just update (ignore force)
@@ -850,7 +850,7 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
             await _finalize_layout_note(keeper, content)
             _mark_ok(keeper, created=False)
             await _cleanup_extra_layout_notes(keeper)
-            _push_slide_index_restore(keep_edit=True)
+            _push_slide_index_restore(keep_edit=False)
             return True
 
         # ── CREATE PATH: only when zero layout notes exist ──
@@ -868,7 +868,7 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
         _mark_ok(new_id, created=True)
         # Sweep any race-created extras + historical stubs
         await _cleanup_extra_layout_notes(new_id)
-        _push_slide_index_restore(keep_edit=True)
+        _push_slide_index_restore(keep_edit=False)
         return True
     except Exception as e:
         _SESSION["_layout_save_err"] = str(e)
@@ -3009,13 +3009,16 @@ def generate_presenter_html(
     }}
 
     // → advances reveal steps first, then next slide. ← reverses.
+    // Navigation must never toggle edit mode (only ✎ / e / Esc do that).
     function goNext() {{
+      consumeGotoKeepEdit();
       if (editing) {{ showSlide(currentSlide + 1); return; }}
       const maxR = maxReveal(slides()[currentSlide]);
       if (fragStep < maxR) {{ fragStep++; applyFragments(); return; }}
       if (currentSlide < slides().length - 1) showSlide(currentSlide + 1);
     }}
     function goPrev() {{
+      consumeGotoKeepEdit();
       if (editing) {{ showSlide(currentSlide - 1); return; }}
       if (fragStep > 0) {{ fragStep--; applyFragments(); return; }}
       if (currentSlide > 0) {{
@@ -3651,14 +3654,23 @@ def generate_presenter_html(
     document.addEventListener('dragstart', (e) => {{ if (editing) e.preventDefault(); }});
 
     let lastGotoT = 0;
+    function consumeGotoKeepEdit() {{
+      // One-shot: never leave keep_edit sticky on the parent (it re-armed
+      // edit mode every time the iframe reloaded or polled an old goto).
+      try {{
+        const g = window.parent && window.parent.__sslive_goto;
+        if (g && g.type === 'sslive_goto') {{
+          window.parent.__sslive_goto = Object.assign({{}}, g, {{ keep_edit: false }});
+        }}
+      }} catch (e) {{}}
+    }}
     function gotoSlideFromHost(msg) {{
       if (!msg || msg.slide_index == null) return;
       const n = Math.max(0, (+msg.slide_index) | 0);
       showSlide(n, {{ selectFirst: false, frag: fragStep }});
-      if (msg.keep_edit) {{
-        // Re-enter edit mode after iframe rebuild (first layout save)
-        if (!editing) setEditing(true);
-      }}
+      // Do NOT auto-enter edit mode. keep_edit was re-enabling ✎ whenever
+      // arrows rebuilt/restored the slide after a layout save.
+      consumeGotoKeepEdit();
     }}
 
     window.addEventListener('message', function (e) {{
@@ -3679,6 +3691,7 @@ def generate_presenter_html(
         const l = window.parent.__sslive_last_layout;
         if (l && l.type === 'sslive_layout_apply') applyLayoutMsg(l);
         const g = window.parent.__sslive_goto;
+        // Only restore *slide index* — ignore keep_edit forever after first consume
         if (g && g.type === 'sslive_goto' && g.t && g.t !== lastGotoT) {{
           lastGotoT = g.t;
           gotoSlideFromHost(g);
@@ -3722,7 +3735,9 @@ def generate_presenter_html(
         if (tag === 'TEXTAREA' && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) return;
         return;
       }}
-      if (e.key === 'e' && !e.metaKey && !e.ctrlKey && !e.altKey) {{
+      // Exact letter e only (not arrows / not key repeat)
+      if (e.key === 'e' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {{
+        e.preventDefault();
         setEditing(!editing);
         return;
       }}
@@ -3730,6 +3745,7 @@ def generate_presenter_html(
         setEditing(false);  // exits directly (and deselects); ✎/e toggle back
         return;
       }}
+      // While editing + selection: arrows nudge. Otherwise arrows navigate slides.
       if (editing && editSel && e.key.startsWith('Arrow')) {{
         e.preventDefault();
         const step = e.shiftKey ? 10 : 1;
@@ -3740,10 +3756,10 @@ def generate_presenter_html(
         placeRsBox();
         return;
       }}
-      if (e.key === 'ArrowRight') {{ e.preventDefault(); goNext(); }}
-      if (e.key === 'ArrowLeft')  {{ e.preventDefault(); goPrev(); }}
+      if (e.key === 'ArrowRight') {{ e.preventDefault(); goNext(); return; }}
+      if (e.key === 'ArrowLeft')  {{ e.preventDefault(); goPrev(); return; }}
       if (e.key === 'Enter' && e.shiftKey) {{ e.preventDefault(); runSelected(); }}
-      if (e.key === 'f' && !e.metaKey && !e.ctrlKey) {{
+      if (e.key === 'f' && !e.metaKey && !e.ctrlKey && !e.altKey) {{
         document.documentElement.requestFullscreen?.();
       }}
       if (e.key === 'ArrowDown') {{
@@ -3754,9 +3770,15 @@ def generate_presenter_html(
       }}
     }});
 
-    document.getElementById('prev-btn')?.addEventListener('click', () => goPrev());
-    document.getElementById('next-btn')?.addEventListener('click', () => goNext());
-    document.getElementById('edit-btn')?.addEventListener('click', () => setEditing(!editing));
+    document.getElementById('prev-btn')?.addEventListener('click', (e) => {{
+      e.preventDefault(); e.stopPropagation(); goPrev();
+    }});
+    document.getElementById('next-btn')?.addEventListener('click', (e) => {{
+      e.preventDefault(); e.stopPropagation(); goNext();
+    }});
+    document.getElementById('edit-btn')?.addEventListener('click', (e) => {{
+      e.preventDefault(); e.stopPropagation(); setEditing(!editing);
+    }});
     // Keep floating toolbar glued to the selection on viewport changes
     window.addEventListener('resize', () => {{ placeRsBox(); placeToolbar(); }});
     document.addEventListener('scroll', () => {{ placeRsBox(); placeToolbar(); }}, true);
@@ -4546,20 +4568,21 @@ async def _sync_slide_index_from_parent() -> int | None:
     return None
 
 
-def _push_slide_index_restore(*, keep_edit: bool = True) -> None:
+def _push_slide_index_restore(*, keep_edit: bool = False) -> None:
     """Tell live iframe(s) to return to the session slide after a parent rebuild.
 
-    First layout ``add_msg`` / ``update_msg`` can make SolveIt re-render the
-    %slive cell and rebuild the srcdoc iframe at slide 0 — this undoes that.
+    Layout ``add_msg`` / ``update_msg`` can rebuild the srcdoc iframe at slide 0
+    — this restores the slide index only. ``keep_edit`` defaults to False: a
+    sticky keep_edit flag was incorrectly turning ✎ on during arrow navigation.
     """
     idx = int(_SESSION.get("slide_index") or 0)
     if iife is None:
         return
-    keep = "true" if keep_edit else "false"
+    # keep_edit intentionally ignored for normal restores (API kept for callers)
     js = f"""
 (function() {{
   var idx = {idx};
-  var msg = {{ type: 'sslive_goto', slide_index: idx, keep_edit: {keep}, t: Date.now() }};
+  var msg = {{ type: 'sslive_goto', slide_index: idx, keep_edit: false, t: Date.now() }};
   window.__sslive_slide_index = idx;
   window.__sslive_goto = msg;
   function push() {{
@@ -4570,7 +4593,6 @@ def _push_slide_index_restore(*, keep_edit: bool = True) -> None:
   push();
   setTimeout(push, 50);
   setTimeout(push, 200);
-  setTimeout(push, 500);
 }})();
 """
     try:
