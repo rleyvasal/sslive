@@ -163,15 +163,14 @@ _HOST_LOAD_HELP = """
 sslive host must load on the SolveIt kernel (not the remote GPU).
 
   %local
-  %run sslive/sslive.py
-  register_slive()     # marks %slive as a local magic
-  %gpu                 # optional — stay here for torch / %pointcloud
-  %slive               # or: await slive()
+  %run sslive/sslive.py   # auto-registers %slive
+  %gpu                    # optional — stay here for torch / %pointcloud
+  %slive                  # or: await slive()
 
 If you %run under %gpu, this file executes on the remote kernel where
 dialoghelper does not exist — that causes this error.
+If %slive is missing after a bad order:  register_slive()
 """.strip()
-
 
 async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[dict]:
     """Cells after `#| s` marker. Requires dialoghelper (async API)."""
@@ -836,8 +835,39 @@ class ExecResult:
     error: str | None = None
 
 
+def _code_has_ipy_magic(code: str) -> bool:
+    """True if source uses IPython line/cell magics or shell escapes."""
+    for line in (code or "").splitlines():
+        s = line.lstrip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("%%") or s.startswith("%") or s.startswith("!"):
+            return True
+    return False
+
+
+def _display_data_to_parts(data: dict) -> list[OutputPart]:
+    """Convert a MIME bundle to OutputPart list (prefer rich types)."""
+    if not data:
+        return []
+    if "image/png" in data:
+        return [OutputPart(kind="image/png", b64=_as_str(data["image/png"]))]
+    if "text/html" in data:
+        return [OutputPart(kind="text/html", text=_as_str(data["text/html"]))]
+    if "text/plain" in data:
+        return [OutputPart(kind="text/plain", text=_as_str(data["text/plain"]))]
+    return []
+
+
 class LiveExecutor:
-    """GPU-only executor. Source comes from Deck; never from rewriting SolveIt cells."""
+    """Execute slide code: pure Python → CRAFT remote GPU; magics → host IPython.
+
+    ``%pointcloud`` and similar magics are often registered on the SolveIt host
+    (or only available through IPython's shell), so sending them with
+    ``remote_kc.execute_interactive`` yields "magic not found". Magics are
+    therefore run via ``get_ipython().run_cell`` on the host — the same path
+    a dialog cell uses for local magics under ``%gpu``.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -860,6 +890,8 @@ class LiveExecutor:
             self.busy = True
             t0 = time.perf_counter()
             try:
+                if _code_has_ipy_magic(code):
+                    return self._execute_host_ipython(code, t0=t0)
                 return self._execute_gpu(code, echo_to_dialog=echo_to_dialog, t0=t0)
             finally:
                 self.busy = False
@@ -870,6 +902,87 @@ class LiveExecutor:
         if result.ok or result.parts:
             deck.cells[cell_id].outputs = list(result.parts)
         return result
+
+    def _execute_host_ipython(self, code: str, *, t0: float) -> ExecResult:
+        """Run code (with magics) on the host IPython shell; capture display/output."""
+        if get_ipython is None:
+            return ExecResult(
+                ok=False,
+                parts=[],
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                error="IPython not available for magic execution",
+            )
+        ip = get_ipython()
+        parts: list[OutputPart] = []
+        try:
+            try:
+                from IPython.utils.capture import capture_output
+            except Exception:
+                capture_output = None  # type: ignore
+
+            if capture_output is not None:
+                with capture_output(stdout=True, stderr=True, display=True) as cap:
+                    result = ip.run_cell(code, store_history=False)
+                if cap.stdout:
+                    parts.append(
+                        OutputPart(kind="stream", text=_strip_ansi(cap.stdout), name="stdout")
+                    )
+                if cap.stderr:
+                    parts.append(
+                        OutputPart(kind="stream", text=_strip_ansi(cap.stderr), name="stderr")
+                    )
+                for out in getattr(cap, "outputs", None) or []:
+                    data = getattr(out, "data", None) or {}
+                    if isinstance(data, dict):
+                        parts.extend(_display_data_to_parts(data))
+            else:
+                result = ip.run_cell(code, store_history=False)
+
+            ok = True
+            err = None
+            if result is not None:
+                if getattr(result, "error_in_exec", None) is not None:
+                    ok = False
+                    err = str(result.error_in_exec)
+                elif getattr(result, "error_before_exec", None) is not None:
+                    ok = False
+                    err = str(result.error_before_exec)
+                elif hasattr(result, "success") and not result.success:
+                    ok = False
+                    err = "execution failed"
+            # UsageError for missing magics often lands as a raised error string
+            if err and "not found" in err and "%" in (code or ""):
+                err = (
+                    f"{err}\n\n"
+                    "Magics like %pointcloud must be installed on the SolveIt host "
+                    "(same place %slive runs). Load the extension that provides "
+                    "the magic, then ▶ Run again. Pure Python still runs on the GPU."
+                )
+            if err and not any(p.kind == "error" for p in parts):
+                parts.append(OutputPart(kind="error", text=err))
+            # If host couldn't resolve the magic, try remote IPython as fallback
+            if (
+                not ok
+                and err
+                and "not found" in err
+                and get_craft_exec_mgr() is not None
+            ):
+                remote = self._execute_gpu(code, echo_to_dialog=False, t0=t0)
+                if remote.ok or remote.parts:
+                    return remote
+            return ExecResult(
+                ok=ok and not any(p.kind == "error" for p in parts),
+                parts=parts,
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                error=err,
+            )
+        except Exception as e:
+            return ExecResult(
+                ok=False,
+                parts=[OutputPart(kind="error", text=str(e))],
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                error=str(e),
+            )
 
     def _execute_gpu(self, code: str, *, echo_to_dialog: bool, t0: float) -> ExecResult:
         mgr = get_craft_exec_mgr()
@@ -891,7 +1004,7 @@ class LiveExecutor:
         parts: list[OutputPart] = []
         hook = make_capture_hook(parts, echo_to_dialog=echo_to_dialog)
         try:
-            # Same client as execute_remote / remote_run_, custom capture hook
+            # Pure Python on remote GPU (same client as execute_remote)
             reply = kc.execute_interactive(code=code, output_hook=hook)
         except KeyboardInterrupt:
             self.interrupt()
@@ -3760,8 +3873,7 @@ async def slive(
     Load the module on the **host** first, then use ``%slive`` under ``%gpu``::
 
         %local
-        %run path/to/sslive.py   # MUST be %local — not under %gpu
-        register_slive()         # mark %slive as local magic
+        %run path/to/sslive.py   # MUST be %local — auto-registers %slive
         %gpu                     # stay here for torch / %pointcloud
         %slive                   # local magic → host deck, Run → GPU
 
