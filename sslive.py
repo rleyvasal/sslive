@@ -3699,6 +3699,64 @@ def generate_presenter_html(
     let drag = null;
     let nudgeTimer = null;
 
+    // Fullscreen helpers — Esc while editing must leave ✎ first, not dump FS.
+    // Modern browsers often ignore preventDefault on Escape in fullscreen, so we
+    // re-enter FS if the UA still exits it.
+    let presenterWantFs = false;
+    let escLeaveEditGuard = false;
+    function isPresenterFs() {{
+      return !!(document.fullscreenElement || document.webkitFullscreenElement
+        || document.mozFullScreenElement);
+    }}
+    function enterPresenterFs() {{
+      presenterWantFs = true;
+      const el = document.documentElement;
+      const req = el.requestFullscreen || el.webkitRequestFullscreen
+        || el.mozRequestFullScreen;
+      if (!req) return;
+      try {{
+        const p = req.call(el);
+        if (p && p.catch) p.catch(function () {{}});
+      }} catch (e) {{}}
+      // Also ask parent to fullscreen the iframe (more reliable in some hosts)
+      try {{
+        window.parent.postMessage({{ type: 'sslive_request_fs', t: Date.now() }}, '*');
+      }} catch (e) {{}}
+    }}
+    function leavePresenterFs() {{
+      presenterWantFs = false;
+      try {{
+        if (document.exitFullscreen) document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      }} catch (e) {{}}
+      try {{
+        window.parent.postMessage({{ type: 'sslive_exit_fs', t: Date.now() }}, '*');
+      }} catch (e) {{}}
+    }}
+    function reenterFsIfWanted() {{
+      if (!presenterWantFs || isPresenterFs()) return;
+      enterPresenterFs();
+    }}
+    function onFullscreenChange() {{
+      if (isPresenterFs()) {{
+        presenterWantFs = true;
+        return;
+      }}
+      // Left fullscreen. If we were (or just were) editing, Esc meant "leave
+      // edit" — restore FS and ensure edit is off.
+      if (editing || escLeaveEditGuard) {{
+        if (editing) setEditing(false);
+        presenterWantFs = true;
+        setTimeout(reenterFsIfWanted, 0);
+        setTimeout(reenterFsIfWanted, 40);
+        setTimeout(reenterFsIfWanted, 120);
+      }} else {{
+        presenterWantFs = false;
+      }}
+    }}
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+
     function setEditing(on) {{
       const was = editing;
       editing = !!on;
@@ -3706,6 +3764,7 @@ def generate_presenter_html(
       document.getElementById('edit-btn')?.classList.toggle('on', editing);
       // Keep parent index fresh so a layout-save rebuild can restore this slide
       try {{ window.parent.__sslive_slide_index = currentSlide; }} catch (e) {{}}
+      try {{ window.parent.__sslive_editing = !!editing; }} catch (e) {{}}
       if (!editing) selectEl(null);
       applyFragments();  // show all while editing; restore hide when done
       // Leaving edit mode: persist layout once (host drains patches + save_layout)
@@ -4243,13 +4302,34 @@ def generate_presenter_html(
       runCellFromSlide(selectedCellId);
     }}
 
-    // Capture phase: stop browser from leaving fullscreen on Esc while editing
+    // Capture Esc while editing: leave ✎ first; re-enter FS if the browser
+    // still drops fullscreen (preventDefault alone is unreliable).
     document.addEventListener('keydown', (e) => {{
-      if (e.key !== 'Escape' || !editing) return;
+      const isEsc = e.key === 'Escape' || e.key === 'Esc' || e.code === 'Escape';
+      if (!isEsc || !editing) return;
       e.preventDefault();
       e.stopPropagation();
+      try {{ e.stopImmediatePropagation(); }} catch (err) {{}}
+      escLeaveEditGuard = true;
+      if (isPresenterFs()) presenterWantFs = true;
       setEditing(false);
+      reenterFsIfWanted();
+      requestAnimationFrame(reenterFsIfWanted);
+      setTimeout(reenterFsIfWanted, 0);
+      setTimeout(reenterFsIfWanted, 40);
+      setTimeout(function () {{ escLeaveEditGuard = false; reenterFsIfWanted(); }}, 150);
     }}, true);
+
+    window.addEventListener('message', function (e) {{
+      if (!e.data) return;
+      if (e.data.type === 'sslive_exit_edit_keep_fs') {{
+        escLeaveEditGuard = true;
+        if (isPresenterFs()) presenterWantFs = true;
+        if (editing) setEditing(false);
+        reenterFsIfWanted();
+        setTimeout(function () {{ escLeaveEditGuard = false; reenterFsIfWanted(); }}, 150);
+      }}
+    }});
 
     document.addEventListener('keydown', (e) => {{
       const tag = e.target && e.target.tagName;
@@ -4264,7 +4344,11 @@ def generate_presenter_html(
         return;
       }}
       // Esc while editing handled in capture listener (above)
-      if (e.key === 'Escape' && editing) return;
+      if (e.key === 'Escape' || e.key === 'Esc' || e.code === 'Escape') {{
+        if (editing) return;
+        // Not editing: allow normal FS exit (browser default)
+        return;
+      }}
       // While editing + selection: arrows nudge. Otherwise arrows navigate slides.
       if (editing && editSel && e.key.startsWith('Arrow')) {{
         e.preventDefault();
@@ -4280,7 +4364,9 @@ def generate_presenter_html(
       if (e.key === 'ArrowLeft')  {{ e.preventDefault(); goPrev(); return; }}
       if (e.key === 'Enter' && e.shiftKey) {{ e.preventDefault(); runSelected(); }}
       if (e.key === 'f' && !e.metaKey && !e.ctrlKey && !e.altKey) {{
-        document.documentElement.requestFullscreen?.();
+        e.preventDefault();
+        if (isPresenterFs()) leavePresenterFs();
+        else enterPresenterFs();
       }}
       if (e.key === 'ArrowDown') {{
         document.querySelector('[data-slide].active')?.scrollBy({{ top: 100, behavior: 'smooth' }});
@@ -5306,7 +5392,7 @@ def _presenter_iframe_html(height: str = "720px", port: int | None = None) -> st
         f'<iframe id="sslive-frame" data-sslive="1" srcdoc="{escaped}" '
         f'style="width:100%;height:{height};border:none;background:#111;" '
         f'sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals" '
-        f'allow="fullscreen"></iframe>'
+        f'allow="fullscreen" allowfullscreen></iframe>'
     )
 
 
@@ -6080,6 +6166,62 @@ if (window.__sslive_layout_flush === undefined) {
     var d = e.data;
     if (d && d.type === 'sslive_layout_flush') window.__sslive_layout_flush = true;
   });
+}
+// Esc while slide is editing: leave edit first, keep/restore fullscreen.
+// preventDefault inside the iframe is unreliable for UA fullscreen exit.
+if (!window.__sslive_esc_fs_v1) {
+  window.__sslive_esc_fs_v1 = true;
+  window.__sslive_editing = false;
+  function slFsFrame() {
+    return document.getElementById('sslive-frame')
+      || document.querySelector('iframe[data-sslive="1"]');
+  }
+  function slRequestFs() {
+    var f = slFsFrame();
+    if (!f) return;
+    var req = f.requestFullscreen || f.webkitRequestFullscreen || f.mozRequestFullScreen;
+    if (req) {
+      try {
+        var p = req.call(f);
+        if (p && p.catch) p.catch(function () {});
+      } catch (e) {}
+    }
+  }
+  function slExitFs() {
+    var ex = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen;
+    if (ex) {
+      try {
+        var p = ex.call(document);
+        if (p && p.catch) p.catch(function () {});
+      } catch (e) {}
+    }
+  }
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d) return;
+    if (d.type === 'sslive_request_fs') slRequestFs();
+    if (d.type === 'sslive_exit_fs') slExitFs();
+  });
+  window.addEventListener('keydown', function (e) {
+    var isEsc = e.key === 'Escape' || e.key === 'Esc' || e.code === 'Escape';
+    if (!isEsc || !window.__sslive_editing) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try { e.stopImmediatePropagation(); } catch (err) {}
+    var f = slFsFrame();
+    if (f && f.contentWindow) {
+      try {
+        f.contentWindow.postMessage({ type: 'sslive_exit_edit_keep_fs', t: Date.now() }, '*');
+      } catch (err) {}
+    }
+    // If browser already dropped FS, put the iframe back
+    setTimeout(function () {
+      if (!document.fullscreenElement && !document.webkitFullscreenElement) slRequestFs();
+    }, 0);
+    setTimeout(function () {
+      if (!document.fullscreenElement && !document.webkitFullscreenElement) slRequestFs();
+    }, 50);
+  }, true);
 }
 // Focus guard: pre-empt SolveIt's focus/scroll-on-update after update_msg.
 // Armed from Python (window.__sslive_guard_until) just before dialog

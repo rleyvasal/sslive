@@ -43,8 +43,9 @@ End-to-end working version for SolveIt + CRAFT. **Do not paste this file into th
 
 ### Fullscreen + leave edit
 
-- Esc while ✎ editing only leaves edit mode (`preventDefault` so the browser does not exit fullscreen); second Esc can leave fullscreen
-- Leave-edit layout save is deferred while fullscreen (dialog `update_msg` was remounting the iframe and dropping FS); writes when fullscreen ends
+- Esc while ✎ editing leaves edit first; if the browser still drops fullscreen, we re-enter it (UA often ignores `preventDefault` on Esc)
+- Parent bridge also intercepts Esc when `__sslive_editing` and restores iframe fullscreen
+- `f` toggles fullscreen (enter/leave); leave-edit layout save still deferred while FS is on
 
 ### Export (0.1.1)
 
