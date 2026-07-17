@@ -106,11 +106,17 @@ Edit-mode **move / resize / font / reveal** is stored in **one** hidden dialog n
 { "version": 1, "elements": { "el-code-_abc": {"x":120,"y":80,"w":900}, ... } }
 ```
 
-- Created on first drag (or first save); **`skipped=1`** (red eye — not in LLM / not a slide).
+- **Created automatically at the end of `%slive`** if none exists (empty overlay is fine).
+- Also written on first drag/resize / leaving edit mode / `await save_layout()`.
+- **`skipped=1`** (red eye — not in LLM / not a slide).
 - Later edits **update the same note** (find includes skipped messages so we never spawn copies).
-- If older sessions left many layout notes, the next `%slive` **merges** them into one and retires the rest.
+- If several layout notes exist, the next `%slive` **merges** them into one and retires the rest.
 - Coordinates are design-space **1920×1080** px.
-- Leaving edit mode, or the next `%slive` / `reload_deck`, **flushes** any debounced write.
+
+```python
+await ensure_layout_note()   # create/find the single layout cell now
+layout_status()              # see msg id / errors if creation failed
+```
 
 ```python
 layout_ids()           # see which elements have overrides
