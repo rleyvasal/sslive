@@ -990,27 +990,40 @@ def _ensure_local_magic():
         pass
 
 
+def _math_is_display(raw: str) -> bool:
+    r = (raw or "").strip()
+    return (r.startswith("$$") and r.endswith("$$")) or (
+        r.startswith("\\[") and r.endswith("\\]")
+    )
+
+
 def _math_to_mathml(latex_str: str) -> str:
     """`$...$` / `$$...$$` / ``\\(...\\)`` / ``\\[...\\]`` → MathML."""
     raw = (latex_str or "").strip()
     if not raw:
         return ""
-    if _l2m is None:
-        return f'<div class="math-block">{html_module.escape(raw)}</div>'
-    display = False
+    display = _math_is_display(raw)
     body = raw
     if raw.startswith("$$") and raw.endswith("$$") and len(raw) >= 4:
-        display, body = True, raw[2:-2].strip()
+        body = raw[2:-2].strip()
     elif raw.startswith("\\[") and raw.endswith("\\]"):
-        display, body = True, raw[2:-2].strip()
+        body = raw[2:-2].strip()
     elif raw.startswith("\\(") and raw.endswith("\\)"):
         body = raw[2:-2].strip()
     elif raw.startswith("$") and raw.endswith("$") and not raw.startswith("$$"):
         body = raw[1:-1].strip()
+    if _l2m is None:
+        esc = html_module.escape(raw if not body else body)
+        if display:
+            return f'<div class="math-block">{esc}</div>'
+        return f'<span class="math-inline">{esc}</span>'
     try:
         mathml = _l2m.convert(body)
     except Exception:
-        return f'<div class="math-block">{html_module.escape(raw)}</div>'
+        esc = html_module.escape(body or raw)
+        if display:
+            return f'<div class="math-block">{esc}</div>'
+        return f'<span class="math-inline">{esc}</span>'
     if display:
         mathml = mathml.replace('display="inline"', 'display="block"')
         return f'<div class="math-block">{mathml}</div>'
@@ -1018,17 +1031,27 @@ def _math_to_mathml(latex_str: str) -> str:
 
 
 def _extract_math_placeholders(content: str) -> tuple[str, list[str]]:
-    """Pull math out before markdown so `_`/`^`/`\\` survive."""
+    """Pull math out before markdown so `_`/`^`/`\\` survive.
+
+    Placeholders distinguish display vs inline so S2-D can split elements only
+    on **display** math (``$$…$$`` / ``\\[…\\]``). Inline ``$…$`` / ``\\(…\\)``
+    stay inside the same bullet/paragraph.
+    """
     math_blocks: list[str] = []
 
-    def save_math(m: "re.Match[str]") -> str:
+    def save_display(m: "re.Match[str]") -> str:
         math_blocks.append(m.group(0))
-        return f"SSLIVEMATH{len(math_blocks) - 1}X"
+        return f"SSLIVEDISP{len(math_blocks) - 1}X"
 
-    content = re.sub(r"\$\$(.*?)\$\$", save_math, content, flags=re.DOTALL)
-    content = re.sub(r"\\\[(.*?)\\\]", save_math, content, flags=re.DOTALL)
-    content = re.sub(r"\$([^\$\n]+)\$", save_math, content)
-    content = re.sub(r"\\\((.*?)\\\)", save_math, content, flags=re.DOTALL)
+    def save_inline(m: "re.Match[str]") -> str:
+        math_blocks.append(m.group(0))
+        return f"SSLIVEINL{len(math_blocks) - 1}X"
+
+    # Display first so nested/adjacent cases stay correct
+    content = re.sub(r"\$\$(.*?)\$\$", save_display, content, flags=re.DOTALL)
+    content = re.sub(r"\\\[(.*?)\\\]", save_display, content, flags=re.DOTALL)
+    content = re.sub(r"\$([^\$\n]+)\$", save_inline, content)
+    content = re.sub(r"\\\((.*?)\\\)", save_inline, content, flags=re.DOTALL)
     return content, math_blocks
 
 
@@ -1038,16 +1061,20 @@ def _restore_math_in_html(html: str, math_blocks: list[str]) -> str:
             rep = _math_to_mathml(block)
         except Exception:
             rep = html_module.escape(block)
-        html = html.replace(f"SSLIVEMATH{i}X", rep)
+        # display + inline (+ legacy SSLIVEMATH from older paths)
+        for prefix in ("SSLIVEDISP", "SSLIVEINL", "SSLIVEMATH"):
+            html = html.replace(f"{prefix}{i}X", rep)
     return html
 
 
-_MATH_PH_RE = re.compile(r"SSLIVEMATH(\d+)X")
+# Only **display** math + images create new slide elements; inline math does not.
+_DISP_PH_RE = re.compile(r"SSLIVEDISP(\d+)X")
+_ANY_MATH_PH_RE = re.compile(r"SSLIVE(?:DISP|INL|MATH)(\d+)X")
 _MD_IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 _HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.I)
 _ATTACH_RE = re.compile(r"!\[([^\]]*)\]\(attachment:([^)]+)\)")
 _MEDIA_SPLIT_RE = re.compile(
-    r"(SSLIVEMATH\d+X)|(<img\b[^>]*>)|(!\[[^\]]*\]\([^)]+\))",
+    r"(SSLIVEDISP\d+X)|(<img\b[^>]*>)|(!\[[^\]]*\]\([^)]+\))",
     re.I,
 )
 
@@ -1156,7 +1183,11 @@ def _split_media_runs(
     *,
     text_kind: str,
 ) -> list[tuple[str, str, str]]:
-    """Split HTML/text with math placeholders / images into (kind, content, html)."""
+    """Split HTML/text on **display math** + images only (not inline math).
+
+    Inline ``$…$`` placeholders stay in the text run and are restored as MathML
+    inside the same list_item / paragraph element.
+    """
     frag = fragment or ""
     if not frag.strip():
         return []
@@ -1172,10 +1203,13 @@ def _split_media_runs(
                 html = _restore_math_in_html(chunk.strip(), math_blocks)
                 if text_kind == "list_item":
                     html = _wrap_list_item_html(html)
-                runs.append((text_kind, re.sub(r"<[^>]+>", "", chunk).strip(), html))
+                plain = re.sub(r"<[^>]+>", "", chunk).strip()
+                plain = _ANY_MATH_PH_RE.sub("", plain).strip()
+                if plain or not _html_is_effectively_empty(html):
+                    runs.append((text_kind, plain, html))
         token = m.group(0)
-        if token.startswith("SSLIVEMATH"):
-            mm = _MATH_PH_RE.fullmatch(token)
+        if token.startswith("SSLIVEDISP"):
+            mm = _DISP_PH_RE.fullmatch(token)
             idx = int(mm.group(1)) if mm else -1
             raw = math_blocks[idx] if 0 <= idx < len(math_blocks) else token
             runs.append(("math", raw, _math_to_mathml(raw)))
@@ -1188,7 +1222,16 @@ def _split_media_runs(
             html = _restore_math_in_html(chunk.strip(), math_blocks)
             if text_kind == "list_item":
                 html = _wrap_list_item_html(html)
-            runs.append((text_kind, re.sub(r"<[^>]+>", "", chunk).strip(), html))
+            plain = re.sub(r"<[^>]+>", "", chunk).strip()
+            plain = _ANY_MATH_PH_RE.sub("", plain).strip()
+            if plain or not _html_is_effectively_empty(html):
+                runs.append((text_kind, plain, html))
+    # If the only non-empty runs are the same kind we started with and no
+    # actual media, treat as "no split" (caller emits whole block).
+    if runs and all(k == text_kind for k, _, _ in runs) and len(runs) == 1:
+        return runs
+    if not any(k in ("math", "image") for k, _, _ in runs):
+        return []
     return runs
 
 
@@ -1344,22 +1387,17 @@ def _parse_note_to_elements_basic(source: str, cell_id: str) -> list[dict]:
             if lines and all(re.match(r"^\s*([-*+]|\d+\.)\s+", ln) for ln in lines):
                 for ln in lines:
                     item = re.sub(r"^\s*([-*+]|\d+\.)\s+", "", ln.strip())
-                    content, maths = _extract_math_placeholders(item)
-                    # rebuild a pseudo-html with placeholders for split
-                    pseudo = content
-                    # re-insert image md as-is
-                    runs = _split_media_runs(pseudo, maths, text_kind="list_item")
+                    ph, maths = _extract_math_placeholders(item)
+                    runs = _split_media_runs(ph, maths, text_kind="list_item")
                     if runs:
                         for k, c, h in runs:
                             emit(k, h, c)
                     else:
-                        emit(
-                            "list_item",
-                            _wrap_list_item_html(
-                                f"<p>{html_module.escape(item)}</p>"
-                            ),
-                            item,
+                        # Inline math stays in the bullet (placeholders are alnum-safe)
+                        inner = _restore_math_in_html(
+                            f"<p>{html_module.escape(ph)}</p>", maths
                         )
+                        emit("list_item", _wrap_list_item_html(inner), item)
                 continue
             first = lines[0].strip() if lines else block
             if first.startswith("#"):
@@ -1381,17 +1419,17 @@ def _parse_note_to_elements_basic(source: str, cell_id: str) -> list[dict]:
                         rest,
                     )
                 continue
-            content, maths = _extract_math_placeholders(block)
-            runs = _split_media_runs(content, maths, text_kind="paragraph")
+            ph, maths = _extract_math_placeholders(block)
+            runs = _split_media_runs(ph, maths, text_kind="paragraph")
             if runs:
                 for k, c, h in runs:
                     emit(k, h, c)
             else:
-                emit(
-                    "paragraph",
-                    f"<p class='slide-p'>{html_module.escape(block).replace(chr(10), '<br/>')}</p>",
-                    block,
+                inner = _restore_math_in_html(
+                    f"<p class='slide-p'>{html_module.escape(ph).replace(chr(10), '<br/>')}</p>",
+                    maths,
                 )
+                emit("paragraph", inner, block)
     if not out and (source or "").strip():
         emit("paragraph", _note_to_html_basic(source), source)
     return out

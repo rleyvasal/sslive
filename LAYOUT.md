@@ -93,8 +93,9 @@ Overlay keyed by `el_id` (absent = flow layout, today's behavior):
    persists `w`/`h`/`x`/`y`; reset sends an all-null patch which drops the spec
    entirely; selection survives output re-render after Run)
 4. **S2-D** finer note-block elements — **done**
-   (`parse_note_to_elements`: per list-item, math/image media-split, tables,
-   attachment images; ids `el-{idx}-{cid}`; `Element.html` cache)
+   (`parse_note_to_elements`: per list-item; **display** `$$` / `\[\]` math +
+   images split to own elements; **inline** `$` / `\(\)` stays in bullet/paragraph;
+   tables; attachment images; ids `el-{idx}-{cid}`; `Element.html` cache)
 5. **reveal steps** — layout key `reveal` + →/← navigation — **done**
    (toolbar field; blank/0 always shown; N appears when frag step ≥ N)
 6. later: undo/redo, multi-select, snap guides, per-slide backgrounds
