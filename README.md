@@ -1,8 +1,16 @@
-# sslive **0.1.0** (working)
+# sslive **0.1.0** (working baseline)
 
 Live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https://github.com/rleyvasal/gpudev) / CRAFT.
 
+**Working as of 2026-07-17** — see [CHANGELOG.md](CHANGELOG.md). Treat this as the freeze baseline before package split / CRAFT addon modularity.
+
 Stay in **`%gpu` mode** for your usual work (`torch`, `%pointcloud`, …). Open the deck with **`%slive`** — a **local magic** (like other CRAFT host tools) that displays the slides in the cell output and runs slide code on the remote GPU.
+
+### Addon model (CRAFT + sslive / pcviz / mojo)
+
+- **CRAFT** owns connection + remote execution + local-magic registry.
+- **sslive** (and peers) live on the **host disk** and are loaded with `%run` / `import` — **never paste addon source into the dialog** (LLM context).
+- Same pattern for **pcviz** / **mojo**: one short host load line, then magics under `%gpu`.
 
 ## Architecture
 

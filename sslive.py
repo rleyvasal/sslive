@@ -2986,11 +2986,15 @@ def generate_presenter_html(
     """
 
     js = f"""
-    // Prefer parent-remembered index (survives iframe rebuild after first layout save)
+    // Start at Python initial_slide (0 on fresh %slive). Only honor a sticky
+    // parent index when force-restore is set (layout-save iframe rebuild).
     let currentSlide = {initial_slide};
     try {{
-      const p = window.parent && window.parent.__sslive_slide_index;
-      if (p != null && Number.isFinite(+p)) currentSlide = Math.max(0, (+p) | 0);
+      if (window.parent && window.parent.__sslive_force_slide_restore) {{
+        const p = window.parent.__sslive_slide_index;
+        if (p != null && Number.isFinite(+p)) currentSlide = Math.max(0, (+p) | 0);
+        window.parent.__sslive_force_slide_restore = false;
+      }}
     }} catch (e) {{}}
     let selectedCellId = {json.dumps(first_code)};
     let lastResultT = 0;
@@ -3741,10 +3745,11 @@ def generate_presenter_html(
         const l = window.parent.__sslive_last_layout;
         if (l && l.type === 'sslive_layout_apply') applyLayoutMsg(l);
         const g = window.parent.__sslive_goto;
-        // Only restore *slide index* — ignore keep_edit forever after first consume
-        if (g && g.type === 'sslive_goto' && g.t && g.t !== lastGotoT) {{
+        // One-shot restore after layout-save rebuild only (g.force)
+        if (g && g.type === 'sslive_goto' && g.force && g.t && g.t !== lastGotoT) {{
           lastGotoT = g.t;
           gotoSlideFromHost(g);
+          try {{ window.parent.__sslive_goto = null; }} catch (e2) {{}}
         }}
       }} catch (e) {{}}
     }}, 150);
@@ -3893,19 +3898,17 @@ def generate_presenter_html(
       rescale();
     }})();
 
-    // restore slide (parent index wins if the iframe was rebuilt mid-edit)
-    try {{
-      const p = window.parent && window.parent.__sslive_slide_index;
-      if (p != null && Number.isFinite(+p)) currentSlide = Math.max(0, (+p) | 0);
-    }} catch (e) {{}}
+    // Fresh open: stay on initial_slide. Mid-edit rebuild: apply one-shot goto.
     showSlide(currentSlide, {{ selectFirst: false }});
     try {{
       var pending = window.parent.__sslive_last_result;
       if (pending && pending.type === 'sslive_result') applyRunResult(pending);
       var g0 = window.parent && window.parent.__sslive_goto;
-      if (g0 && g0.type === 'sslive_goto') {{
+      // Only consume goto when force-restore was requested (layout save rebuild)
+      if (g0 && g0.type === 'sslive_goto' && g0.force) {{
         lastGotoT = g0.t || 0;
         gotoSlideFromHost(g0);
+        try {{ window.parent.__sslive_goto = null; }} catch (e2) {{}}
       }}
     }} catch (e) {{}}
     // re-select the code cell we care about
@@ -4175,6 +4178,7 @@ def _presenter_iframe_html(height: str = "720px", port: int | None = None) -> st
     else:
         short = (msg or "offline")[:40]
         label = f"gpu · offline · {short}"
+    # Fresh open always starts at 0 unless a force-restore is in flight
     initial = int(_SESSION.get("slide_index") or 0)
     html = generate_presenter_html(
         deck, backend_label=label, port=port or 0, initial_slide=initial
@@ -4682,22 +4686,49 @@ async def _sync_slide_index_from_parent() -> int | None:
     return None
 
 
-def _push_slide_index_restore(*, keep_edit: bool = False) -> None:
-    """Tell live iframe(s) to return to the session slide after a parent rebuild.
+def _reset_slide_index_for_open() -> None:
+    """Fresh ``%slive``: always start at slide 1 (index 0).
 
-    Layout ``add_msg`` / ``update_msg`` can rebuild the srcdoc iframe at slide 0
-    — this restores the slide index only. ``keep_edit`` defaults to False: a
-    sticky keep_edit flag was incorrectly turning ✎ on during arrow navigation.
+    Without this, a sticky ``parent.__sslive_slide_index`` from the previous
+    session (e.g. 6 → UI 7/7) wins over ``initial_slide=0`` and re-opens the
+    deck on the last slide every time.
+    """
+    _SESSION["slide_index"] = 0
+    if iife is None:
+        return
+    try:
+        iife(
+            "(function(){"
+            "window.__sslive_slide_index=0;"
+            "window.__sslive_force_slide_restore=false;"
+            "window.__sslive_goto=null;"
+            "})();"
+        )
+    except Exception as e:
+        _SESSION["_slide_reset_err"] = str(e)
+
+
+def _push_slide_index_restore(*, keep_edit: bool = False) -> None:
+    """One-shot: restore slide after a layout-save rebuild (not on fresh %slive).
+
+    Sets ``__sslive_force_slide_restore`` so the new iframe may honor the index;
+    normal ``%slive`` clears that flag and always opens at slide 0.
     """
     idx = int(_SESSION.get("slide_index") or 0)
     if iife is None:
         return
-    # keep_edit intentionally ignored for normal restores (API kept for callers)
     js = f"""
 (function() {{
   var idx = {idx};
-  var msg = {{ type: 'sslive_goto', slide_index: idx, keep_edit: false, t: Date.now() }};
+  var msg = {{
+    type: 'sslive_goto',
+    slide_index: idx,
+    keep_edit: false,
+    force: true,
+    t: Date.now()
+  }};
   window.__sslive_slide_index = idx;
+  window.__sslive_force_slide_restore = true;
   window.__sslive_goto = msg;
   function push() {{
     document.querySelectorAll('iframe').forEach(function(f) {{
@@ -5674,6 +5705,8 @@ async def slive(
         # re-mounts the cell output). So: red-eye *before* show when needed,
         # show once, never skip after the iframe is on screen.
         _start_bridge()
+        # Clear sticky last-slide (e.g. 7/7) before building the srcdoc
+        _reset_slide_index_for_open()
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         _SESSION["launcher_msg_id"] = mid
 
