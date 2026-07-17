@@ -46,10 +46,13 @@ Overlay keyed by `el_id` (absent = flow layout, today's behavior):
 - Toggle: `e` key / ✎ button. Selection outline + floating toolbar.
 - **Drag**: pointer events; delta ÷ current stage scale → design px; live DOM
   update. Code cells drag by a **grip handle only** (textarea keeps its clicks).
-- **Resize**: edge handle → width (height auto; images/outputs both).
+- **Resize**: Google Slides–style 8 handles (corners + edges) → `w`/`h`
+  (and `x`/`y` when resizing from left/top). Note corner-drag scales `fs`
+  with the box; Alt+corner forces font-scale on any element.
 - **Nudge**: arrows 1px, Shift+arrows 10px.
-- **Toolbar**: font size stepper, font family dropdown, z front/back,
-  flow order up/down, reset-to-flow.
+- **Toolbar**: font size stepper, font family dropdown, free **z** / **order**
+  number fields (any integer on the selected element) plus ±1 buttons,
+  reset-to-flow.
 - Debounced `postMessage {type:'sslive_layout', el_id, patch}` to parent queue.
 
 ## Python side
@@ -85,10 +88,10 @@ Overlay keyed by `el_id` (absent = flow layout, today's behavior):
    echo for slide-originated patches — the DOM already shows the result)
 3. **S2-C** toolbar: font size/family, resize, z-order, flow reorder — **done**
    (pure presenter UI — Python patch pipeline from S2-A/B needed zero changes;
-   toolbar is viewport-fixed so it never scales down with the stage; z buttons
-   enabled only for positioned elements, order buttons only for flow; reset
-   sends an all-null patch which drops the spec entirely; selection survives
-   output re-render after Run)
+   toolbar is viewport-fixed so it never scales down with the stage; free z/order
+   number inputs on the selected element (not linear-only ±1); 8-handle resize
+   persists `w`/`h`/`x`/`y`; reset sends an all-null patch which drops the spec
+   entirely; selection survives output re-render after Run)
 4. **S2-D** finer note-block elements (mistletoe path), image polish
 5. later: reveal-order fragments (`fragment_step` reserved), undo/redo,
    multi-select, snap guides, per-slide backgrounds

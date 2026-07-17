@@ -512,10 +512,16 @@ def _el_style(spec: dict) -> str:
         parts.append(f"left:{_css_len(x) or 0}px")
         parts.append(f"top:{_css_len(y) or 0}px")
         parts.append("margin:0")
+    elif spec.get("z") is not None:
+        # z-index only applies to positioned elements; keep in flow with relative.
+        parts.append("position:relative")
     for key, prop in (("w", "width"), ("h", "height")):
         v = _css_len(spec.get(key))
         if v is not None:
             parts.append(f"{prop}:{v}px")
+    # Explicit height pins a box like Google slides — scroll rather than spill.
+    if spec.get("h") is not None:
+        parts.append("overflow:auto")
     for key, prop in (("z", "z-index"), ("order", "order")):
         try:
             if spec.get(key) is not None:
@@ -1181,16 +1187,29 @@ def generate_presenter_html(
     #edit-toolbar button:disabled {{ opacity:0.35; cursor:default; }}
     #edit-toolbar select {{ background:#1f2937; border:1px solid #4b5563; color:#e5e7eb;
       border-radius:6px; padding:3px 6px; font-size:13px; }}
+    #edit-toolbar input[type=number] {{ background:#1f2937; border:1px solid #4b5563; color:#e5e7eb;
+      border-radius:6px; padding:3px 4px; font-size:13px; width:52px; text-align:center;
+      -moz-appearance:textfield; }}
+    #edit-toolbar input[type=number]::-webkit-outer-spin-button,
+    #edit-toolbar input[type=number]::-webkit-inner-spin-button {{ -webkit-appearance:none; margin:0; }}
     #edit-toolbar .tb-label {{ color:#9ca3af; font-family:ui-monospace,monospace; font-size:11px;
       max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+    #edit-toolbar .tb-field {{ color:#9ca3af; font-size:11px; display:inline-flex; align-items:center; gap:4px; }}
     #edit-toolbar .tb-sep {{ width:1px; height:18px; background:#374151; }}
     #edit-toolbar #tb-fs-val {{ min-width:32px; text-align:center; }}
-    /* width-resize handle: full-height strip on the selected element's right edge */
-    .rs-handle {{ position:absolute; right:-12px; top:0; bottom:0; width:24px;
-      cursor:ew-resize; touch-action:none; z-index:5; display:flex; align-items:center; }}
-    .rs-handle::after {{ content:''; width:10px; height:56px; margin:auto;
-      border-radius:5px; background:#f59e0b; opacity:0.85; }}
+    /* Google Slides–style resize: 8 handles on selection box */
     body.editing .el-editsel {{ position:relative; }}
+    .rs-handle {{ position:absolute; width:12px; height:12px; background:#60a5fa;
+      border:2px solid #fff; border-radius:2px; box-sizing:border-box;
+      touch-action:none; z-index:6; box-shadow:0 0 0 1px rgba(0,0,0,0.35); }}
+    .rs-handle.rs-nw {{ left:-7px; top:-7px; cursor:nwse-resize; }}
+    .rs-handle.rs-n  {{ left:50%; top:-7px; transform:translateX(-50%); cursor:ns-resize; }}
+    .rs-handle.rs-ne {{ right:-7px; top:-7px; cursor:nesw-resize; }}
+    .rs-handle.rs-e  {{ right:-7px; top:50%; transform:translateY(-50%); cursor:ew-resize; }}
+    .rs-handle.rs-se {{ right:-7px; bottom:-7px; cursor:nwse-resize; }}
+    .rs-handle.rs-s  {{ left:50%; bottom:-7px; transform:translateX(-50%); cursor:ns-resize; }}
+    .rs-handle.rs-sw {{ left:-7px; bottom:-7px; cursor:nesw-resize; }}
+    .rs-handle.rs-w  {{ left:-7px; top:50%; transform:translateY(-50%); cursor:ew-resize; }}
     """
 
     js = f"""
@@ -1314,13 +1333,15 @@ def generate_presenter_html(
       updateToolbar();
     }}
 
-    // ── S2-C toolbar: font size/family, z-order, flow order, resize, reset ──
+    // ── S2-C toolbar: font size/family, free z/order, 8-handle resize, reset ──
     const TB_FONTS = [
       ['', 'Default'],
       ["Georgia, 'Times New Roman', serif", 'Serif'],
       ["'Helvetica Neue', Arial, sans-serif", 'Sans'],
       ['ui-monospace, Menlo, monospace', 'Mono'],
     ];
+    const RS_DIRS = ['nw','n','ne','e','se','s','sw','w'];
+    const RS_MIN = 40;
 
     function selElId() {{ return editSel ? (editSel.dataset.elId || editSel.id) : null; }}
     function isAbs() {{ return !!editSel && editSel.style.position === 'absolute'; }}
@@ -1329,16 +1350,31 @@ def generate_presenter_html(
       return Math.round(parseFloat(editSel.style.fontSize)
         || parseFloat(getComputedStyle(editSel).fontSize) || 28);
     }}
-    function curZ() {{ return (editSel && parseInt(editSel.style.zIndex)) || 0; }}
-    function curOrder() {{ return (editSel && parseInt(editSel.style.order)) || 0; }}
+    function curZ() {{
+      if (!editSel) return 0;
+      const v = parseInt(editSel.style.zIndex, 10);
+      return Number.isFinite(v) ? v : 0;
+    }}
+    function curOrder() {{
+      if (!editSel) return 0;
+      const v = parseInt(editSel.style.order, 10);
+      return Number.isFinite(v) ? v : 0;
+    }}
 
     function ensureHandle() {{
       removeHandle();
       if (!editSel) return;
-      const h = document.createElement('div');
-      h.className = 'rs-handle';
-      h.title = 'drag to resize width';
-      editSel.appendChild(h);
+      // Handles need a positioned ancestor; don't clobber absolute layout.
+      if (editSel.style.position !== 'absolute') {{
+        // CSS body.editing .el-editsel {{ position:relative }} covers flow.
+      }}
+      RS_DIRS.forEach((dir) => {{
+        const h = document.createElement('div');
+        h.className = 'rs-handle rs-' + dir;
+        h.dataset.dir = dir;
+        h.title = 'drag to resize';
+        editSel.appendChild(h);
+      }});
     }}
     function removeHandle() {{
       document.querySelectorAll('.rs-handle').forEach(x => x.remove());
@@ -1353,11 +1389,18 @@ def generate_presenter_html(
       document.getElementById('tb-fs-val').textContent = curFs();
       const sel = document.getElementById('tb-font');
       sel.value = editSel.style.fontFamily || '';
-      // z needs positioning; flow order needs flow — enable accordingly
-      document.getElementById('tb-front').disabled = !isAbs();
-      document.getElementById('tb-back').disabled = !isAbs();
-      document.getElementById('tb-up').disabled = isAbs();
-      document.getElementById('tb-down').disabled = isAbs();
+      // Free absolute integers on the selected element (not linear-only ±1).
+      const zIn = document.getElementById('tb-z');
+      const oIn = document.getElementById('tb-order');
+      if (zIn && document.activeElement !== zIn) zIn.value = String(curZ());
+      if (oIn && document.activeElement !== oIn) oIn.value = String(curOrder());
+      // Both always available — pick the value you want on this element.
+      document.getElementById('tb-front').disabled = false;
+      document.getElementById('tb-back').disabled = false;
+      document.getElementById('tb-up').disabled = false;
+      document.getElementById('tb-down').disabled = false;
+      if (zIn) zIn.disabled = false;
+      if (oIn) oIn.disabled = false;
       ensureHandle();
     }}
 
@@ -1374,9 +1417,18 @@ def generate_presenter_html(
         }}
       }}
       if ('ff' in patch) editSel.style.fontFamily = patch.ff || '';
-      if ('z' in patch) editSel.style.zIndex = patch.z == null ? '' : patch.z;
+      if ('z' in patch) {{
+        editSel.style.zIndex = patch.z == null ? '' : patch.z;
+        // z-index only paints for positioned boxes; pin relative if still in flow
+        if (patch.z != null && editSel.style.position !== 'absolute') {{
+          editSel.style.position = 'relative';
+        }}
+      }}
       if ('order' in patch) editSel.style.order = patch.order == null ? '' : patch.order;
       if ('w' in patch) editSel.style.width = patch.w == null ? '' : patch.w + 'px';
+      if ('h' in patch) editSel.style.height = patch.h == null ? '' : patch.h + 'px';
+      if ('x' in patch) editSel.style.left = patch.x == null ? '' : patch.x + 'px';
+      if ('y' in patch) editSel.style.top = patch.y == null ? '' : patch.y + 'px';
       sendLayoutPatch(selElId(), patch);
       updateToolbar();
     }}
@@ -1399,6 +1451,7 @@ def generate_presenter_html(
       const x = Math.round((er.left - sr.left) / sc);
       const y = Math.round((er.top - sr.top) / sc);
       const w = Math.round(er.width / sc);
+      const h = Math.round(er.height / sc);
       if (converted) {{
         el.style.width = w + 'px';
         el.style.position = 'absolute';
@@ -1406,7 +1459,7 @@ def generate_presenter_html(
       }}
       el.style.left = x + 'px';
       el.style.top = y + 'px';
-      return {{ x: x, y: y, w: w, converted: converted }};
+      return {{ x: x, y: y, w: w, h: h, converted: converted }};
     }}
 
     function beginDrag(el, ev) {{
@@ -1435,17 +1488,75 @@ def generate_presenter_html(
 
     let rsDrag = null;
 
+    function applyResizeFrame(state, clientX, clientY) {{
+      // Google Slides–style: drag a corner/edge → box grows/shrinks from that side.
+      const dx = (clientX - state.sx) / state.sc;
+      const dy = (clientY - state.sy) / state.sc;
+      let x = state.ox, y = state.oy, w = state.ow, h = state.oh;
+      const dir = state.dir || '';
+      const touchW = dir.indexOf('e') >= 0 || dir.indexOf('w') >= 0;
+      const touchH = dir.indexOf('n') >= 0 || dir.indexOf('s') >= 0;
+      if (dir.indexOf('e') >= 0) w = Math.max(RS_MIN, state.ow + dx);
+      if (dir.indexOf('s') >= 0) h = Math.max(RS_MIN, state.oh + dy);
+      if (dir.indexOf('w') >= 0) {{
+        w = Math.max(RS_MIN, state.ow - dx);
+        x = state.ox + (state.ow - w);
+      }}
+      if (dir.indexOf('n') >= 0) {{
+        h = Math.max(RS_MIN, state.oh - dy);
+        y = state.oy + (state.oh - h);
+      }}
+      // Corner drag on notes (or Alt+corner anywhere): scale font with the box
+      if (state.scaleFs && state.ofs && dir.length === 2) {{
+        const sx = w / Math.max(1, state.ow), sy = h / Math.max(1, state.oh);
+        const scale = Math.max(0.25, Math.min(sx, sy));
+        const fs = Math.max(8, Math.round(state.ofs * scale));
+        state.el.style.fontSize = fs + 'px';
+        state.el.style.setProperty('--code-fs', fs + 'px');
+        state.fs = fs;
+      }}
+      x = Math.round(x); y = Math.round(y);
+      w = Math.round(w); h = Math.round(h);
+      state.el.style.left = x + 'px';
+      state.el.style.top = y + 'px';
+      if (touchW) state.el.style.width = w + 'px';
+      if (touchH) {{
+        state.el.style.height = h + 'px';
+        state.el.style.overflow = 'auto';
+      }}
+      state.cx = x; state.cy = y; state.cw = w; state.ch = h;
+      state.touchW = touchW; state.touchH = touchH;
+    }}
+
     document.addEventListener('pointerdown', (e) => {{
       if (!editing || e.button !== 0) return;
       if (e.target.closest('#edit-toolbar')) return;  // toolbar clicks never drag/deselect
       const rh = e.target.closest('.rs-handle');
       if (rh) {{
         const el = rh.parentElement;
-        const sr = el.closest('[data-slide]').getBoundingClientRect();
-        const sc = sr.width / 1920 || 1;
-        rsDrag = {{ el: el, elId: el.dataset.elId || el.id, sx: e.clientX,
-                   ow: el.getBoundingClientRect().width / sc, sc: sc }};
+        selectEl(el);
+        const start = ensureAbs(el);
+        const slide = el.closest('[data-slide]');
+        const sc = slide ? (slide.getBoundingClientRect().width / 1920 || 1) : 1;
+        // Prefer explicit layout size; fall back to measured box.
+        const explicitH = parseFloat(el.style.height);
+        const oh = Number.isFinite(explicitH) && explicitH > 0 ? explicitH : start.h;
+        const explicitW = parseFloat(el.style.width);
+        const ow = Number.isFinite(explicitW) && explicitW > 0 ? explicitW : start.w;
+        const isNote = el.classList.contains('note-block');
+        rsDrag = {{
+          el: el, elId: el.dataset.elId || el.id, dir: rh.dataset.dir || 'se',
+          sx: e.clientX, sy: e.clientY, sc: sc,
+          ox: start.x, oy: start.y, ow: ow, oh: oh,
+          converted: start.converted,
+          // Corner-drag notes scale font with the box (Google-ish text grow);
+          // hold Alt on any element to force font-scale on corner drag.
+          scaleFs: isNote || e.altKey,
+          ofs: curFs(), fs: null,
+          cx: start.x, cy: start.y, cw: ow, ch: oh
+        }};
         e.preventDefault();
+        e.stopPropagation();
         try {{ rh.setPointerCapture(e.pointerId); }} catch (err) {{}}
         return;
       }}
@@ -1471,8 +1582,7 @@ def generate_presenter_html(
 
     document.addEventListener('pointermove', (e) => {{
       if (rsDrag) {{
-        const w = Math.max(60, Math.round(rsDrag.ow + (e.clientX - rsDrag.sx) / rsDrag.sc));
-        rsDrag.el.style.width = w + 'px';
+        applyResizeFrame(rsDrag, e.clientX, e.clientY);
         return;
       }}
       if (!drag) return;
@@ -1489,8 +1599,12 @@ def generate_presenter_html(
 
     document.addEventListener('pointerup', (e) => {{
       if (rsDrag) {{
-        const w = Math.round(parseFloat(rsDrag.el.style.width) || rsDrag.ow);
-        sendLayoutPatch(rsDrag.elId, {{ w: w }});
+        applyResizeFrame(rsDrag, e.clientX, e.clientY);
+        const patch = {{ x: rsDrag.cx, y: rsDrag.cy }};
+        if (rsDrag.touchW) patch.w = rsDrag.cw;
+        if (rsDrag.touchH) patch.h = rsDrag.ch;
+        if (rsDrag.fs != null) patch.fs = rsDrag.fs;
+        sendLayoutPatch(rsDrag.elId, patch);
         rsDrag = null;
         updateToolbar();
         return;
@@ -1503,7 +1617,7 @@ def generate_presenter_html(
         }};
         if (drag.includeW) patch.w = drag.w;
         sendLayoutPatch(drag.elId, patch);
-        updateToolbar();  // abs conversion flips z/order button states
+        updateToolbar();
       }}
       drag = null;
     }});
@@ -1557,8 +1671,9 @@ def generate_presenter_html(
     }}
 
     document.addEventListener('keydown', (e) => {{
-      if (e.target && e.target.tagName === 'TEXTAREA') {{
-        if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') return;
+      const tag = e.target && e.target.tagName;
+      if (tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT') {{
+        if (tag === 'TEXTAREA' && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) return;
         return;
       }}
       if (e.key === 'e' && !e.metaKey && !e.ctrlKey && !e.altKey) {{
@@ -1613,6 +1728,29 @@ def generate_presenter_html(
       document.getElementById('tb-back').addEventListener('click', () => tbPatch({{ z: curZ() - 1 }}));
       document.getElementById('tb-up').addEventListener('click', () => tbPatch({{ order: curOrder() - 1 }}));
       document.getElementById('tb-down').addEventListener('click', () => tbPatch({{ order: curOrder() + 1 }}));
+      // Free order / z: type any integer on the selected element (not linear-only).
+      const commitNum = (id, key) => {{
+        const inp = document.getElementById(id);
+        if (!inp) return;
+        const apply = () => {{
+          if (!editSel) return;
+          const raw = (inp.value || '').trim();
+          if (raw === '' || raw === '-') return;
+          const n = parseInt(raw, 10);
+          if (!Number.isFinite(n)) return;
+          const patch = {{}};
+          patch[key] = n;
+          tbPatch(patch);
+        }};
+        inp.addEventListener('change', apply);
+        inp.addEventListener('keydown', (ev) => {{
+          if (ev.key === 'Enter') {{ ev.preventDefault(); apply(); inp.blur(); }}
+          ev.stopPropagation();  // don't nudge/slide while typing
+        }});
+        inp.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+      }};
+      commitNum('tb-z', 'z');
+      commitNum('tb-order', 'order');
       document.getElementById('tb-reset').addEventListener('click', () => {{
         if (!editSel) return;
         const elId = selElId();
@@ -1689,11 +1827,17 @@ def generate_presenter_html(
     <button type="button" id="tb-fs-plus" title="bigger text">A+</button>
     <select id="tb-font" title="font family"></select>
     <span class="tb-sep"></span>
-    <button type="button" id="tb-front" title="bring forward (needs position)">⬆ front</button>
-    <button type="button" id="tb-back" title="send backward (needs position)">⬇ back</button>
+    <span class="tb-field" title="stacking order (z-index) — any integer">z
+      <input type="number" id="tb-z" step="1" />
+    </span>
+    <button type="button" id="tb-front" title="bring forward (+1 z)">⬆ front</button>
+    <button type="button" id="tb-back" title="send backward (−1 z)">⬇ back</button>
     <span class="tb-sep"></span>
-    <button type="button" id="tb-up" title="earlier in flow">↑ order</button>
-    <button type="button" id="tb-down" title="later in flow">↓ order</button>
+    <span class="tb-field" title="flex flow order — set any integer on this element">order
+      <input type="number" id="tb-order" step="1" />
+    </span>
+    <button type="button" id="tb-up" title="earlier in flow (−1 order)">↑</button>
+    <button type="button" id="tb-down" title="later in flow (+1 order)">↓</button>
     <span class="tb-sep"></span>
     <button type="button" id="tb-reset" title="clear all overrides">reset</button>
   </div>
