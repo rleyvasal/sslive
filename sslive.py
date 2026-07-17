@@ -1168,6 +1168,29 @@ def generate_presenter_html(
     .drag-grip {{ display:none; cursor:move; user-select:none; color:#9ca3af;
       font-size:18px; padding:2px 6px; touch-action:none; }}
     body.editing .drag-grip {{ display:inline-block; }}
+    /* ── edit toolbar (S2-C): viewport-fixed, unscaled ── */
+    #edit-toolbar {{ position:fixed; top:54px; left:50%; transform:translateX(-50%); z-index:30;
+      display:none; align-items:center; gap:8px; flex-wrap:wrap; justify-content:center;
+      background:rgba(3,7,18,0.92); border:1px solid #374151; color:#e5e7eb;
+      padding:6px 10px; border-radius:10px; font-size:13px;
+      box-shadow:0 4px 16px rgba(0,0,0,0.45); }}
+    body.editing #edit-toolbar.show {{ display:flex; }}
+    #edit-toolbar button {{ background:#1f2937; border:1px solid #4b5563; color:#e5e7eb;
+      border-radius:6px; padding:3px 9px; font-size:13px; cursor:pointer; }}
+    #edit-toolbar button:hover:not(:disabled) {{ background:#374151; }}
+    #edit-toolbar button:disabled {{ opacity:0.35; cursor:default; }}
+    #edit-toolbar select {{ background:#1f2937; border:1px solid #4b5563; color:#e5e7eb;
+      border-radius:6px; padding:3px 6px; font-size:13px; }}
+    #edit-toolbar .tb-label {{ color:#9ca3af; font-family:ui-monospace,monospace; font-size:11px;
+      max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+    #edit-toolbar .tb-sep {{ width:1px; height:18px; background:#374151; }}
+    #edit-toolbar #tb-fs-val {{ min-width:32px; text-align:center; }}
+    /* width-resize handle: full-height strip on the selected element's right edge */
+    .rs-handle {{ position:absolute; right:-12px; top:0; bottom:0; width:24px;
+      cursor:ew-resize; touch-action:none; z-index:5; display:flex; align-items:center; }}
+    .rs-handle::after {{ content:''; width:10px; height:56px; margin:auto;
+      border-radius:5px; background:#f59e0b; opacity:0.85; }}
+    body.editing .el-editsel {{ position:relative; }}
     """
 
     js = f"""
@@ -1234,7 +1257,11 @@ def generate_presenter_html(
         const tmp = document.createElement('div');
         tmp.innerHTML = msg.html;
         const neu = tmp.firstElementChild;
-        if (neu) out.replaceWith(neu);
+        if (neu) {{
+          const wasSel = (typeof editSel !== 'undefined' && editSel === out);
+          out.replaceWith(neu);
+          if (wasSel) selectEl(neu);  // keep selection/handle on the fresh node
+        }}
       }}
       const btn = document.querySelector('.run-btn[data-cell-id="' + cellId + '"]');
       if (btn) btn.disabled = false;
@@ -1284,6 +1311,74 @@ def generate_presenter_html(
       if (editSel) editSel.classList.remove('el-editsel');
       editSel = el || null;
       if (editSel) editSel.classList.add('el-editsel');
+      updateToolbar();
+    }}
+
+    // ── S2-C toolbar: font size/family, z-order, flow order, resize, reset ──
+    const TB_FONTS = [
+      ['', 'Default'],
+      ["Georgia, 'Times New Roman', serif", 'Serif'],
+      ["'Helvetica Neue', Arial, sans-serif", 'Sans'],
+      ['ui-monospace, Menlo, monospace', 'Mono'],
+    ];
+
+    function selElId() {{ return editSel ? (editSel.dataset.elId || editSel.id) : null; }}
+    function isAbs() {{ return !!editSel && editSel.style.position === 'absolute'; }}
+    function curFs() {{
+      if (!editSel) return 28;
+      return Math.round(parseFloat(editSel.style.fontSize)
+        || parseFloat(getComputedStyle(editSel).fontSize) || 28);
+    }}
+    function curZ() {{ return (editSel && parseInt(editSel.style.zIndex)) || 0; }}
+    function curOrder() {{ return (editSel && parseInt(editSel.style.order)) || 0; }}
+
+    function ensureHandle() {{
+      removeHandle();
+      if (!editSel) return;
+      const h = document.createElement('div');
+      h.className = 'rs-handle';
+      h.title = 'drag to resize width';
+      editSel.appendChild(h);
+    }}
+    function removeHandle() {{
+      document.querySelectorAll('.rs-handle').forEach(x => x.remove());
+    }}
+
+    function updateToolbar() {{
+      const tb = document.getElementById('edit-toolbar');
+      if (!tb) return;
+      if (!editing || !editSel) {{ tb.classList.remove('show'); removeHandle(); return; }}
+      tb.classList.add('show');
+      document.getElementById('tb-el').textContent = selElId();
+      document.getElementById('tb-fs-val').textContent = curFs();
+      const sel = document.getElementById('tb-font');
+      sel.value = editSel.style.fontFamily || '';
+      // z needs positioning; flow order needs flow — enable accordingly
+      document.getElementById('tb-front').disabled = !isAbs();
+      document.getElementById('tb-back').disabled = !isAbs();
+      document.getElementById('tb-up').disabled = isAbs();
+      document.getElementById('tb-down').disabled = isAbs();
+      ensureHandle();
+    }}
+
+    function tbPatch(patch) {{
+      // apply locally (live, no rebuild) + persist via bridge
+      if (!editSel) return;
+      if ('fs' in patch) {{
+        if (patch.fs == null) {{
+          editSel.style.fontSize = '';
+          editSel.style.removeProperty('--code-fs');
+        }} else {{
+          editSel.style.fontSize = patch.fs + 'px';
+          editSel.style.setProperty('--code-fs', patch.fs + 'px');
+        }}
+      }}
+      if ('ff' in patch) editSel.style.fontFamily = patch.ff || '';
+      if ('z' in patch) editSel.style.zIndex = patch.z == null ? '' : patch.z;
+      if ('order' in patch) editSel.style.order = patch.order == null ? '' : patch.order;
+      if ('w' in patch) editSel.style.width = patch.w == null ? '' : patch.w + 'px';
+      sendLayoutPatch(selElId(), patch);
+      updateToolbar();
     }}
 
     function sendLayoutPatch(elId, patch) {{
@@ -1333,13 +1428,27 @@ def generate_presenter_html(
       editSel.style.top = ny + 'px';
       const elId = editSel.dataset.elId || editSel.id;
       const patch = {{ x: nx, y: ny }};
-      if (cur.converted) patch.w = cur.w;
+      if (cur.converted) {{ patch.w = cur.w; updateToolbar(); }}
       clearTimeout(nudgeTimer);
       nudgeTimer = setTimeout(() => sendLayoutPatch(elId, patch), 350);
     }}
 
+    let rsDrag = null;
+
     document.addEventListener('pointerdown', (e) => {{
       if (!editing || e.button !== 0) return;
+      if (e.target.closest('#edit-toolbar')) return;  // toolbar clicks never drag/deselect
+      const rh = e.target.closest('.rs-handle');
+      if (rh) {{
+        const el = rh.parentElement;
+        const sr = el.closest('[data-slide]').getBoundingClientRect();
+        const sc = sr.width / 1920 || 1;
+        rsDrag = {{ el: el, elId: el.dataset.elId || el.id, sx: e.clientX,
+                   ow: el.getBoundingClientRect().width / sc, sc: sc }};
+        e.preventDefault();
+        try {{ rh.setPointerCapture(e.pointerId); }} catch (err) {{}}
+        return;
+      }}
       const grip = e.target.closest('.drag-grip');
       if (grip) {{
         const el = document.getElementById(grip.dataset.dragFor);
@@ -1361,6 +1470,11 @@ def generate_presenter_html(
     }}, true);
 
     document.addEventListener('pointermove', (e) => {{
+      if (rsDrag) {{
+        const w = Math.max(60, Math.round(rsDrag.ow + (e.clientX - rsDrag.sx) / rsDrag.sc));
+        rsDrag.el.style.width = w + 'px';
+        return;
+      }}
       if (!drag) return;
       if (!drag.started) {{
         if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) <= 2) return;
@@ -1374,6 +1488,13 @@ def generate_presenter_html(
     }});
 
     document.addEventListener('pointerup', (e) => {{
+      if (rsDrag) {{
+        const w = Math.round(parseFloat(rsDrag.el.style.width) || rsDrag.ow);
+        sendLayoutPatch(rsDrag.elId, {{ w: w }});
+        rsDrag = null;
+        updateToolbar();
+        return;
+      }}
       if (!drag) return;
       if (drag.started) {{
         const patch = {{
@@ -1382,6 +1503,7 @@ def generate_presenter_html(
         }};
         if (drag.includeW) patch.w = drag.w;
         sendLayoutPatch(drag.elId, patch);
+        updateToolbar();  // abs conversion flips z/order button states
       }}
       drag = null;
     }});
@@ -1474,6 +1596,33 @@ def generate_presenter_html(
     document.getElementById('next-btn')?.addEventListener('click', () => showSlide(currentSlide + 1));
     document.getElementById('edit-btn')?.addEventListener('click', () => setEditing(!editing));
 
+    (function initToolbar() {{
+      const sel = document.getElementById('tb-font');
+      if (!sel) return;
+      TB_FONTS.forEach(([v, label]) => {{
+        const o = document.createElement('option');
+        o.value = v; o.textContent = label;
+        sel.appendChild(o);
+      }});
+      sel.addEventListener('change', () => tbPatch({{ ff: sel.value || null }}));
+      document.getElementById('tb-fs-minus').addEventListener('click',
+        () => tbPatch({{ fs: Math.max(8, curFs() - 2) }}));
+      document.getElementById('tb-fs-plus').addEventListener('click',
+        () => tbPatch({{ fs: curFs() + 2 }}));
+      document.getElementById('tb-front').addEventListener('click', () => tbPatch({{ z: curZ() + 1 }}));
+      document.getElementById('tb-back').addEventListener('click', () => tbPatch({{ z: curZ() - 1 }}));
+      document.getElementById('tb-up').addEventListener('click', () => tbPatch({{ order: curOrder() - 1 }}));
+      document.getElementById('tb-down').addEventListener('click', () => tbPatch({{ order: curOrder() + 1 }}));
+      document.getElementById('tb-reset').addEventListener('click', () => {{
+        if (!editSel) return;
+        const elId = selElId();
+        editSel.style.cssText = '';
+        sendLayoutPatch(elId, {{ x: null, y: null, w: null, h: null, z: null,
+                                order: null, fs: null, ff: null, align: null }});
+        updateToolbar();
+      }});
+    }})();
+
     (() => {{
       const DESIGN_W = 1920, DESIGN_H = 1080;
       const stage = document.getElementById('stage');
@@ -1531,6 +1680,22 @@ def generate_presenter_html(
         {slides_html or empty}
       </div>
     </div>
+  </div>
+  <div id="edit-toolbar">
+    <span class="tb-label" id="tb-el">—</span>
+    <span class="tb-sep"></span>
+    <button type="button" id="tb-fs-minus" title="smaller text">A−</button>
+    <span id="tb-fs-val">–</span>
+    <button type="button" id="tb-fs-plus" title="bigger text">A+</button>
+    <select id="tb-font" title="font family"></select>
+    <span class="tb-sep"></span>
+    <button type="button" id="tb-front" title="bring forward (needs position)">⬆ front</button>
+    <button type="button" id="tb-back" title="send backward (needs position)">⬇ back</button>
+    <span class="tb-sep"></span>
+    <button type="button" id="tb-up" title="earlier in flow">↑ order</button>
+    <button type="button" id="tb-down" title="later in flow">↓ order</button>
+    <span class="tb-sep"></span>
+    <button type="button" id="tb-reset" title="clear all overrides">reset</button>
   </div>
   <div id="nav">
     <button type="button" id="edit-btn" title="edit layout (e)" aria-label="Edit layout">✎</button>

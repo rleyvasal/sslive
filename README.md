@@ -14,6 +14,7 @@ RISE-like live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https:/
 | Preview mode keep-focus after Run | ✅ pre-emptive focus guard (see below) |
 | Move/size/font/order elements (S2-A API) | ✅ `await set_layout(...)` |
 | Edit mode: drag/nudge **in the slide** (S2-B) | ✅ press `e` |
+| Toolbar: font size/family, resize, z-order, flow order (S2-C) | ✅ select an element |
 | Markdown + LaTeX in notes | ✅ mistletoe + latex2mathml (falls back to plain) |
 
 ## Usage
@@ -79,5 +80,13 @@ its current width so the text keeps its wrap.
 Notes render full markdown (bold, lists, images, code) and LaTeX
 (`$...$` / `$$...$$` → MathML) when `mistletoe` + `latex2mathml` are
 installed — same pipeline as sslides.
+
+Selecting an element shows the **floating toolbar** (viewport-fixed, never
+scaled): **A− / A+** font size (±2 px, scales headings + body together, code
+follows via `--code-fs`), **font** dropdown (Default/Serif/Sans/Mono),
+**⬆ front / ⬇ back** z-order (positioned elements), **↑ / ↓ order** flex
+position (flow elements), and **reset** to clear every override. The selected
+element also grows a right-edge **resize handle** (drag to set width).
+All of it flows through the same patch bridge and persists.
 
 Keep driver cells under **`%local`**.

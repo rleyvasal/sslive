@@ -83,7 +83,12 @@ Overlay keyed by `el_id` (absent = flow layout, today's behavior):
    flow→absolute conversion deferred to first real movement so plain clicks
    never change layout mode; nudge patches debounced 350 ms; no `_push_layout`
    echo for slide-originated patches — the DOM already shows the result)
-3. **S2-C** toolbar: font size/family, resize, z-order, flow reorder
+3. **S2-C** toolbar: font size/family, resize, z-order, flow reorder — **done**
+   (pure presenter UI — Python patch pipeline from S2-A/B needed zero changes;
+   toolbar is viewport-fixed so it never scales down with the stage; z buttons
+   enabled only for positioned elements, order buttons only for flow; reset
+   sends an all-null patch which drops the spec entirely; selection survives
+   output re-render after Run)
 4. **S2-D** finer note-block elements (mistletoe path), image polish
 5. later: reveal-order fragments (`fragment_step` reserved), undo/redo,
    multi-select, snap guides, per-slide backgrounds
