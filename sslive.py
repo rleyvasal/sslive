@@ -1372,8 +1372,10 @@ def _scrub_output_html(html: str) -> str:
     return html
 
 
-# Default viz frame height in design-space px (stage is 1920×1080).
-_DEFAULT_VIZ_H = 560
+# Default viz height in design-space px (stage is 1920×1080). Nested data-URL
+# iframes were collapsing to Plotly's ~700px default width — plotly now mounts
+# directly in the slide (already a srcdoc sandbox) so width:100% is real.
+_DEFAULT_VIZ_H = 680
 
 
 def _height_px_from_style(style: str) -> int | None:
@@ -1389,12 +1391,79 @@ def _height_px_from_style(style: str) -> int | None:
         return None
 
 
-def _isolate_rich_html(html: str, *, min_height: int | None = None) -> str:
-    """Sandbox Plotly/script HTML in a nested iframe (pointcloud-style).
+def _width_px_from_style(style: str) -> int | None:
+    """Parse ``width: Npx`` from an inline style string, if present."""
+    if not style:
+        return None
+    m = re.search(r"(?:^|;)\s*width\s*:\s*([\d.]+)\s*px", style, flags=re.I)
+    if not m:
+        return None
+    try:
+        return max(80, int(float(m.group(1))))
+    except (TypeError, ValueError):
+        return None
 
-    Parent SolveIt uses HTMX; injecting raw Plotly HTML there mangles CDN
-    URLs (``%22https://cdn.plot.ly…``) and throws oobSwap/insertBefore errors.
-    Nested ``data:text/html;base64,…`` never enters the parent DOM parser.
+
+def _plotly_fill_script(host_id: str) -> str:
+    """JS: force every Plotly graph inside host to the host's pixel box."""
+    return (
+        f"<script>(function(){{"
+        f"var host=document.getElementById({json.dumps(host_id)});"
+        f"if(!host)return;"
+        f"function fill(){{"
+        f"if(!window.Plotly)return;"
+        f"var w=host.clientWidth|0,h=host.clientHeight|0;"
+        f"if(w<40||h<40)return;"
+        f"host.querySelectorAll('.js-plotly-plot,.plotly-graph-div').forEach(function(gd){{"
+        f"gd.style.width='100%';gd.style.height='100%';gd.style.minHeight=h+'px';"
+        f"try{{window.Plotly.relayout(gd,{{autosize:false,width:w,height:h}});"
+        f"}}catch(e){{try{{window.Plotly.Plots.resize(gd);}}catch(e2){{}}}}"
+        f"}});"
+        f"}}"
+        f"function boot(){{fill();setTimeout(fill,80);setTimeout(fill,300);setTimeout(fill,800);}}"
+        f"if(window.Plotly)boot();else{{var n=0,t=setInterval(function(){{"
+        f"if(window.Plotly||++n>80){{clearInterval(t);if(window.Plotly)boot();}}"
+        f"}},50);}}"
+        f"if(window.ResizeObserver)try{{new ResizeObserver(function(){{fill();}}).observe(host);}}catch(e){{}}"
+        f"window.addEventListener('resize',fill);"
+        f"}})();</script>"
+    )
+
+
+def _plotly_host_html(inner: str, *, height: int) -> str:
+    """Full-width Plotly mount in the slide (no nested iframe)."""
+    h = max(240, min(int(height), 1000))
+    host_id = f"ph-{abs(hash(inner)) % (10**12):x}"
+    # Neutralize fixed px sizes Plotly/fig.show bake into wrappers
+    cleaned = re.sub(
+        r"""(?i)(style\s*=\s*["'][^"']*?)(?:max-)?width\s*:\s*[\d.]+px\s*;?""",
+        r"\1",
+        inner,
+    )
+    cleaned = re.sub(
+        r"""(?i)(style\s*=\s*["'][^"']*?)(?:max-)?height\s*:\s*[\d.]+px\s*;?""",
+        r"\1",
+        cleaned,
+    )
+    return (
+        f'<div id="{host_id}" class="sslive-plotly-host" '
+        f'style="width:100%;height:{h}px;min-height:{h}px;max-width:100%;'
+        f'display:block;position:relative;overflow:hidden;'
+        f'border-radius:8px;background:#0b1220;box-sizing:border-box">'
+        f"{cleaned}"
+        f"{_plotly_fill_script(host_id)}"
+        f"</div>"
+    )
+
+
+def _isolate_rich_html(html: str, *, min_height: int | None = None) -> str:
+    """Prepare rich HTML for the slide.
+
+    * **Plotly** — mount directly in the slide (srcdoc is already sandboxed from
+      parent HTMX). Nested ``data:`` iframes were collapsing to Plotly's default
+      ~700×450 box, which looks tiny on the 1920×1080 stage.
+    * **Other script HTML** — still sandboxed in a nested iframe so parent HTMX
+      never parses tags (push path also base64-encodes the fragment).
     """
     html = _scrub_output_html(html or "")
     if not html.strip():
@@ -1404,44 +1473,25 @@ def _isolate_rich_html(html: str, *, min_height: int | None = None) -> str:
 
     h = int(min_height or _DEFAULT_VIZ_H)
     h = max(240, min(h, 1000))
-    has_plotly = _looks_like_plotly(html)
-    head_extra = ""
-    if has_plotly:
-        head_extra = (
-            '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" '
-            'charset="utf-8"></script>\n'
-        )
-    # 100% chain so Plotly fills the iframe (avoids tiny white plot card)
+
+    # Plotly: full-width host in the slide document (presenter has Plotly CDN)
+    if _looks_like_plotly(html):
+        return _plotly_host_html(html, height=h)
+
+    # Non-plotly rich HTML (generic scripts) — nested iframe isolation
     doc = (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\n"
-        f"{head_extra}"
-        "<style>"
-        "html,body{margin:0;padding:0;width:100%;height:100%;"
-        "background:#0b1220;color:#e5e7eb;overflow:hidden}"
-        "body{display:flex;flex-direction:column}"
-        ".plotly-graph-div,.js-plotly-plot,"
-        ".plot-container,.svg-container{width:100%!important;height:100%!important;"
-        "flex:1 1 auto;min-height:0}"
-        "/* fig.show() wrappers */ body>div{flex:1 1 auto;min-height:0;width:100%;height:100%}"
-        "</style>\n"
-        f"</head><body>\n{html}\n"
-        "<script>(function(){"
-        "function rz(){if(!window.Plotly)return;"
-        "document.querySelectorAll('.js-plotly-plot,.plotly-graph-div').forEach(function(gd){"
-        "try{window.Plotly.Plots.resize(gd);}catch(e){}});"
-        "}"
-        "window.addEventListener('load',function(){setTimeout(rz,50);setTimeout(rz,300);});"
-        "window.addEventListener('resize',rz);"
-        "})();</script>"
-        "</body></html>"
+        "<style>html,body{margin:0;padding:0;width:100%;height:100%;"
+        "background:#0b1220;color:#e5e7eb;overflow:auto}</style>\n"
+        f"</head><body>\n{html}\n</body></html>"
     )
     raw = doc.encode("utf-8")
     if len(raw) > _MAX_ISOLATED_HTML_BYTES:
         return (
             '<pre style="color:#fecaca;background:#7f1d1d;padding:0.5rem;'
             'border-radius:6px;white-space:pre-wrap">'
-            f"Plotly/HTML output too large for in-slide display "
-            f"({len(raw) // 1024} KB). Downsample the series or export a static image.</pre>"
+            f"HTML output too large for in-slide display "
+            f"({len(raw) // 1024} KB).</pre>"
         )
     b64 = base64.b64encode(raw).decode("ascii")
     return (
@@ -1481,7 +1531,9 @@ def render_output_html(
 
     # When the output box has an explicit layout height, fill it; else a roomy default.
     layout_h = _height_px_from_style(style)
+    layout_w = _width_px_from_style(style)
     viz_h = max(240, layout_h - 8) if layout_h else _DEFAULT_VIZ_H
+    has_html = any(p.kind == "text/html" for p in parts)
 
     chunks: list[str] = []
     for p in parts:
@@ -1494,7 +1546,6 @@ def render_output_html(
                 f'<img src="data:image/png;base64,{p.b64}" style="{img_st}" alt="output"/>'
             )
         elif p.kind == "text/html":
-            # Isolate Plotly/scripts like %pointcloud (iframe), never dump into parent HTMX
             body = _isolate_rich_html(p.text or "", min_height=viz_h)
             fill = "height:100%;" if layout_h else f"min-height:{viz_h}px;"
             chunks.append(
@@ -1508,10 +1559,35 @@ def render_output_html(
         chunks.append(f'<pre style="{out_st}opacity:0.5">(no output)</pre>')
     inner = "\n".join(chunks)
     eid = html_module.escape(f"el-output-{cell_id}")
+    # Plotly/HTML: force full slide width + roomy height unless user set layout w/h.
+    # Tiny saved overlays (or shrink-to-fit absolute boxes) made the plot card tiny.
+    out_style = style or ""
+    compact = out_style.replace(" ", "").lower()
+    if has_html:
+        if not layout_w or (layout_w is not None and layout_w < 500):
+            # Drop a too-small explicit width so the plot can span the column
+            if layout_w is not None and layout_w < 500:
+                out_style = re.sub(
+                    r"(?:^|;)\s*width\s*:\s*[\d.]+px\s*;?",
+                    ";",
+                    out_style,
+                    flags=re.I,
+                )
+                compact = out_style.replace(" ", "").lower()
+            if "width:" not in compact:
+                out_style = (out_style.rstrip(";") + "; " if out_style else "") + (
+                    "width:100%;max-width:100%;box-sizing:border-box;"
+                )
+                compact = out_style.replace(" ", "").lower()
+        if not layout_h:
+            if "height:" not in compact:
+                out_style = (
+                    out_style.rstrip(";") + "; " if out_style else ""
+                ) + f"height:{viz_h}px;min-height:{viz_h}px;"
     return (
         f'<div id="{eid}" data-el-id="{eid}" '
         f'data-type="output" data-cell-id="{html_module.escape(cell_id)}"'
-        f'{extra_attrs}{_style_attr(style)}>'
+        f'{extra_attrs}{_style_attr(out_style)}>'
         f"{inner}</div>"
     )
 
@@ -2202,12 +2278,20 @@ def generate_presenter_html(
     .note-block pre code {{ background:none; border:0; padding:0; }}
     .note-block img {{ max-width:100%; }}
     .sslive-html {{ width:100%; max-width:100%; }}
-    .sslive-html-viz {{ display:flex; flex-direction:column; }}
+    .sslive-html-viz {{ display:block; width:100%; max-width:100%; }}
+    /* Plotly host: full content-column width, large default height */
+    .sslive-plotly-host {{ width:100% !important; max-width:100%; box-sizing:border-box;
+      position:relative; overflow:hidden; border-radius:8px; background:#0b1220; }}
+    .sslive-plotly-host .js-plotly-plot,
+    .sslive-plotly-host .plotly-graph-div,
+    .sslive-plotly-host .plot-container,
+    .sslive-plotly-host .svg-container {{ width:100% !important; height:100% !important;
+      min-height:100% !important; }}
     .sslive-html iframe, iframe.sslive-viz-frame {{ width:100%; min-height:560px; border:0;
-      border-radius:8px; background:#0b1220; display:block; flex:1 1 auto; }}
-    /* When the output box has an explicit layout height, fill it */
-    [data-type="output"] {{ display:flex; flex-direction:column; min-height:0; }}
-    [data-type="output"] .sslive-html-viz {{ flex:1 1 auto; min-height:0; }}
+      border-radius:8px; background:#0b1220; display:block; }}
+    [data-type="output"] {{ display:block; width:100%; max-width:100%; box-sizing:border-box;
+      min-height:0; }}
+    [data-type="output"] .sslive-html-viz {{ width:100%; }}
     [data-type="output"] .sslive-html-viz iframe.sslive-viz-frame {{ height:100%; min-height:240px; }}
     .sslive-html canvas, .sslive-html video {{ max-width:100%; height:auto; }}
     .note-block a {{ color:#60a5fa; }}
@@ -2489,15 +2573,13 @@ def generate_presenter_html(
     }}
 
     // Re-run <script> tags after HTML inject (innerHTML does not execute them).
-    // Nested plotly iframes (data: URLs) need no activation — they self-run.
-    // Strip any HTMX attrs that slipped through.
+    // Nested data-URL iframes self-run; Plotly hosts need script activation + fill.
     function sanitizeAndActivateOutput(root) {{
       if (!root) return;
       root.querySelectorAll('[hx-swap-oob],[data-hx-swap-oob]').forEach(function (n) {{
         n.removeAttribute('hx-swap-oob');
         n.removeAttribute('data-hx-swap-oob');
       }});
-      // Skip script re-injection inside isolated viz iframes (already sandboxed)
       root.querySelectorAll('script').forEach(function (old) {{
         if (old.closest && old.closest('iframe.sslive-viz-frame')) return;
         const s = document.createElement('script');
@@ -2508,14 +2590,30 @@ def generate_presenter_html(
         s.text = old.textContent || '';
         old.parentNode.replaceChild(s, old);
       }});
-      // Plotly figures (non-iframe mounts) often need a resize after inject
-      try {{
-        if (window.Plotly && root.querySelector) {{
-          root.querySelectorAll('.js-plotly-plot, .plotly-graph-div').forEach(function (gd) {{
-            try {{ window.Plotly.Plots.resize(gd); }} catch (e) {{}}
+      // Force Plotly graphs to fill their host box (fig.show defaults ~700px wide)
+      function fillPlotly() {{
+        if (!window.Plotly || !root.querySelector) return;
+        root.querySelectorAll('.sslive-plotly-host').forEach(function (host) {{
+          const w = host.clientWidth | 0, h = host.clientHeight | 0;
+          if (w < 40 || h < 40) return;
+          host.querySelectorAll('.js-plotly-plot, .plotly-graph-div').forEach(function (gd) {{
+            gd.style.width = '100%';
+            gd.style.height = '100%';
+            try {{
+              window.Plotly.relayout(gd, {{ autosize: false, width: w, height: h }});
+            }} catch (e) {{
+              try {{ window.Plotly.Plots.resize(gd); }} catch (e2) {{}}
+            }}
           }});
-        }}
-      }} catch (e) {{}}
+        }});
+        root.querySelectorAll('.js-plotly-plot, .plotly-graph-div').forEach(function (gd) {{
+          if (gd.closest && gd.closest('.sslive-plotly-host')) return;
+          try {{ window.Plotly.Plots.resize(gd); }} catch (e) {{}}
+        }});
+      }}
+      setTimeout(fillPlotly, 0);
+      setTimeout(fillPlotly, 120);
+      setTimeout(fillPlotly, 400);
     }}
 
     function applyRunResult(msg) {{
@@ -2539,21 +2637,55 @@ def generate_presenter_html(
         const neu = tmp.firstElementChild;
         if (neu) {{
           const wasSel = (typeof editSel !== 'undefined' && editSel === out);
-          // Keep live layout (drag/resize) on the output box across replace
-          const liveStyle = out.getAttribute('style');
-          if (liveStyle) neu.setAttribute('style', liveStyle);
+          // Keep live layout (drag/resize) — but never keep a tiny width for viz
+          const liveStyle = out.getAttribute('style') || '';
+          const neuStyle = neu.getAttribute('style') || '';
+          // Prefer Python-baked style (includes width:100% for plotly); only copy
+          // live left/top/height when the user has positioned the box.
+          if (liveStyle && /position\\s*:\\s*absolute/i.test(liveStyle)) {{
+            const merged = neuStyle || liveStyle;
+            neu.setAttribute('style', merged);
+            // If live box was dragged narrow (< 500px), expand to full column
+            try {{
+              const mw = parseFloat((liveStyle.match(/width\\s*:\\s*([\\d.]+)px/i) || [])[1] || '0');
+              if (mw && mw < 500) {{
+                neu.style.width = '100%';
+                neu.style.maxWidth = '100%';
+              }}
+            }} catch (e) {{}}
+          }}
           out.replaceWith(neu);
-          sanitizeAndActivateOutput(neu);
-          // Size viz iframe to the output box (layout h or default min)
+          // Ensure plotly host is large even if a prior overlay shrank the box
           try {{
-            const boxH = neu.clientHeight || 0;
+            const host = neu.querySelector('.sslive-plotly-host');
+            const slide = neu.closest('[data-slide]');
+            if (host && slide) {{
+              const colW = Math.max(400, (slide.clientWidth || 1920) - 128);
+              if (!neu.style.width || neu.clientWidth < 500) {{
+                neu.style.width = '100%';
+                neu.style.maxWidth = '100%';
+              }}
+              const targetH = Math.max(
+                640,
+                parseInt(host.style.height, 10) || 0,
+                neu.clientHeight || 0
+              );
+              host.style.width = '100%';
+              host.style.height = targetH + 'px';
+              host.style.minHeight = targetH + 'px';
+              // if absolute and no left set, keep flow-like full width
+              void colW;
+            }}
             const ifr = neu.querySelector('iframe.sslive-viz-frame');
             if (ifr) {{
-              const h = boxH > 120 ? Math.max(240, boxH - 4) : (parseInt(ifr.style.height, 10) || 560);
+              const boxH = neu.clientHeight || 0;
+              const h = boxH > 120 ? Math.max(240, boxH - 4) : (parseInt(ifr.style.height, 10) || 680);
+              ifr.style.width = '100%';
               ifr.style.height = h + 'px';
               ifr.style.minHeight = h + 'px';
             }}
           }} catch (e) {{}}
+          sanitizeAndActivateOutput(neu);
           if (wasSel) selectEl(neu);  // keep selection/handle on the fresh node
         }}
       }}
