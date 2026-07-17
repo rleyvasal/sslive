@@ -99,17 +99,18 @@ Do not paste `sslive.py` into a dialog cell — only `%run` it.
 
 ### Layout persistence (positions after drag)
 
-Edit-mode **move / resize / font / reveal** is stored in a **hidden dialog note**:
+Edit-mode **move / resize / font / reveal** is stored in **one** hidden dialog note, placed **just below the `%slive` preview** (not at the top of the dialog):
 
 ```text
 #| sslive-layout
 { "version": 1, "elements": { "el-code-_abc": {"x":120,"y":80,"w":900}, ... } }
 ```
 
-- Created automatically on first drag; **`skipped=1`** (red eye — not in LLM / not a slide).
+- Created on first drag (or first save); **`skipped=1`** (red eye — not in LLM / not a slide).
+- Later edits **update the same note** (find includes skipped messages so we never spawn copies).
+- If older sessions left many layout notes, the next `%slive` **merges** them into one and retires the rest.
 - Coordinates are design-space **1920×1080** px.
-- Leaving edit mode, or the next `%slive` / `reload_deck`, **flushes** any debounced write so positions are not lost.
-- Next `%slive` reloads the overlay and applies it.
+- Leaving edit mode, or the next `%slive` / `reload_deck`, **flushes** any debounced write.
 
 ```python
 layout_ids()           # see which elements have overrides

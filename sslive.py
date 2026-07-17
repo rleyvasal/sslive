@@ -62,6 +62,12 @@ try:
 except Exception:  # pragma: no cover
     js_eval_a = None
 
+# Optional: remove duplicate layout notes (not all dialoghelper builds have it)
+try:
+    from dialoghelper.core import delete_msg  # type: ignore
+except Exception:  # pragma: no cover
+    delete_msg = None
+
 try:
     from IPython.display import display, IFrame, clear_output, DisplayHandle, HTML as IPyHTML
     from IPython import get_ipython
@@ -402,40 +408,150 @@ def _layout_msg_content(layout: dict) -> str:
 
 def _parse_layout_msg(content: str) -> dict | None:
     """Overlay dict if ``content`` is a layout message, else None."""
-    if not content or not content.lstrip().startswith(LAYOUT_MARKER):
+    if not content:
         return None
-    body = content.lstrip()[len(LAYOUT_MARKER):]
+    text = content.lstrip()
+    if not text.startswith(LAYOUT_MARKER):
+        return None
+    body = text[len(LAYOUT_MARKER) :].lstrip()
+    # Tolerate accidental junk after marker before JSON
+    if body and body[0] not in "{[":
+        brace = body.find("{")
+        if brace >= 0:
+            body = body[brace:]
     try:
         return _normalize_layout(json.loads(body))
     except Exception:
         return None
 
 
-async def _find_layout_msg() -> tuple[str, dict] | None:
-    """(msg_id, overlay) for the hidden layout note, if the dialog has one."""
-    if find_msgs is None:
-        return None
-    try:
-        for m in await find_msgs():
-            if m.get("msg_type") != "note":
+def _merge_layouts(*lays: dict) -> dict:
+    """Merge overlay dicts; later entries win per-element key."""
+    out = _empty_layout()
+    for lay in lays:
+        if not isinstance(lay, dict):
+            continue
+        for k, v in (lay.get("elements") or {}).items():
+            if not isinstance(v, dict):
                 continue
-            lay = _parse_layout_msg(m.get("content", "") or "")
-            if lay is not None:
-                return m["id"], lay
-    except Exception as e:
-        print(f"sslive: layout lookup failed: {e}")
-    return None
+            prev = dict(out["elements"].get(k) or {})
+            prev.update(v)
+            out["elements"][str(k)] = prev
+        dk = lay.get("deck")
+        if isinstance(dk, dict):
+            out["deck"].update(dk)
+    return out
+
+
+def _msg_type_of(m: Any) -> str:
+    if isinstance(m, dict):
+        return str(m.get("msg_type") or "")
+    return str(getattr(m, "msg_type", "") or "")
+
+
+def _msg_content_of(m: Any) -> str:
+    if isinstance(m, dict):
+        return m.get("content", "") or ""
+    return getattr(m, "content", "") or ""
+
+
+async def _list_layout_msgs() -> list[tuple[str, dict]]:
+    """All ``#| sslive-layout`` notes (including skipped).
+
+    Important: default ``find_msgs`` often **hides** skipped messages. After the
+    first save we set ``skipped=1``, so a plain find misses the note and
+    ``save_layout`` used to create *another* cell every time.
+    """
+    if find_msgs is None:
+        return []
+    attempts: list[dict] = [
+        {"include_skipped": True, "include_meta": True},
+        {"include_skipped": True},
+        {
+            "msg_type": "note",
+            "include_skipped": True,
+            "re_pattern": r"#\|\s*sslive-layout",
+            "use_regex": True,
+        },
+        {"msg_type": "note", "include_skipped": True},
+        {},
+    ]
+    msgs = None
+    last_err = None
+    for kw in attempts:
+        try:
+            msgs = await find_msgs(**kw)
+            break
+        except TypeError:
+            continue
+        except Exception as e:
+            last_err = e
+            continue
+    if msgs is None and last_err is not None:
+        print(f"sslive: layout lookup failed: {last_err}")
+        return []
+
+    out: list[tuple[str, dict]] = []
+    for m in msgs or []:
+        # When we didn't filter by type, only notes (or untyped) matter
+        mt = _msg_type_of(m)
+        if mt and mt not in ("note", "code"):
+            # still allow if content matches (some APIs mis-tag)
+            pass
+        lay = _parse_layout_msg(_msg_content_of(m))
+        if lay is None:
+            continue
+        mid = _msg_id_from_obj(m)
+        if mid:
+            out.append((str(mid), lay))
+    return out
+
+
+async def _find_layout_msg() -> tuple[str, dict] | None:
+    """(msg_id, overlay) for the canonical layout note, if any."""
+    found = await _list_layout_msgs()
+    if not found:
+        return None
+    # Prefer session id, else the richest overlay (most element keys)
+    prefer = _SESSION.get("layout_msg_id")
+    if prefer:
+        for mid, lay in found:
+            if str(mid) == str(prefer) or str(mid).lstrip("_") == str(prefer).lstrip(
+                "_"
+            ):
+                return mid, lay
+    found_sorted = sorted(
+        found, key=lambda t: len((t[1].get("elements") or {})), reverse=True
+    )
+    return found_sorted[0]
 
 
 async def load_layout() -> dict:
-    """Read the layout overlay from the dialog (empty overlay when absent)."""
-    found = await _find_layout_msg()
-    if found is None:
+    """Read the layout overlay from the dialog (empty overlay when absent).
+
+    If multiple layout notes exist (legacy bug), merge them so nothing is lost.
+    """
+    found = await _list_layout_msgs()
+    if not found:
         _SESSION.pop("layout_msg_id", None)
         return _empty_layout()
-    mid, lay = found
-    _SESSION["layout_msg_id"] = mid
-    return lay
+    # Merge all copies (later list order then richness for keeper id)
+    merged = _merge_layouts(*(lay for _, lay in found))
+    prefer = _SESSION.get("layout_msg_id")
+    keeper = None
+    if prefer:
+        for mid, _ in found:
+            if str(mid) == str(prefer) or str(mid).lstrip("_") == str(prefer).lstrip(
+                "_"
+            ):
+                keeper = mid
+                break
+    if keeper is None:
+        keeper = max(found, key=lambda t: len((t[1].get("elements") or {})))[0]
+    _SESSION["layout_msg_id"] = keeper
+    if len(found) > 1:
+        _SESSION["_layout_dup_count"] = len(found)
+    return merged
 
 
 async def _ensure_layout_skipped(mid: str) -> None:
@@ -452,59 +568,154 @@ async def _ensure_layout_skipped(mid: str) -> None:
             pass
 
 
-async def save_layout(layout: dict | None = None) -> bool:
-    """Persist the overlay into the hidden dialog note (created if missing).
+async def _retire_layout_msg(mid: str) -> None:
+    """Remove or blank a duplicate layout note."""
+    if not mid:
+        return
+    if delete_msg is not None:
+        try:
+            await delete_msg(id=mid)
+            return
+        except TypeError:
+            try:
+                await delete_msg(mid)
+                return
+            except Exception:
+                pass
+        except Exception:
+            pass
+    if update_msg is not None:
+        try:
+            # Leave a clear stub so the user can delete manually if needed
+            await update_msg(
+                id=mid,
+                content="(sslive: duplicate layout note — safe to delete)",
+                skipped=1,
+            )
+        except Exception:
+            try:
+                await update_msg(id=mid, content="", skipped=1)
+            except Exception:
+                pass
 
-    Always re-asserts ``skipped=1`` so the note stays out of LLM context and
-    the slide loader. Returns True on success.
+
+async def _create_layout_msg(content: str) -> str | None:
+    """Create the single layout note **below the %slive preview**, not at top.
+
+    Tries placement after the launcher/preview cell; falls back to dialog end.
+    """
+    if add_msg is None:
+        return None
+    after_id = _SESSION.get("launcher_msg_id") or _SESSION.get("skipped_launcher_id")
+    trials: list[dict] = []
+    if after_id:
+        aid = str(after_id)
+        trials.extend(
+            [
+                {"placement": "after", "after_id": aid},
+                {"placement": "after", "msg_id": aid},
+                {"placement": "after", "id": aid},
+                {"after": aid},
+                {"after_id": aid},
+                {"relative_id": aid, "placement": "after"},
+                {"placement": f"after:{aid}"},
+            ]
+        )
+    trials.extend(
+        [
+            {"placement": "at_end"},
+            {"placement": "end"},
+            {},
+        ]
+    )
+    for kw in trials:
+        try:
+            nid = await add_msg(content, **kw)
+            if nid:
+                return str(nid)
+        except TypeError:
+            continue
+        except Exception as e:
+            _SESSION["_layout_add_err"] = f"{kw}: {e}"
+            continue
+    return None
+
+
+async def save_layout(layout: dict | None = None) -> bool:
+    """Persist the overlay into **one** hidden dialog note (created if missing).
+
+    - Always re-asserts ``skipped=1`` (red eye).
+    - Finds existing notes **including skipped** so we never spawn duplicates.
+    - Merges/retires extra ``#| sslive-layout`` cells from older bugs.
+    - New notes are placed **after the %slive preview**, not at dialog start.
     """
     if layout is None:
         deck = _SESSION.get("deck")
         layout = deck.layout if deck is not None else _empty_layout()
-    if update_msg is None:
-        _SESSION["_layout_save_err"] = "update_msg unavailable"
+    if update_msg is None and add_msg is None:
+        _SESSION["_layout_save_err"] = "update_msg/add_msg unavailable"
         return False
     content = _layout_msg_content(layout)
     _arm_focus_guard(2000)  # update_msg would steal focus in preview otherwise
     n_els = len((layout or {}).get("elements") or {})
-    mid = _SESSION.get("layout_msg_id")
-    try:
-        if mid:
-            try:
-                await update_msg(id=mid, content=content)
-                await _ensure_layout_skipped(str(mid))
-                _SESSION["_layout_save_ok_ts"] = time.time()
-                _SESSION.pop("_layout_save_err", None)
-                if not _SESSION.get("_layout_save_announced"):
-                    _SESSION["_layout_save_announced"] = True
-                    print(f"sslive: layout saved ({n_els} elements) → #| sslive-layout")
-                return True
-            except Exception as e:
-                print(f"sslive: layout save to {mid} failed ({e}); re-finding message")
-                _SESSION.pop("layout_msg_id", None)
-        found = await _find_layout_msg()
-        if found is not None:
-            mid = found[0]
-            _SESSION["layout_msg_id"] = mid
-            await update_msg(id=mid, content=content)
-            await _ensure_layout_skipped(str(mid))
-            _SESSION["_layout_save_ok_ts"] = time.time()
-            _SESSION.pop("_layout_save_err", None)
-            if not _SESSION.get("_layout_save_announced"):
-                _SESSION["_layout_save_announced"] = True
-                print(f"sslive: layout saved ({n_els} elements) → #| sslive-layout")
-            return True
-        if add_msg is None:
-            _SESSION["_layout_save_err"] = "add_msg unavailable"
-            return False
-        new_id = await add_msg(content, placement="at_start")
-        _SESSION["layout_msg_id"] = new_id
-        await _ensure_layout_skipped(str(new_id))
+
+    def _mark_ok(mid: str) -> None:
+        _SESSION["layout_msg_id"] = mid
         _SESSION["_layout_save_ok_ts"] = time.time()
         _SESSION.pop("_layout_save_err", None)
         if not _SESSION.get("_layout_save_announced"):
             _SESSION["_layout_save_announced"] = True
             print(f"sslive: layout saved ({n_els} elements) → #| sslive-layout")
+
+    try:
+        existing = await _list_layout_msgs()
+        # Pick keeper: session id if present, else richest
+        keeper: str | None = None
+        prefer = _SESSION.get("layout_msg_id")
+        if prefer:
+            for mid, _ in existing:
+                if str(mid) == str(prefer) or str(mid).lstrip("_") == str(
+                    prefer
+                ).lstrip("_"):
+                    keeper = str(mid)
+                    break
+        if keeper is None and existing:
+            keeper = str(
+                max(existing, key=lambda t: len((t[1].get("elements") or {})))[0]
+            )
+
+        if keeper and update_msg is not None:
+            try:
+                await update_msg(id=keeper, content=content)
+                await _ensure_layout_skipped(keeper)
+                _mark_ok(keeper)
+                # Retire duplicates (legacy multi-note mess)
+                for mid, _ in existing:
+                    if str(mid) == str(keeper) or str(mid).lstrip("_") == str(
+                        keeper
+                    ).lstrip("_"):
+                        continue
+                    await _retire_layout_msg(str(mid))
+                return True
+            except Exception as e:
+                print(f"sslive: layout save to {keeper} failed ({e}); recreating")
+                _SESSION.pop("layout_msg_id", None)
+
+        # No usable existing note — create one under the preview
+        if add_msg is None:
+            _SESSION["_layout_save_err"] = "add_msg unavailable"
+            return False
+        new_id = await _create_layout_msg(content)
+        if not new_id:
+            _SESSION["_layout_save_err"] = "add_msg returned no id"
+            return False
+        await _ensure_layout_skipped(new_id)
+        _mark_ok(new_id)
+        # If we still see old copies (create raced with find miss), retire them
+        for mid, _ in existing:
+            if str(mid).lstrip("_") == str(new_id).lstrip("_"):
+                continue
+            await _retire_layout_msg(str(mid))
         return True
     except Exception as e:
         _SESSION["_layout_save_err"] = str(e)
@@ -4992,6 +5203,20 @@ async def slive(
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         if mid:
             await _skip_msg(mid, settle=0.0, quiet=True)
+        _SESSION["launcher_msg_id"] = mid
+
+    # After preview id is known: merge legacy multi-layout notes into one cell
+    # sitting under the %slive output (not at dialog top).
+    try:
+        dups = await _list_layout_msgs()
+        if len(dups) > 1:
+            await save_layout(deck.layout)
+            print(
+                f"sslive: merged {len(dups)} layout notes → one #| sslive-layout "
+                "(duplicates retired; delete leftover stubs if any)"
+            )
+    except Exception as e:
+        _SESSION["_layout_dedupe_err"] = str(e)
 
     _SESSION["session"] = session
     return session if return_session else None
