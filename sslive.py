@@ -707,8 +707,15 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
         print("sslive: layout save failed — dialoghelper add_msg/update_msg missing")
         return False
     content = _layout_msg_content(layout)
+    # Remember which slide the user is on — dialog writes can rebuild the iframe
+    try:
+        await _sync_slide_index_from_parent()
+    except Exception:
+        pass
     _arm_focus_guard(2000)  # update_msg would steal focus in preview otherwise
     n_els = len((layout or {}).get("elements") or {})
+    # Creating a note is the most disruptive (first drag); always restore edit mode
+    will_create = False
 
     def _mark_ok(mid: str, *, created: bool) -> None:
         _SESSION["layout_msg_id"] = mid
@@ -725,6 +732,7 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
 
     try:
         existing = await _list_layout_msgs()
+        will_create = not existing
         # Pick keeper: session id if present, else richest
         keeper: str | None = None
         prefer = _SESSION.get("layout_msg_id")
@@ -752,10 +760,13 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
                     ).lstrip("_"):
                         continue
                     await _retire_layout_msg(str(mid))
+                # Even updates can re-render the preview cell — restore slide
+                _push_slide_index_restore(keep_edit=True)
                 return True
             except Exception as e:
                 print(f"sslive: layout save to {keeper} failed ({e}); creating new")
                 _SESSION.pop("layout_msg_id", None)
+                will_create = True
 
         # No usable existing note — create one under the preview
         if add_msg is None:
@@ -775,6 +786,8 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
             if str(mid).lstrip("_") == str(new_id).lstrip("_"):
                 continue
             await _retire_layout_msg(str(mid))
+        # First create is the usual cause of "reset to slide 1" — restore hard
+        _push_slide_index_restore(keep_edit=True)
         return True
     except Exception as e:
         _SESSION["_layout_save_err"] = str(e)
@@ -2822,7 +2835,12 @@ def generate_presenter_html(
     """
 
     js = f"""
+    // Prefer parent-remembered index (survives iframe rebuild after first layout save)
     let currentSlide = {initial_slide};
+    try {{
+      const p = window.parent && window.parent.__sslive_slide_index;
+      if (p != null && Number.isFinite(+p)) currentSlide = Math.max(0, (+p) | 0);
+    }} catch (e) {{}}
     let selectedCellId = {json.dumps(first_code)};
     let lastResultT = 0;
     let fragStep = 0;  // how far into this slide's reveal sequence we are
@@ -3156,6 +3174,8 @@ def generate_presenter_html(
       editing = !!on;
       document.body.classList.toggle('editing', editing);
       document.getElementById('edit-btn')?.classList.toggle('on', editing);
+      // Keep parent index fresh so a layout-save rebuild can restore this slide
+      try {{ window.parent.__sslive_slide_index = currentSlide; }} catch (e) {{}}
       if (!editing) selectEl(null);
       applyFragments();  // show all while editing; restore hide when done
       // Leaving edit mode: ask host to flush debounced layout to the dialog now
@@ -3320,9 +3340,12 @@ def generate_presenter_html(
     }}
 
     function sendLayoutPatch(elId, patch) {{
+      // Stamp slide index so host can restore after dialog write rebuilds iframe
+      try {{ window.parent.__sslive_slide_index = currentSlide; }} catch (e) {{}}
       try {{
         window.parent.postMessage(
-          {{ type: 'sslive_layout', el_id: elId, patch: patch, t: Date.now() }}, '*');
+          {{ type: 'sslive_layout', el_id: elId, patch: patch,
+             slide_index: currentSlide, t: Date.now() }}, '*');
       }} catch (e) {{}}
     }}
 
@@ -3526,19 +3549,39 @@ def generate_presenter_html(
 
     document.addEventListener('dragstart', (e) => {{ if (editing) e.preventDefault(); }});
 
+    let lastGotoT = 0;
+    function gotoSlideFromHost(msg) {{
+      if (!msg || msg.slide_index == null) return;
+      const n = Math.max(0, (+msg.slide_index) | 0);
+      showSlide(n, {{ selectFirst: false, frag: fragStep }});
+      if (msg.keep_edit) {{
+        // Re-enter edit mode after iframe rebuild (first layout save)
+        if (!editing) setEditing(true);
+      }}
+    }}
+
     window.addEventListener('message', function (e) {{
       if (!e.data) return;
       if (e.data.type === 'sslive_result') applyRunResult(e.data);
       else if (e.data.type === 'sslive_layout_apply') applyLayoutMsg(e.data);
+      else if (e.data.type === 'sslive_goto') {{
+        if (e.data.t) lastGotoT = e.data.t;
+        gotoSlideFromHost(e.data);
+      }}
     }});
 
-    // More reliable than postMessage into srcdoc: poll parent for last result
+    // More reliable than postMessage into srcdoc: poll parent for last result / goto
     setInterval(function () {{
       try {{
         const r = window.parent.__sslive_last_result;
         if (r && r.type === 'sslive_result') applyRunResult(r);
         const l = window.parent.__sslive_last_layout;
         if (l && l.type === 'sslive_layout_apply') applyLayoutMsg(l);
+        const g = window.parent.__sslive_goto;
+        if (g && g.type === 'sslive_goto' && g.t && g.t !== lastGotoT) {{
+          lastGotoT = g.t;
+          gotoSlideFromHost(g);
+        }}
       }} catch (e) {{}}
     }}, 150);
 
@@ -3677,11 +3720,20 @@ def generate_presenter_html(
       rescale();
     }})();
 
-    // restore slide; if parent has a pending result, apply immediately
+    // restore slide (parent index wins if the iframe was rebuilt mid-edit)
+    try {{
+      const p = window.parent && window.parent.__sslive_slide_index;
+      if (p != null && Number.isFinite(+p)) currentSlide = Math.max(0, (+p) | 0);
+    }} catch (e) {{}}
     showSlide(currentSlide, {{ selectFirst: false }});
     try {{
       var pending = window.parent.__sslive_last_result;
       if (pending && pending.type === 'sslive_result') applyRunResult(pending);
+      var g0 = window.parent && window.parent.__sslive_goto;
+      if (g0 && g0.type === 'sslive_goto') {{
+        lastGotoT = g0.t || 0;
+        gotoSlideFromHost(g0);
+      }}
     }} catch (e) {{}}
     // re-select the code cell we care about
     if (selectedCellId) selectCell(selectedCellId);
@@ -4372,13 +4424,58 @@ async def _read_parent_slide_index() -> int | None:
         if js_eval is None and js_eval_a is None:
             return None
         idx = await _call_js_eval(
-            "return (window.__sslive_slide_index != null) "
-            "? window.__sslive_slide_index : 0;"
+            "return (window.__sslive_slide_index != null "
+            "&& window.__sslive_slide_index !== '') "
+            "? window.__sslive_slide_index : null;"
         )
         idx = _parse_js_eval_result(idx)
-        return int(idx) if idx is not None else None
+        if idx is None or idx is False or idx == "":
+            return None
+        return int(idx)
     except Exception:
         return None
+
+
+async def _sync_slide_index_from_parent() -> int | None:
+    """Copy parent ``__sslive_slide_index`` into the session (for rebuilds)."""
+    idx = await _read_parent_slide_index()
+    if idx is not None:
+        _SESSION["slide_index"] = max(0, int(idx))
+        return int(idx)
+    return None
+
+
+def _push_slide_index_restore(*, keep_edit: bool = True) -> None:
+    """Tell live iframe(s) to return to the session slide after a parent rebuild.
+
+    First layout ``add_msg`` / ``update_msg`` can make SolveIt re-render the
+    %slive cell and rebuild the srcdoc iframe at slide 0 — this undoes that.
+    """
+    idx = int(_SESSION.get("slide_index") or 0)
+    if iife is None:
+        return
+    keep = "true" if keep_edit else "false"
+    js = f"""
+(function() {{
+  var idx = {idx};
+  var msg = {{ type: 'sslive_goto', slide_index: idx, keep_edit: {keep}, t: Date.now() }};
+  window.__sslive_slide_index = idx;
+  window.__sslive_goto = msg;
+  function push() {{
+    document.querySelectorAll('iframe').forEach(function(f) {{
+      try {{ f.contentWindow.postMessage(msg, '*'); }} catch (e) {{}}
+    }});
+  }}
+  push();
+  setTimeout(push, 50);
+  setTimeout(push, 200);
+  setTimeout(push, 500);
+}})();
+"""
+    try:
+        iife(js)
+    except Exception as e:
+        _SESSION["_slide_restore_err"] = str(e)
 
 
 async def _parent_in_fullscreen() -> bool:
@@ -4566,9 +4663,12 @@ if (!window.__sslive_layout_bridge_v1) {
       return;
     }
     if (d.type !== 'sslive_layout' || !d.el_id) return;
+    // Remember slide so a dialog write that rebuilds the iframe can restore it
+    if (d.slide_index != null) window.__sslive_slide_index = d.slide_index;
     window.__sslive_layout_q.push({
       el_id: String(d.el_id),
       patch: d.patch || {},
+      slide_index: d.slide_index,
       t: d.t || Date.now()
     });
   });
@@ -4722,7 +4822,7 @@ async def _drain_slide_queue() -> tuple[list[dict], list[dict], bool]:
             runs_raw, layouts_raw = q, None
         return (
             _item_dicts(runs_raw, ("cell_id", "source", "slide_index")),
-            _item_dicts(layouts_raw, ("el_id", "patch", "t")),
+            _item_dicts(layouts_raw, ("el_id", "patch", "t", "slide_index")),
             flush,
         )
     except Exception as e:
@@ -4750,6 +4850,13 @@ def _apply_slide_layout_patches(items: list[dict]) -> int:
         el_id = str(it.get("el_id") or "")
         if not el_id:
             continue
+        # Capture slide index from the patch batch (first drag after edit)
+        sidx = it.get("slide_index")
+        if sidx is not None:
+            try:
+                _SESSION["slide_index"] = max(0, int(sidx))
+            except (TypeError, ValueError):
+                pass
         if el_id not in deck.elements:
             orphans += 1
         patch = it.get("patch") or {}
