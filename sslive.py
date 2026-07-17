@@ -3127,22 +3127,13 @@ if (!window.__sslive_guard_v1) {
     if iife is not None:
         try:
             iife(bridge_js)
-            print("sslive: parent bridge installed (dialoghelper.iife)")
             return
-        except Exception as e:
-            print(f"sslive: iife bridge failed ({e}); trying HTML script")
+        except Exception:
+            pass  # fall through to HTML script
 
     if display is not None and IPyHTML is not None:
         # Fallback: inject via notebook output (usually still parent page)
-        display(
-            IPyHTML(
-                f"<script>{bridge_js}</script>"
-                "<div style='font:12px system-ui;color:#9ca3af;margin:4px 0'>"
-                "sslive: Run bridge active — edit code in the slide, press ▶"
-                "</div>"
-            )
-        )
-        print("sslive: parent bridge installed (HTML script tag)")
+        display(IPyHTML(f"<script>{bridge_js}</script>"))
     else:
         print("sslive: WARNING — could not install parent bridge; in-slide Run will not work")
 
@@ -3305,10 +3296,9 @@ def _start_bridge() -> None:
     try:
         task = asyncio.get_running_loop().create_task(_bridge_poll_loop())
         _SESSION["bridge_task"] = task
-        print("sslive: bridge poll started (in-slide ▶ → GPU + dialog sync)")
     except RuntimeError:
-        # no running loop — try ensure future later
-        print("sslive: no running event loop for bridge; use await pump_slide_runs()")
+        # no running loop — user can await pump_slide_runs() if needed
+        pass
 
 
 async def pump_slide_runs(max_items: int = 20) -> int:
@@ -3331,24 +3321,12 @@ async def pump_slide_runs(max_items: int = 20) -> int:
 
 
 def _show_run_panel(deck: Deck) -> None:
-    """Short help under the deck (edit happens *inside* the slides)."""
-    if display is None or IPyHTML is None:
-        return
-    html = """
-<div style="font:14px system-ui;color:#e5e7eb;margin:10px 0;padding:12px 14px;
-            background:#0b1220;border:1px solid #374151;border-radius:8px">
-  <b>sslive:</b> edit in the slide → <b>▶ Run</b> / <b>Shift+Enter</b>
-  → GPU (in place) → dialog source updates shortly after.
-  <div style="margin-top:8px;font-size:12px;color:#9ca3af">
-    Host under <code>%local</code>; slide code runs on GPU. Manual: <code>await sync_dialog()</code>
-  </div>
-</div>
-"""
-    display(IPyHTML(html))
+    """Deprecated: help used to render under the deck; kept as no-op."""
+    return
 
 
 def _show_presenter(port: int | None, height: str = "720px"):
-    """Embed deck (srcdoc) with in-slide editors + Run bridge."""
+    """Embed deck (srcdoc) with in-slide editors + Run bridge — no extra chatter."""
     if isinstance(height, int):
         height = f"{height}px"
     _SESSION["height"] = height
@@ -3357,16 +3335,19 @@ def _show_presenter(port: int | None, height: str = "720px"):
 
     try:
         if display is not None and IPyHTML is not None:
+            import warnings
+
             iframe = IPyHTML(_presenter_iframe_html(height, port=port))
-            handle = display(iframe, display_id=True)
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=".*IFrame.*",
+                    category=UserWarning,
+                )
+                handle = display(iframe, display_id=True)
             _SESSION["presenter_handle"] = handle
-            print("sslive: slides ready — edit code in the iframe, ▶ Run / Shift+Enter")
     except Exception as e:
         print(f"sslive: srcdoc embed failed: {e}")
-
-    deck = _SESSION.get("deck")
-    if deck is not None:
-        _show_run_panel(deck)
 
     if port and HTMX is not None and not _in_solveit():
         try:
@@ -3612,8 +3593,6 @@ async def _skip_msg(mid: str | None, *, quiet: bool = False, settle: float = 1.0
             alt = mid_try[1:] if mid_try.startswith("_") else "_" + mid_try
             await _call_update_msg(id=alt, skipped=1)
             mid_try = alt
-        if not quiet:
-            print(f"sslive: AI-hidden (skipped=1) msg {mid_try} — eye should be red")
         _SESSION["skipped_launcher_id"] = mid_try
         return mid_try
     except Exception as e:
@@ -3671,6 +3650,13 @@ class LiveSession:
 
     def stop(self) -> None:
         sstop()
+
+    def __repr__(self) -> str:
+        # Avoid dumping the full Deck (cells, sources, outputs) into cell output.
+        d = self.deck
+        n_s = len(d.slides) if d else 0
+        n_c = len(d.ordered_code_ids) if d else 0
+        return f"LiveSession(backend={self.backend!r}, slides={n_s}, code_cells={n_c})"
 
 
 async def slive(
@@ -3751,36 +3737,27 @@ async def slive(
     session = LiveSession(port=port or 0, backend="gpu", deck=deck)
 
     n_code = len(deck.ordered_code_ids)
-    print(
-        f"sslive: {len(deck.slides)} slides, {n_code} code cells, "
-        f"host={host_msg}, gpu=({msg})"
-        + (f", msg={launcher_msg_id}" if launcher_msg_id else "")
-    )
     if n_code == 0 and len(deck.slides) == 0:
-        print("No slides found — add a note with exactly `#| s`, then `#` / `##` content below it.")
+        print(
+            "sslive: no slides found — add a note with exactly `#| s`, "
+            "then `#` / `##` content below it."
+        )
     _SESSION["slide_index"] = 0
     _SESSION.setdefault("pending_dialog_sync", {})
     _SESSION["auto_sync_dialog"] = True  # deferred update_msg after Run
-    if _MdDocument is None or _l2m is None:
-        print(
-            "sslive: basic note render — `pip install mistletoe latex2mathml` "
-            "for markdown + LaTeX"
-        )
-    print("In-slide: edit · ▶ Run / Shift+Enter → GPU (in-place)")
-    print("Dialog source: auto-sync shortly after Run (no rebuild/refocus)")
-    print("Manual: await sync_dialog()  ·  await hide_from_ai() if eye stays open")
 
     if embed:
         # show → sleep → skipped=1 so LLM does not ingest the srcdoc HTML
         _show_presenter(port, height=height)
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         _SESSION["launcher_msg_id"] = mid
-        await _skip_msg(mid, settle=1.0)
+        await _skip_msg(mid, settle=1.0, quiet=True)
     else:
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         if mid:
-            await _skip_msg(mid, settle=0.0)
+            await _skip_msg(mid, settle=0.0, quiet=True)
 
+    # Return session without dumping Deck into the cell output (see LiveSession.__repr__).
     return session
 
 
@@ -3854,8 +3831,6 @@ async def reload_deck(theme: str | dict | None = None) -> Deck:
     if _SESSION.get("executor") is None:
         _SESSION["executor"] = LiveExecutor()
     refresh_presenter()
-    _show_run_panel(deck)
-    print(f"sslive: reloaded deck — {len(deck.slides)} slides, {len(deck.ordered_code_ids)} code cells")
     return deck
 
 
