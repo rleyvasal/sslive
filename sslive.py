@@ -798,7 +798,8 @@ async def save_layout(layout: dict | None = None, *, force_create: bool = False)
         await _sync_slide_index_from_parent()
     except Exception:
         pass
-    _arm_focus_guard(2000)
+    # Long enough for create/update + SolveIt UI re-layout
+    _arm_focus_guard(5000)
     n_els = len((layout or {}).get("elements") or {})
 
     def _mark_ok(mid: str, *, created: bool) -> None:
@@ -4459,6 +4460,9 @@ def _refocus_presenter_js() -> str:
 
     SolveIt focuses the message updated by ``update_msg`` (same class of issue
     as HTMX live-preview focus jumps). We blur that and focus #sslive-frame.
+
+    On ``%slive`` open we only focus the iframe (not a code textarea) so the
+    dialog does not look like it jumped to "first cell" editing.
     """
     return r"""
 (function () {
@@ -4472,43 +4476,29 @@ def _refocus_presenter_js() -> str:
     var fs = document.fullscreenElement || document.webkitFullscreenElement;
     if (fs) return true;
 
-    // Focus never left the slides (guard worked) — no thrash needed
-    var cur = findFrame();
-    if (cur && document.activeElement === cur) return true;
+    var ifr = findFrame();
+    if (!ifr) return false;
 
+    // Blur whatever SolveIt just focused (often the first dialog cell)
     try {
       var ae = document.activeElement;
-      if (ae && ae !== document.body && ae.tagName !== 'IFRAME'
+      if (ae && ae !== document.body && ae !== ifr
           && ae.id !== 'sslive-frame' && ae.getAttribute('data-sslive') !== '1') {
         try { ae.blur(); } catch (e) {}
       }
     } catch (e) {}
 
-    var ifr = findFrame();
-    if (!ifr) return false;
-
-    // Keep the presentation visible in the dialog scroller
+    // Keep the presentation visible — but never scroll *away* from it
     try {
-      ifr.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+      ifr.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
     } catch (e) {
-      try { ifr.scrollIntoView(true); } catch (e2) {}
+      try { ifr.scrollIntoView(false); } catch (e2) {}
     }
-    // Prefer focusing the iframe without scrolling the page again
     try { ifr.focus({ preventScroll: true }); } catch (e) {
       try { ifr.focus(); } catch (e2) {}
     }
     try {
-      if (ifr.contentWindow) {
-        ifr.contentWindow.focus();
-        // Prefer the code textarea the user was editing
-        var doc = ifr.contentDocument || ifr.contentWindow.document;
-        if (doc) {
-          var ta = doc.querySelector('textarea.code-ta.selected, .code-wrap.selected textarea, textarea.code-ta');
-          if (ta) {
-            try { ta.focus({ preventScroll: true }); } catch (e3) { try { ta.focus(); } catch (e4) {} }
-          }
-        }
-      }
+      if (ifr.contentWindow) ifr.contentWindow.focus();
     } catch (e) {}
     return true;
   }
@@ -4537,9 +4527,31 @@ def _arm_focus_guard(ms: int = 2000) -> None:
     if iife is None:
         return
     try:
-        iife(f"window.__sslive_guard_until = Date.now() + {int(ms)};")
+        # Extend (don't shorten) an already-armed guard
+        iife(
+            f"(function(){{"
+            f"var until=Date.now()+{int(ms)};"
+            f"if((window.__sslive_guard_until||0)<until)"
+            f"  window.__sslive_guard_until=until;"
+            f"}})();"
+        )
     except Exception:
         pass
+
+
+async def _refocus_after_dialog_writes(*, pulses: int = 4, gap: float = 0.2) -> None:
+    """Re-arm guard + refocus the slide iframe after dialog churn settles."""
+    _arm_focus_guard(int(4000 + pulses * gap * 1000))
+    for i in range(max(1, pulses)):
+        try:
+            refocus_presenter()
+        except Exception:
+            pass
+        if i + 1 < pulses:
+            try:
+                await asyncio.sleep(gap)
+            except Exception:
+                break
 
 
 async def _read_parent_slide_index() -> int | None:
@@ -4822,7 +4834,17 @@ if (!window.__sslive_guard_v1) {
   };
   var slAllowed = function (el) {
     var ifr = slFrame();
-    return !ifr || el === ifr || (el && ifr.contains && ifr.contains(el));
+    if (!ifr) return true;
+    if (el === ifr) return true;
+    try {
+      if (el && ifr.contains && ifr.contains(el)) return true;
+    } catch (e) {}
+    // Also allow focus inside the frame's contentDocument when reachable
+    try {
+      var doc = ifr.contentDocument;
+      if (doc && el && doc.documentElement && doc.documentElement.contains(el)) return true;
+    } catch (e) {}
+    return false;
   };
   window.addEventListener('pointerdown', function () { window.__sslive_user_ts = Date.now(); }, true);
   window.addEventListener('keydown', function () { window.__sslive_user_ts = Date.now(); }, true);
@@ -5307,6 +5329,8 @@ async def _skip_msg(mid: str | None, *, quiet: bool = False, settle: float = 1.0
     Mirrors sslides ``sshow``::
 
         show(...); time.sleep(1); update_msg(id=..., skipped=1)
+
+    Arms the focus guard so SolveIt does not yank focus to the first dialog cell.
     """
     if not mid:
         mid = await _resolve_launcher_msg_id()
@@ -5336,6 +5360,8 @@ async def _skip_msg(mid: str | None, *, quiet: bool = False, settle: float = 1.0
         # sslides sleeps 1s after show so the output is attached, then skips.
         if settle and settle > 0:
             await asyncio.sleep(settle)
+        # Guard must cover the update_msg (and a short tail of UI churn)
+        _arm_focus_guard(int(max(3000, settle * 1000 + 2500)))
         # Normalize: SolveIt DOM often uses _prefix; API accepts either
         mid_try = str(mid)
         try:
@@ -5521,18 +5547,24 @@ async def slive(
     if embed:
         # show → sleep → skipped=1 so LLM does not ingest the srcdoc HTML
         _show_presenter(port, height=height)
+        # Bridge is installed in _show_presenter — arm immediately so skip /
+        # layout writes cannot scroll the dialog to the first cell.
+        _arm_focus_guard(8000)
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         _SESSION["launcher_msg_id"] = mid
         await _skip_msg(mid, settle=1.0, quiet=True)
+        refocus_presenter()
     else:
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         if mid:
+            _arm_focus_guard(4000)
             await _skip_msg(mid, settle=0.0, quiet=True)
         _SESSION["launcher_msg_id"] = mid
 
     # After preview id is known: ensure exactly one #| sslive-layout note exists
     # under / near the %slive cell (create if user deleted them all).
     try:
+        _arm_focus_guard(8000)
         mid_layout = await ensure_layout_note()
         if mid_layout is None:
             print(
@@ -5542,6 +5574,15 @@ async def slive(
     except Exception as e:
         _SESSION["_layout_ensure_err"] = str(e)
         print(f"sslive: layout note ensure failed: {e}")
+
+    # update_msg / add_msg for skip + layout always fight for focus — reclaim it
+    try:
+        await _refocus_after_dialog_writes(pulses=5, gap=0.15)
+    except Exception:
+        try:
+            refocus_presenter()
+        except Exception:
+            pass
 
     _SESSION["session"] = session
     return session if return_session else None
