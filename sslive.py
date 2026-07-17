@@ -3976,6 +3976,392 @@ def generate_presenter_html(
 """
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Portable HTML export (static player — no SolveIt / CRAFT / live Run)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _code_block_html_export(cell: Cell, *, style: str = "", extra_attrs: str = "") -> str:
+    """Read-only code block for portable export (no Run / no live textarea)."""
+    cid = html_module.escape(cell.id)
+    src = html_module.escape(cell.source or "")
+    return (
+        f'<div id="el-code-{cid}" class="code-wrap code-frozen" '
+        f'data-el-id="el-code-{cid}" data-type="code" data-cell-id="{cid}"'
+        f"{extra_attrs}{_style_attr(style)}>"
+        f'<div class="code-toolbar">'
+        f'<span class="cell-id">{cid}</span>'
+        f'<span class="hint">exported · read-only</span>'
+        f"</div>"
+        f'<pre class="code-pre">{src}</pre>'
+        f"</div>"
+    )
+
+
+def _slide_html_export(deck: Deck, slide: Slide, *, active: bool = False) -> str:
+    """Slide HTML for static export (layout + frozen code/outputs)."""
+    theme = deck.theme or THEME_DARK
+    parts: list[str] = []
+    for cid in slide.cell_ids:
+        cell = deck.cells[cid]
+        if cell.kind == "note":
+            note_ids = cell.element_ids or [f"el-0-{cid}"]
+            for el_id in note_ids:
+                el = deck.elements.get(el_id)
+                if el is None:
+                    continue
+                eid = html_module.escape(el_id)
+                spec = _layout_spec(deck, el_id)
+                style = _el_style(spec)
+                kind = html_module.escape(el.kind or "paragraph")
+                body = el.html if el.html else _note_to_html(el.content or cell.source)
+                parts.append(
+                    f'<div id="{eid}" class="note-block" data-el-id="{eid}" '
+                    f'data-type="{kind}" data-cell-id="{html_module.escape(cid)}"'
+                    f"{_reveal_attr(spec)}{_style_attr(style)}>{body}</div>"
+                )
+        else:
+            cspec = _layout_spec(deck, f"el-code-{cid}")
+            ospec = _layout_spec(deck, f"el-output-{cid}")
+            parts.append(
+                _code_block_html_export(
+                    cell,
+                    style=_el_style(cspec),
+                    extra_attrs=_reveal_attr(cspec),
+                )
+            )
+            parts.append(
+                render_output_html(
+                    cell.outputs,
+                    cell.id,
+                    theme,
+                    style=_el_style(ospec),
+                    extra_attrs=_reveal_attr(ospec),
+                )
+            )
+    cls = "slide title-slide" if slide.is_title else "slide"
+    hidden = " active" if active else " hidden"
+    return (
+        f'<section class="{cls}{hidden}" data-slide="{slide.index}">'
+        f'{"".join(parts)}</section>'
+    )
+
+
+def _export_title_from_deck(deck: Deck) -> str:
+    for slide in deck.slides:
+        for cid in slide.cell_ids:
+            cell = deck.cells.get(cid)
+            if not cell or cell.kind != "note":
+                continue
+            for el_id in cell.element_ids or []:
+                el = deck.elements.get(el_id)
+                if el and el.kind == "heading" and (el.content or "").strip():
+                    return (el.content or "").strip()[:80]
+            src = (cell.source or "").strip()
+            if src.startswith("# "):
+                return src[2:].splitlines()[0].strip()[:80]
+    return "sslive deck"
+
+
+def generate_export_html(
+    deck: Deck,
+    *,
+    title: str | None = None,
+    offline: bool = False,
+    initial_slide: int = 0,
+) -> str:
+    """Self-contained static HTML player (no SolveIt, no GPU Run).
+
+    Includes navigation, reveal steps, layout, frozen code, and last-run outputs.
+    ``offline=True`` currently still uses the Plotly CDN (full offline bundle is
+    a follow-up); reserved for future inlining.
+    """
+    del offline  # reserved
+    theme = deck.theme or THEME_DARK
+    n_slides = len(deck.slides)
+    initial_slide = max(0, min(int(initial_slide), max(0, n_slides - 1)))
+    slides_html = "\n".join(
+        _slide_html_export(deck, s, active=(s.index == initial_slide))
+        for s in deck.slides
+    )
+    n = n_slides
+    doc_title = html_module.escape(title or _export_title_from_deck(deck))
+
+    empty = ""
+    if n == 0:
+        empty = (
+            "<section class='slide active' data-slide='0'>"
+            "<h2 class='slide-h2'>No slides</h2>"
+            "<p class='slide-p'>Export ran with an empty deck.</p></section>"
+        )
+
+    css = f"""
+    * {{ box-sizing: border-box; }}
+    html, body {{ margin:0; height:100%; background:{theme.get("bg", "#111")}; color:{theme.get("fg", "#eee")};
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; }}
+    #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
+    #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
+    .slide {{ width:1920px; height:1080px; padding:48px 64px; display:none; flex-direction:column;
+      justify-content:flex-start; align-items:stretch; overflow:auto; gap:12px; position:relative; }}
+    .slide.active {{ display:flex; }}
+    .slide.hidden {{ display:none; }}
+    .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
+    .note-block {{ font-size:1.75rem; }}
+    .slide-h1, .note-block h1 {{ font-size:2.5714em; font-weight:700; margin:0 0 1rem; }}
+    .slide-h2, .note-block h2 {{ font-size:1.7143em; font-weight:700; margin:0 0 1rem; }}
+    .note-block h3 {{ font-size:1.3em; font-weight:700; margin:0 0 0.75rem; }}
+    .slide-p, .note-block p {{ font-size:1em; line-height:1.5; margin:0.5rem 0; color:{theme.get("fg", "#eee")}; }}
+    .note-block ul, .note-block ol {{ font-size:1em; line-height:1.5; margin:0.5rem 0; padding-left:1.4em; }}
+    .note-block li {{ margin:0.2em 0; }}
+    .note-block[data-type="list_item"] {{ margin:0.15rem 0; }}
+    .note-block[data-type="math"] {{ margin:0.6rem 0; }}
+    .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow-x:auto; }}
+    .note-block .math-inline {{ display:inline; }}
+    .note-block img, .note-block[data-type="image"] img {{
+      max-width:100%; height:auto; display:block; border-radius:6px; }}
+    .note-block table {{ border-collapse:collapse; width:100%; font-size:0.9em; }}
+    .note-block th, .note-block td {{ border:1px solid #374151; padding:0.35em 0.6em; text-align:left; }}
+    .sslive-html {{ width:100%; max-width:100%; }}
+    .sslive-plotly-host {{ width:100% !important; max-width:100%; box-sizing:border-box;
+      position:relative; overflow:hidden; border-radius:8px; background:#0b1220; }}
+    .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
+      padding:8px 12px; outline:none; flex:0 0 auto; max-width:100%; }}
+    .code-toolbar {{ display:flex; align-items:center; gap:12px; margin-bottom:6px; flex-wrap:wrap; }}
+    .cell-id {{ font-size:11px; color:{theme.get("muted", "#9ca3af")}; font-family:ui-monospace,monospace; }}
+    .hint {{ font-size:11px; color:#6b7280; }}
+    .code-pre {{ width:100%; box-sizing:border-box; margin:0; padding:6px 10px;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45; font-size:14px;
+      white-space:pre-wrap; word-break:break-word; color:#e5e7eb; background:#111827;
+      border:1px solid #4b5563; border-radius:6px; overflow:auto; max-height:70vh; }}
+    [data-type="output"] {{ display:block; width:100%; max-width:100%; box-sizing:border-box; }}
+    .frag-hidden {{ opacity:0 !important; visibility:hidden !important; pointer-events:none !important; }}
+    #chrome {{ position:fixed; left:12px; top:12px; z-index:20; display:flex; gap:10px; align-items:center;
+      background:rgba(0,0,0,0.55); color:#fff; padding:6px 12px; border-radius:8px; font-size:13px; }}
+    #chrome .ok {{ color:#86efac; }}
+    #nav {{ position:fixed; right:16px; bottom:16px; z-index:20; display:flex; gap:12px; align-items:center;
+      background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.85; }}
+    #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer; padding:0 6px; }}
+    #nav button:hover {{ color:#93c5fd; }}
+    @media print {{
+      html, body {{ overflow:visible; height:auto; background:#fff; color:#000; }}
+      #chrome, #nav {{ display:none !important; }}
+      #viewport {{ width:auto; height:auto; overflow:visible; }}
+      #stage {{ position:static; transform:none !important; left:0 !important; top:0 !important;
+        width:100%; height:auto; }}
+      .slide {{ display:flex !important; page-break-after:always; height:auto; min-height:100vh;
+        overflow:visible; color:#111; }}
+      .slide.hidden {{ display:flex !important; }}
+      .frag-hidden {{ opacity:1 !important; visibility:visible !important; }}
+    }}
+    """
+
+    js = f"""
+    let currentSlide = {initial_slide};
+    let fragStep = 0;
+    const slides = () => document.querySelectorAll('[data-slide]');
+
+    function slideEls(slideEl) {{
+      if (!slideEl) return [];
+      return slideEl.querySelectorAll('.note-block, .code-wrap, [data-type="output"]');
+    }}
+    function revealOf(el) {{
+      const r = parseInt(el.getAttribute('data-reveal'), 10);
+      return (Number.isFinite(r) && r > 0) ? r : 0;
+    }}
+    function maxReveal(slideEl) {{
+      let m = 0;
+      slideEls(slideEl).forEach(el => {{ m = Math.max(m, revealOf(el)); }});
+      return m;
+    }}
+    function applyFragments() {{
+      const ss = slides()[currentSlide];
+      if (!ss) return;
+      slideEls(ss).forEach(el => {{
+        const r = revealOf(el);
+        el.classList.toggle('frag-hidden', r > 0 && r > fragStep);
+      }});
+      updateCounter();
+    }}
+    function updateCounter() {{
+      const el = document.getElementById('slide-counter');
+      if (!el) return;
+      const n = slides().length;
+      el.textContent = (currentSlide + 1) + ' / ' + Math.max(n, 1);
+    }}
+    function showSlide(n, frag) {{
+      const ss = slides();
+      if (!ss.length) return;
+      n = Math.max(0, Math.min(n, ss.length - 1));
+      ss.forEach((s, i) => {{
+        s.classList.toggle('active', i === n);
+        s.classList.toggle('hidden', i !== n);
+      }});
+      currentSlide = n;
+      fragStep = (frag == null) ? 0 : frag;
+      applyFragments();
+      try {{
+        const u = new URL(window.location.href);
+        u.searchParams.set('slide', String(currentSlide + 1));
+        history.replaceState(null, '', u);
+      }} catch (e) {{}}
+    }}
+    function goNext() {{
+      const maxR = maxReveal(slides()[currentSlide]);
+      if (fragStep < maxR) {{ fragStep++; applyFragments(); return; }}
+      if (currentSlide < slides().length - 1) showSlide(currentSlide + 1, 0);
+    }}
+    function goPrev() {{
+      if (fragStep > 0) {{ fragStep--; applyFragments(); return; }}
+      if (currentSlide > 0) {{
+        const prev = currentSlide - 1;
+        showSlide(prev, maxReveal(slides()[prev]));
+      }}
+    }}
+    document.addEventListener('keydown', (e) => {{
+      if (e.key === 'ArrowRight' || e.key === ' ') {{ e.preventDefault(); goNext(); }}
+      if (e.key === 'ArrowLeft') {{ e.preventDefault(); goPrev(); }}
+      if (e.key === 'f' && !e.metaKey && !e.ctrlKey) {{
+        document.documentElement.requestFullscreen?.();
+      }}
+      if (e.key === 'Home') {{ e.preventDefault(); showSlide(0, 0); }}
+      if (e.key === 'End') {{ e.preventDefault(); showSlide(slides().length - 1, 0); }}
+    }});
+    document.getElementById('prev-btn')?.addEventListener('click', (e) => {{
+      e.preventDefault(); goPrev();
+    }});
+    document.getElementById('next-btn')?.addEventListener('click', (e) => {{
+      e.preventDefault(); goNext();
+    }});
+    (function scale() {{
+      const DESIGN_W = 1920, DESIGN_H = 1080;
+      const stage = document.getElementById('stage');
+      const viewport = document.getElementById('viewport');
+      function rescale() {{
+        const vw = viewport.clientWidth, vh = viewport.clientHeight;
+        const sc = Math.min(vw / DESIGN_W, vh / DESIGN_H);
+        stage.style.transform = 'scale(' + sc + ')';
+        stage.style.left = ((vw - DESIGN_W * sc) / 2) + 'px';
+        stage.style.top = ((vh - DESIGN_H * sc) / 2) + 'px';
+      }}
+      new ResizeObserver(rescale).observe(viewport);
+      rescale();
+    }})();
+    (function boot() {{
+      let start = {initial_slide};
+      try {{
+        const q = new URLSearchParams(window.location.search).get('slide');
+        if (q) {{
+          const n = parseInt(q, 10);
+          if (Number.isFinite(n) && n >= 1) start = n - 1;
+        }}
+      }} catch (e) {{}}
+      showSlide(start, 0);
+    }})();
+    """
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="generator" content="sslive {__version__} export"/>
+  <title>{doc_title}</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+  <style>{css}</style>
+</head>
+<body>
+  <div id="chrome">
+    <strong>sslive</strong>
+    <span id="status-badge" class="ok">exported · static</span>
+    <span style="opacity:0.7">←/→ reveal then slides · space next · f fullscreen · ?slide=N</span>
+  </div>
+  <div id="viewport">
+    <div id="stage">
+      <div id="slides-container">
+        {slides_html or empty}
+      </div>
+    </div>
+  </div>
+  <div id="nav">
+    <button type="button" id="prev-btn" aria-label="Previous">‹</button>
+    <span id="slide-counter">1 / {max(n, 1)}</span>
+    <button type="button" id="next-btn" aria-label="Next">›</button>
+  </div>
+  <script>{js}</script>
+</body>
+</html>
+"""
+
+
+def export_html_str(
+    deck: Deck | None = None,
+    *,
+    title: str | None = None,
+    offline: bool = False,
+    initial_slide: int = 0,
+) -> str:
+    """Return portable HTML for ``deck`` (default: current session deck)."""
+    deck = deck or _SESSION.get("deck")
+    if deck is None:
+        raise RuntimeError("No deck — call await slive() first, or pass deck=")
+    return generate_export_html(
+        deck, title=title, offline=offline, initial_slide=initial_slide
+    )
+
+
+def export_html(
+    path: str | Path,
+    deck: Deck | None = None,
+    *,
+    title: str | None = None,
+    offline: bool = False,
+    initial_slide: int = 0,
+) -> Path:
+    """Write a portable HTML player to ``path`` and return the resolved Path.
+
+    Snapshot of the current deck (layout + last-run outputs). Open the file in
+    any browser — no SolveIt or GPU required.
+
+    ::
+
+        await slive()
+        # ▶ Run cells you want frozen, then:
+        export_html("talk.html")
+        export_html("talk.html", title="Demo")
+    """
+    deck = deck or _SESSION.get("deck")
+    if deck is None:
+        raise RuntimeError("No deck — call await slive() first, or pass deck=")
+    html = generate_export_html(
+        deck, title=title, offline=offline, initial_slide=initial_slide
+    )
+    out = Path(path).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    # Summary for the author
+    n_code = len(deck.ordered_code_ids)
+    n_empty = sum(
+        1
+        for cid in deck.ordered_code_ids
+        if not (deck.cells[cid].outputs or [])
+    )
+    print(
+        f"sslive: exported {len(deck.slides)} slide(s), {n_code} code cell(s) "
+        f"→ {out}"
+        + (f" ({n_empty} code cell(s) had no outputs)" if n_empty else "")
+    )
+    return out
+
+
+async def export_html_a(
+    path: str | Path,
+    deck: Deck | None = None,
+    **kw: Any,
+) -> Path:
+    """Async alias of ``export_html`` (for await-style SolveIt cells)."""
+    return export_html(path, deck=deck, **kw)
+
+
 def _do_execute(cell_id: str) -> tuple[str, dict[str, str], int]:
     """Run cell; return (html, headers, status_code)."""
     deck: Deck | None = _SESSION.get("deck")
@@ -5899,6 +6285,29 @@ def _run_slive_from_magic(line: str = "") -> Any:
         return loop.create_task(_run())
 
 
+def _run_slive_export_magic(line: str = "") -> Any:
+    """``%slive_export path.html`` — write portable static HTML of the current deck."""
+    line = (line or "").strip()
+    if not line:
+        print("usage: %slive_export talk.html  [title=...]")
+        return None
+    # first token = path; optional title=...
+    parts = line.split()
+    path = parts[0]
+    title = None
+    offline = False
+    for p in parts[1:]:
+        if p.startswith("title="):
+            title = p.split("=", 1)[1].strip("\"'")
+        elif p in ("--offline", "offline=1", "offline"):
+            offline = True
+    try:
+        return export_html(path, title=title, offline=offline)
+    except Exception as e:
+        print(f"sslive: export failed: {e}")
+        return None
+
+
 def _register_slive_magic(*, quiet: bool = True) -> bool:
     """Install ``%slive`` and mark it local for ``%gpu`` mode.
 
@@ -5917,6 +6326,9 @@ def _register_slive_magic(*, quiet: bool = True) -> bool:
         mm = ip.magics_manager
         mm.register_function(_run_slive_from_magic, magic_kind="line", magic_name="slive")
         mm.register_function(_run_slive_from_magic, magic_kind="line", magic_name="sslive")
+        mm.register_function(
+            _run_slive_export_magic, magic_kind="line", magic_name="slive_export"
+        )
         ok = True
     except Exception as e:
         _SESSION["_magic_reg_err"] = f"register_function: {e}"
@@ -5936,6 +6348,10 @@ def _register_slive_magic(*, quiet: bool = True) -> bool:
                 def sslive_magic(self, line: str = ""):
                     return _run_slive_from_magic(line)
 
+                @line_magic("slive_export")
+                def slive_export_magic(self, line: str = ""):
+                    return _run_slive_export_magic(line)
+
             ip.register_magics(SSliveMagics(ip))
             ok = True
         except Exception as e:
@@ -5944,6 +6360,14 @@ def _register_slive_magic(*, quiet: bool = True) -> bool:
     # Critical under %gpu: route magic to host, not remote kernel
     _mark_slive_local_magic()
     _ensure_local_magic()
+    # Also mark export magic local
+    try:
+        reg = (ip.user_ns or {}).get("register_local_magic")
+        if callable(reg):
+            reg("%slive_export")
+            reg("slive_export")
+    except Exception:
+        pass
 
     # Verify
     try:
@@ -6025,5 +6449,9 @@ __all__ = [
     "hold_dialog_focus",
     "render_output_html",
     "generate_presenter_html",
+    "generate_export_html",
+    "export_html",
+    "export_html_str",
+    "export_html_a",
     "get_craft_exec_mgr",
 ]

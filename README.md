@@ -87,12 +87,40 @@ await hide_from_ai("_msg_id")
 
 Do not paste `sslive.py` into a dialog cell — only `%run` it.
 
+## Export portable HTML
+
+After authoring in SolveIt (layout + ▶ Run for outputs you want frozen):
+
+```python
+export_html("talk.html")                 # write file
+export_html("talk.html", title="Demo")
+html = export_html_str()                 # string only
+```
+
+Or:
+
+```text
+%slive_export talk.html
+%slive_export talk.html title=Demo
+```
+
+Open `talk.html` in any browser — **no SolveIt / CRAFT / GPU**. Snapshot only: re-export after you change slides or re-run cells.
+
+| Included | Not included (v1) |
+|----------|-------------------|
+| Slides, layout, reveal | Live ▶ Run |
+| Frozen code + last outputs | Layout editing |
+| Nav / keyboard / print CSS | Offline-vendored Plotly (uses CDN) |
+
 ## Commands
 
 | Call | Role |
 |------|------|
 | `%slive` / `%slive 800` | Open deck (local magic) |
 | `await slive()` | Same (async API) |
+| `export_html("out.html")` | Portable static HTML snapshot |
+| `export_html_str()` | Same as string |
+| `%slive_export out.html` | Magic for export |
 | `session()` | Last `LiveSession` |
 | `await hide_from_ai()` | Force AI-hide |
 | `await sync_dialog()` | Batch source write-back |

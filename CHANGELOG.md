@@ -23,9 +23,15 @@ End-to-end working version for SolveIt + CRAFT. **Do not paste this file into th
 | User slides under `#\| s` | `#\| sslive-layout` (skipped) |
 | CRAFT bootstrap (keep short) | `%slive` preview iframe (skipped) |
 
+### Export (0.1.1)
+
+- `export_html("talk.html")` / `export_html_str()` / `%slive_export` — static portable player
+- Frozen code + last-run outputs, layout, reveal, keyboard nav; no live GPU
+
 ### Known follow-ups
 
 - Further reduce first-open preview flash if SolveIt remounts on any `update_msg`
 - Package split (`deck` / `execute` / `layout` / `presenter` / `bridge` / `entry`) behind thin `%run` entry
 - Stable note fragment ids (S2-D renumber drift)
 - Shared `craft_hostkit` + CRAFT thin addon loader for sslive / pcviz / mojo
+- Export: offline Plotly bundle, image inlining, in-preview download button
