@@ -438,37 +438,78 @@ async def load_layout() -> dict:
     return lay
 
 
+async def _ensure_layout_skipped(mid: str) -> None:
+    """Best-effort: keep the layout note out of LLM + slides (red eye)."""
+    if update_msg is None or not mid:
+        return
+    try:
+        await update_msg(id=mid, skipped=1)
+    except Exception:
+        try:
+            alt = mid[1:] if str(mid).startswith("_") else "_" + str(mid)
+            await update_msg(id=alt, skipped=1)
+        except Exception:
+            pass
+
+
 async def save_layout(layout: dict | None = None) -> bool:
-    """Persist the overlay into the hidden dialog note (created if missing)."""
+    """Persist the overlay into the hidden dialog note (created if missing).
+
+    Always re-asserts ``skipped=1`` so the note stays out of LLM context and
+    the slide loader. Returns True on success.
+    """
     if layout is None:
         deck = _SESSION.get("deck")
         layout = deck.layout if deck is not None else _empty_layout()
     if update_msg is None:
+        _SESSION["_layout_save_err"] = "update_msg unavailable"
         return False
     content = _layout_msg_content(layout)
     _arm_focus_guard(2000)  # update_msg would steal focus in preview otherwise
+    n_els = len((layout or {}).get("elements") or {})
     mid = _SESSION.get("layout_msg_id")
-    if mid:
-        try:
-            await update_msg(id=mid, content=content)
-            return True
-        except Exception as e:
-            print(f"sslive: layout save to {mid} failed ({e}); re-finding message")
-            _SESSION.pop("layout_msg_id", None)
-    found = await _find_layout_msg()
-    if found is not None:
-        _SESSION["layout_msg_id"] = found[0]
-        await update_msg(id=found[0], content=content)
-        return True
-    if add_msg is None:
-        return False
-    new_id = await add_msg(content, placement="at_start")
-    _SESSION["layout_msg_id"] = new_id
     try:
-        await update_msg(id=new_id, skipped=1)
-    except Exception:
-        pass
-    return True
+        if mid:
+            try:
+                await update_msg(id=mid, content=content)
+                await _ensure_layout_skipped(str(mid))
+                _SESSION["_layout_save_ok_ts"] = time.time()
+                _SESSION.pop("_layout_save_err", None)
+                if not _SESSION.get("_layout_save_announced"):
+                    _SESSION["_layout_save_announced"] = True
+                    print(f"sslive: layout saved ({n_els} elements) → #| sslive-layout")
+                return True
+            except Exception as e:
+                print(f"sslive: layout save to {mid} failed ({e}); re-finding message")
+                _SESSION.pop("layout_msg_id", None)
+        found = await _find_layout_msg()
+        if found is not None:
+            mid = found[0]
+            _SESSION["layout_msg_id"] = mid
+            await update_msg(id=mid, content=content)
+            await _ensure_layout_skipped(str(mid))
+            _SESSION["_layout_save_ok_ts"] = time.time()
+            _SESSION.pop("_layout_save_err", None)
+            if not _SESSION.get("_layout_save_announced"):
+                _SESSION["_layout_save_announced"] = True
+                print(f"sslive: layout saved ({n_els} elements) → #| sslive-layout")
+            return True
+        if add_msg is None:
+            _SESSION["_layout_save_err"] = "add_msg unavailable"
+            return False
+        new_id = await add_msg(content, placement="at_start")
+        _SESSION["layout_msg_id"] = new_id
+        await _ensure_layout_skipped(str(new_id))
+        _SESSION["_layout_save_ok_ts"] = time.time()
+        _SESSION.pop("_layout_save_err", None)
+        if not _SESSION.get("_layout_save_announced"):
+            _SESSION["_layout_save_announced"] = True
+            print(f"sslive: layout saved ({n_els} elements) → #| sslive-layout")
+        return True
+    except Exception as e:
+        _SESSION["_layout_save_err"] = str(e)
+        print(f"sslive: layout save failed: {e}")
+        return False
 
 
 def _schedule_layout_save(delay: float = 0.5) -> None:
@@ -476,20 +517,90 @@ def _schedule_layout_save(delay: float = 0.5) -> None:
     prev = _SESSION.get("_layout_save_task")
     if prev is not None and not prev.done():
         prev.cancel()
+    _SESSION["_layout_save_pending"] = True
 
     async def _later():
         try:
             await asyncio.sleep(delay)
-            await save_layout()
+            ok = await save_layout()
+            if ok:
+                _SESSION["_layout_save_pending"] = False
         except asyncio.CancelledError:
             pass
         except Exception as e:
             _SESSION["_layout_save_err"] = str(e)
+            _SESSION["_layout_save_pending"] = False
 
     try:
         _SESSION["_layout_save_task"] = asyncio.get_running_loop().create_task(_later())
     except RuntimeError:  # no loop (headless tests) — persistence is moot there
         _SESSION["_layout_save_task"] = None
+        _SESSION["_layout_save_pending"] = False
+
+
+async def _drain_layout_queue_only() -> list[dict]:
+    """Pull pending edit-mode layout patches without touching the Run queue."""
+    if js_eval is None and js_eval_a is None:
+        return []
+    try:
+        res = await _call_js_eval(
+            "const l = (window.__sslive_layout_q || []).slice(); "
+            "window.__sslive_layout_q = []; "
+            "return l;"
+        )
+        q = _parse_js_eval_result(res)
+        return _item_dicts(q, ("el_id", "patch", "t"))
+    except Exception as e:
+        _SESSION["_layout_drain_err"] = str(e)
+        return []
+
+
+async def flush_layout_save() -> bool:
+    """Cancel debounce and write layout to the dialog now.
+
+    Call before ``%slive`` / ``reload_deck`` so a drag just before rebuild is
+    not lost. Also useful after a long edit session.
+    """
+    prev = _SESSION.get("_layout_save_task")
+    if prev is not None and not prev.done():
+        try:
+            prev.cancel()
+        except Exception:
+            pass
+        _SESSION["_layout_save_task"] = None
+    # Apply any patches still sitting in the parent queue (not yet polled)
+    try:
+        layout_patches = await _drain_layout_queue_only()
+        if layout_patches:
+            _apply_slide_layout_patches(layout_patches)
+    except Exception as e:
+        _SESSION["_layout_flush_err"] = str(e)
+    ok = await save_layout()
+    _SESSION["_layout_save_pending"] = False
+    return ok
+
+
+def layout_status(deck: "Deck | None" = None) -> dict:
+    """Diagnostics for layout persistence (hidden ``#| sslive-layout`` note)."""
+    deck = deck or _SESSION.get("deck")
+    lay = (deck.layout if deck is not None else None) or _empty_layout()
+    els = lay.get("elements") or {}
+    known = set((deck.elements or {}).keys()) if deck is not None else set()
+    orphans = [k for k in els if k not in known]
+    task = _SESSION.get("_layout_save_task")
+    pending = bool(_SESSION.get("_layout_save_pending")) or (
+        task is not None and not getattr(task, "done", lambda: True)()
+    )
+    return {
+        "msg_id": _SESSION.get("layout_msg_id"),
+        "n_elements": len(els),
+        "n_orphans": len(orphans),
+        "orphans": orphans[:12],
+        "pending_debounce": pending,
+        "last_err": _SESSION.get("_layout_save_err"),
+        "last_ok_ts": _SESSION.get("_layout_save_ok_ts"),
+        "ids": list(els.keys())[:24],
+    }
 
 
 def _layout_spec(deck: "Deck | None", el_id: str) -> dict:
@@ -2735,11 +2846,18 @@ def generate_presenter_html(
     let nudgeTimer = null;
 
     function setEditing(on) {{
+      const was = editing;
       editing = !!on;
       document.body.classList.toggle('editing', editing);
       document.getElementById('edit-btn')?.classList.toggle('on', editing);
       if (!editing) selectEl(null);
       applyFragments();  // show all while editing; restore hide when done
+      // Leaving edit mode: ask host to flush debounced layout to the dialog now
+      if (was && !editing) {{
+        try {{
+          window.parent.postMessage({{ type: 'sslive_layout_flush', t: Date.now() }}, '*');
+        }} catch (e) {{}}
+      }}
     }}
 
     function selectEl(el) {{
@@ -4133,14 +4251,28 @@ if (!window.__sslive_bridge) {
 if (!window.__sslive_layout_bridge_v1) {
   window.__sslive_layout_bridge_v1 = true;
   window.__sslive_layout_q = window.__sslive_layout_q || [];
+  window.__sslive_layout_flush = false;
   window.addEventListener('message', function (e) {
     var d = e.data;
-    if (!d || d.type !== 'sslive_layout' || !d.el_id) return;
+    if (!d) return;
+    if (d.type === 'sslive_layout_flush') {
+      window.__sslive_layout_flush = true;
+      return;
+    }
+    if (d.type !== 'sslive_layout' || !d.el_id) return;
     window.__sslive_layout_q.push({
       el_id: String(d.el_id),
       patch: d.patch || {},
       t: d.t || Date.now()
     });
+  });
+}
+// Upgrade older bridges that lack the flush flag
+if (window.__sslive_layout_flush === undefined) {
+  window.__sslive_layout_flush = false;
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (d && d.type === 'sslive_layout_flush') window.__sslive_layout_flush = true;
   });
 }
 // Focus guard: pre-empt SolveIt's focus/scroll-on-update after update_msg.
@@ -4252,40 +4384,46 @@ def _item_dicts(seq: Any, fields: tuple[str, ...]) -> list[dict]:
     return out
 
 
-async def _drain_slide_queue() -> tuple[list[dict], list[dict]]:
-    """Pull pending (runs, layout patches) from the parent page queues.
+async def _drain_slide_queue() -> tuple[list[dict], list[dict], bool]:
+    """Pull pending (runs, layout patches, flush flag) from the parent page.
 
-    One js_eval round-trip drains both ``__sslive_q`` (Run requests) and
-    ``__sslive_layout_q`` (edit-mode drag/nudge patches).
+    One js_eval round-trip drains ``__sslive_q``, ``__sslive_layout_q``, and
+    ``__sslive_layout_flush`` (set when leaving edit mode).
     """
     if js_eval is None and js_eval_a is None:
-        return [], []
+        return [], [], False
     try:
         res = await _call_js_eval(
             "const r = (window.__sslive_q || []).slice(); "
             "window.__sslive_q = []; "
             "const l = (window.__sslive_layout_q || []).slice(); "
             "window.__sslive_layout_q = []; "
-            "return {runs: r, layouts: l};"
+            "const f = !!window.__sslive_layout_flush; "
+            "window.__sslive_layout_flush = false; "
+            "return {runs: r, layouts: l, flush: f};"
         )
         q = _parse_js_eval_result(res)
         if q is None:
-            return [], []
-        if isinstance(q, dict) and ("runs" in q or "layouts" in q):
+            return [], [], False
+        flush = False
+        if isinstance(q, dict) and ("runs" in q or "layouts" in q or "flush" in q):
             runs_raw, layouts_raw = q.get("runs"), q.get("layouts")
+            flush = bool(q.get("flush"))
         elif hasattr(q, "runs") or hasattr(q, "layouts"):
             runs_raw, layouts_raw = getattr(q, "runs", None), getattr(q, "layouts", None)
+            flush = bool(getattr(q, "flush", False))
         else:  # old bridge on the page: bare run list
             runs_raw, layouts_raw = q, None
         return (
             _item_dicts(runs_raw, ("cell_id", "source", "slide_index")),
             _item_dicts(layouts_raw, ("el_id", "patch", "t")),
+            flush,
         )
     except Exception as e:
         if _SESSION.get("_bridge_err") != str(e):
             _SESSION["_bridge_err"] = str(e)
             print(f"sslive: bridge poll error: {e}")
-        return [], []
+        return [], [], False
 
 
 def _apply_slide_layout_patches(items: list[dict]) -> int:
@@ -4293,21 +4431,31 @@ def _apply_slide_layout_patches(items: list[dict]) -> int:
 
     No ``_push_layout`` echo — the iframe DOM already shows the dragged
     position; pushing back could fight a drag still in progress.
+
+    Patches are stored even when ``el_id`` is not in ``deck.elements`` (orphan
+    keys survive content edits; load still applies when the id returns).
     """
     deck: Deck | None = _SESSION.get("deck")
     if deck is None or not items:
         return 0
     n = 0
+    orphans = 0
     for it in items:
         el_id = str(it.get("el_id") or "")
-        if not el_id or el_id not in deck.elements:
+        if not el_id:
             continue
+        if el_id not in deck.elements:
+            orphans += 1
         patch = it.get("patch") or {}
         try:
             _apply_layout_patch(deck, el_id, dict(patch))
             n += 1
         except Exception as e:
             _SESSION["_layout_patch_err"] = f"{el_id}: {e}"
+    if orphans:
+        _SESSION["_layout_patch_orphans"] = int(
+            _SESSION.get("_layout_patch_orphans") or 0
+        ) + orphans
     if n:
         _schedule_layout_save()
     return n
@@ -4317,10 +4465,16 @@ async def _bridge_poll_loop() -> None:
     """Background: apply in-slide Run requests + edit-mode layout patches."""
     while _SESSION.get("bridge_active"):
         try:
-            pending, layout_patches = await _drain_slide_queue()
+            pending, layout_patches, want_flush = await _drain_slide_queue()
             # layout first: a Run in the same batch re-renders the output
             # block and must see the just-dragged position
             _apply_slide_layout_patches(layout_patches)
+            # Edit-mode exit asks for an immediate dialog write
+            if want_flush:
+                try:
+                    await flush_layout_save()
+                except Exception as e:
+                    _SESSION["_layout_flush_err"] = str(e)
             for item in pending:
                 if not isinstance(item, dict):
                     continue
@@ -4368,8 +4522,13 @@ async def pump_slide_runs(max_items: int = 20) -> int:
     """Manually drain in-slide Run queue (if background poll is not running)."""
     n = 0
     for _ in range(max_items):
-        pending, layout_patches = await _drain_slide_queue()
+        pending, layout_patches, want_flush = await _drain_slide_queue()
         _apply_slide_layout_patches(layout_patches)
+        if want_flush:
+            try:
+                await flush_layout_save()
+            except Exception as e:
+                _SESSION["_layout_flush_err"] = str(e)
         if not pending:
             break
         for item in pending:
@@ -4764,6 +4923,12 @@ async def slive(
         use_http = not _in_solveit()
 
     theme_dict = theme if isinstance(theme, dict) else dict(THEME_DARK)
+    # Persist any in-flight edit-mode positions before we rebuild the deck
+    if _SESSION.get("deck") is not None:
+        try:
+            await flush_layout_save()
+        except Exception as e:
+            _SESSION["_layout_flush_err"] = str(e)
     try:
         deck = await build_deck(theme=theme_dict)
     except RuntimeError as e:
@@ -4776,6 +4941,16 @@ async def slive(
     _SESSION["executor"] = executor
     _SESSION["echo_to_dialog"] = echo_to_dialog
     _SESSION["theme"] = theme_dict
+    # Soft notice when overlay has keys that no longer match elements (S2-D drift)
+    try:
+        st = layout_status(deck)
+        if st.get("n_orphans"):
+            print(
+                f"sslive: layout has {st['n_orphans']} orphan id(s) "
+                "(note edits renumber pieces) — see layout_status()"
+            )
+    except Exception:
+        pass
 
     port: int | None = None
     if use_http:
@@ -4879,6 +5054,12 @@ async def run_cell_index(i: int = 0, **kw) -> ExecResult:
 
 async def reload_deck(theme: str | dict | None = None) -> Deck:
     """Rebuild deck from the dialog (after structural edits) and refresh slides."""
+    # Don't lose a drag that hasn't hit the debounced dialog write yet
+    if _SESSION.get("deck") is not None:
+        try:
+            await flush_layout_save()
+        except Exception as e:
+            _SESSION["_layout_flush_err"] = str(e)
     theme_dict = (
         theme
         if isinstance(theme, dict)
@@ -5052,8 +5233,10 @@ __all__ = [
     "set_layout",
     "clear_layout",
     "layout_ids",
+    "layout_status",
     "save_layout",
     "load_layout",
+    "flush_layout_save",
     "pump_slide_runs",
     "deck_summary",
     "refresh_presenter",

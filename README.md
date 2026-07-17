@@ -89,11 +89,35 @@ Do not paste `sslive.py` into a dialog cell — only `%run` it.
 | `await hide_from_ai()` | Force AI-hide |
 | `await sync_dialog()` | Batch source write-back |
 | `await set_layout(...)` | Programmatic layout |
-| `layout_ids()` | List element ids |
+| `layout_ids()` | List element ids (`*` = has overlay) |
+| `layout_status()` | Persistence diagnostics |
+| `await save_layout()` / `await flush_layout_save()` | Write overlay now |
 
 ### Edit mode
 
 **`e`** or ✎: select elements; toolbar floats next to the selection. **← / →** reveal then slides. Nav shows `n / N` only (no fragment counter).
+
+### Layout persistence (positions after drag)
+
+Edit-mode **move / resize / font / reveal** is stored in a **hidden dialog note**:
+
+```text
+#| sslive-layout
+{ "version": 1, "elements": { "el-code-_abc": {"x":120,"y":80,"w":900}, ... } }
+```
+
+- Created automatically on first drag; **`skipped=1`** (red eye — not in LLM / not a slide).
+- Coordinates are design-space **1920×1080** px.
+- Leaving edit mode, or the next `%slive` / `reload_deck`, **flushes** any debounced write so positions are not lost.
+- Next `%slive` reloads the overlay and applies it.
+
+```python
+layout_ids()           # see which elements have overrides
+layout_status()        # msg id, pending save, orphan keys
+await flush_layout_save()  # force write after a long edit session
+```
+
+**Note:** fine note pieces use ids `el-{index}-{cell_id}`. Editing the note text (add/remove bullets) can renumber indices so old keys become orphans — positions for those pieces may reset.
 
 ## Troubleshooting
 

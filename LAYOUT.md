@@ -98,7 +98,12 @@ Overlay keyed by `el_id` (absent = flow layout, today's behavior):
    tables; attachment images; ids `el-{idx}-{cid}`; `Element.html` cache)
 5. **reveal steps** — layout key `reveal` + →/← navigation — **done**
    (toolbar field; blank/0 always shown; N appears when frag step ≥ N)
-6. later: undo/redo, multi-select, snap guides, per-slide backgrounds
+6. **Harden persistence** — **done**
+   (`flush_layout_save` before `%slive` / `reload_deck`; flush on leaving edit mode;
+   always re-assert `skipped=1`; patches accepted for orphan el_ids; `layout_status()`;
+   first-save one-liner; README docs. Remaining: content-stable note piece ids.)
+7. later: undo/redo, multi-select, snap guides, per-slide backgrounds,
+   content-hash ids for S2-D (avoid renumber orphans when notes are edited)
 
 ## Risks / decisions
 
