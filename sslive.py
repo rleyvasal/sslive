@@ -1977,6 +1977,20 @@ def generate_presenter_html(
     body.editing .el-editsel {{ outline:2px solid #f59e0b; outline-offset:2px; }}
     body.editing img {{ -webkit-user-drag:none; user-drag:none; }}
     body.editing .code-toolbar {{ cursor:move; }}
+    /* Viz/output embeds (iframe/canvas) steal clicks — disable hit-testing in
+       edit mode so the output *box* can be selected, dragged, and resized. */
+    body.editing [data-type="output"] {{
+      position:relative; min-height:64px; touch-action:none; }}
+    body.editing [data-type="output"] iframe,
+    body.editing [data-type="output"] canvas,
+    body.editing [data-type="output"] video,
+    body.editing [data-type="output"] .sslive-html,
+    body.editing [data-type="output"] .sslive-html * {{
+      pointer-events:none !important; }}
+    body.editing [data-type="output"]::after {{
+      content:'⠿ drag / resize'; position:absolute; top:6px; right:8px; z-index:3;
+      font:11px/1.2 system-ui,sans-serif; color:#fbbf24; background:rgba(0,0,0,0.55);
+      padding:3px 8px; border-radius:6px; pointer-events:none; letter-spacing:0.02em; }}
     .drag-grip {{ display:none; cursor:move; user-select:none; color:#9ca3af;
       font-size:18px; padding:2px 6px; touch-action:none; }}
     body.editing .drag-grip {{ display:inline-block; }}
@@ -2238,13 +2252,14 @@ def generate_presenter_html(
       if (!editing || !editSel) return;
       const slide = editSel.closest('[data-slide]');
       if (!slide) return;
+      // Pin a min box size so tiny/collapsed outputs still get grab targets
       const sr = slide.getBoundingClientRect();
       const er = editSel.getBoundingClientRect();
       const sc = sr.width / 1920 || 1;
       const left = (er.left - sr.left) / sc;
       const top = (er.top - sr.top) / sc;
-      const w = er.width / sc;
-      const h = er.height / sc;
+      const w = Math.max(80, er.width / sc);
+      const h = Math.max(48, er.height / sc);
       const box = document.createElement('div');
       box.id = 'rs-box';
       box.style.left = left + 'px';
@@ -2258,6 +2273,23 @@ def generate_presenter_html(
         hEl.title = 'drag to resize';
         box.appendChild(hEl);
       }});
+      // Extra center drag strip for large viz outputs (easier than edge-only)
+      if (editSel.getAttribute('data-type') === 'output' || editSel.dataset.type === 'output') {{
+        const bar = document.createElement('div');
+        bar.className = 'rs-move';
+        bar.title = 'drag to move';
+        bar.style.cssText = 'position:absolute;left:50%;top:8px;transform:translateX(-50%);'
+          + 'padding:4px 12px;border-radius:6px;background:#60a5fa;color:#0b1220;'
+          + 'font:700 11px/1 system-ui,sans-serif;pointer-events:auto;cursor:move;'
+          + 'z-index:42;user-select:none;touch-action:none;';
+        bar.textContent = 'move';
+        bar.addEventListener('pointerdown', (ev) => {{
+          ev.preventDefault();
+          ev.stopPropagation();
+          beginDrag(editSel, ev);
+        }});
+        box.appendChild(bar);
+      }}
       slide.appendChild(box);
     }}
     function ensureHandle() {{ placeRsBox(); }}
@@ -2487,7 +2519,10 @@ def generate_presenter_html(
         const cw = tb.closest('.code-wrap');
         if (cw) {{ selectEl(cw); beginDrag(cw, e); return; }}
       }}
-      const el = e.target.closest('.note-block, [data-type="output"]');
+      // Outputs / viz (pointcloud iframe, images) — whole mount is one layout el
+      const out = e.target.closest('[data-type="output"]');
+      if (out) {{ selectEl(out); beginDrag(out, e); return; }}
+      const el = e.target.closest('.note-block');
       if (el) {{ selectEl(el); beginDrag(el, e); return; }}
       const cw = e.target.closest('.code-wrap');
       selectEl(cw || null);  // code body: select only; move via toolbar/arrows
