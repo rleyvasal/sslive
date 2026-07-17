@@ -68,6 +68,19 @@ try:
 except Exception:  # pragma: no cover
     FastHTML = JupyUvi = HTMX = None
 
+# Markdown + LaTeX note rendering (sslides pipeline); falls back to a
+# lightweight renderer when unavailable
+try:
+    from mistletoe import Document as _MdDocument
+    from mistletoe.html_renderer import HTMLRenderer as _MdHTMLRenderer
+except Exception:  # pragma: no cover
+    _MdDocument = _MdHTMLRenderer = None
+
+try:
+    from latex2mathml import converter as _l2m
+except Exception:  # pragma: no cover
+    _l2m = None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Piece 2 — Deck model (stable ids for future S1-B write-back)
@@ -922,8 +935,59 @@ def _ensure_local_magic():
         pass
 
 
+def _math_to_mathml(latex_str: str) -> str:
+    """`$...$` / `$$...$$` → MathML (display math centered as a block)."""
+    if _l2m is None:
+        return html_module.escape(latex_str)
+    if latex_str.startswith("$$"):
+        mathml = _l2m.convert(latex_str[2:-2].strip())
+        mathml = mathml.replace('display="inline"', 'display="block"')
+        return f'<div class="math-block">{mathml}</div>'
+    return _l2m.convert(latex_str[1:-1])
+
+
+def _note_to_html_md(content: str) -> str:
+    """Full note render: mistletoe markdown + latex2mathml (sslides pipeline).
+
+    Math is pulled out before markdown so `_`/`^`/`\\` survive, using plain
+    alphanumeric placeholders (markdown-inert). Unlike sslides' global HTML
+    unescape, this leaves entities inside code spans intact (`` `<div>` ``
+    stays escaped). Raw HTML in notes passes through — mistletoe default,
+    and the content is the author's own dialog.
+    """
+    math_blocks: list[str] = []
+
+    def save_math(m: "re.Match[str]") -> str:
+        math_blocks.append(m.group(0))
+        return f"SSLIVEMATH{len(math_blocks) - 1}X"
+
+    content = re.sub(r"\$\$(.*?)\$\$", save_math, content, flags=re.DOTALL)
+    content = re.sub(r"\$([^\$\n]+)\$", save_math, content)
+
+    with _MdHTMLRenderer() as renderer:
+        html = renderer.render(_MdDocument(content))
+
+    for i, block in enumerate(math_blocks):
+        try:
+            rep = _math_to_mathml(block)
+        except Exception:
+            rep = html_module.escape(block)
+        html = html.replace(f"SSLIVEMATH{i}X", rep)
+    return html
+
+
 def _note_to_html(source: str) -> str:
-    """Lightweight note render (headers + paragraphs). Full mistletoe later."""
+    """Note → HTML. Markdown + LaTeX when mistletoe is available."""
+    if _MdDocument is not None and _MdHTMLRenderer is not None:
+        try:
+            return _note_to_html_md(source or "")
+        except Exception as e:
+            _SESSION["_md_render_err"] = str(e)
+    return _note_to_html_basic(source)
+
+
+def _note_to_html_basic(source: str) -> str:
+    """Lightweight fallback render (headers + paragraphs, no markdown/math)."""
     lines = (source or "").splitlines()
     if not lines:
         return ""
@@ -1049,9 +1113,24 @@ def generate_presenter_html(
        overlay `fs`) scales headings + body proportionally; defaults unchanged
        (28px base: 2.5714em≈72px h1, 1.7143em≈48px h2 — the old rem values) */
     .note-block {{ font-size:1.75rem; }}
-    .slide-h1 {{ font-size:2.5714em; font-weight:700; margin:0 0 1rem; }}
-    .slide-h2 {{ font-size:1.7143em; font-weight:700; margin:0 0 1rem; }}
-    .slide-p {{ font-size:1em; line-height:1.5; margin:0.5rem 0; color:{theme.get("fg", "#eee")}; }}
+    .slide-h1, .note-block h1 {{ font-size:2.5714em; font-weight:700; margin:0 0 1rem; }}
+    .slide-h2, .note-block h2 {{ font-size:1.7143em; font-weight:700; margin:0 0 1rem; }}
+    .note-block h3 {{ font-size:1.3em; font-weight:700; margin:0 0 0.75rem; }}
+    .slide-p, .note-block p {{ font-size:1em; line-height:1.5; margin:0.5rem 0; color:{theme.get("fg", "#eee")}; }}
+    .note-block ul, .note-block ol {{ font-size:1em; line-height:1.5; margin:0.5rem 0; padding-left:1.4em; }}
+    .note-block li {{ margin:0.2em 0; }}
+    .note-block code {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.8em;
+      background:{theme.get("code_bg", "#1f2937")}; border:1px solid #374151; border-radius:4px;
+      padding:0.08em 0.35em; }}
+    .note-block pre {{ background:#111827; border:1px solid #374151; border-radius:6px;
+      padding:0.6em 0.8em; overflow-x:auto; }}
+    .note-block pre code {{ background:none; border:0; padding:0; }}
+    .note-block img {{ max-width:100%; }}
+    .note-block a {{ color:#60a5fa; }}
+    .note-block blockquote {{ border-left:3px solid #4b5563; margin:0.5rem 0;
+      padding:0 0 0 0.8em; color:{theme.get("muted", "#9ca3af")}; }}
+    .note-block .math-block {{ text-align:center; margin:0.8em 0; }}
+    .note-block math {{ font-size:1.1em; }}
     .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
       padding:8px 12px; outline:none; }}
     .code-wrap.selected {{ border-color:#60a5fa; box-shadow:0 0 0 2px rgba(96,165,250,0.35); }}
@@ -1365,7 +1444,7 @@ def generate_presenter_html(
         return;
       }}
       if (e.key === 'Escape' && editing) {{
-        if (editSel) selectEl(null); else setEditing(false);
+        setEditing(false);  // exits directly (and deselects); ✎/e toggle back
         return;
       }}
       if (editing && editSel && e.key.startsWith('Arrow')) {{
@@ -2529,6 +2608,11 @@ async def slive(
     _SESSION["slide_index"] = 0
     _SESSION.setdefault("pending_dialog_sync", {})
     _SESSION["auto_sync_dialog"] = True  # deferred update_msg after Run
+    if _MdDocument is None or _l2m is None:
+        print(
+            "sslive: basic note render — `pip install mistletoe latex2mathml` "
+            "for markdown + LaTeX"
+        )
     print("In-slide: edit · ▶ Run / Shift+Enter → GPU (in-place)")
     print("Dialog source: auto-sync shortly after Run (no rebuild/refocus)")
     print("Manual: await sync_dialog()  if needed")

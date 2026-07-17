@@ -14,6 +14,7 @@ RISE-like live GPU slides for [SolveIt](https://solve.it.com) + [gpudev](https:/
 | Preview mode keep-focus after Run | ✅ pre-emptive focus guard (see below) |
 | Move/size/font/order elements (S2-A API) | ✅ `await set_layout(...)` |
 | Edit mode: drag/nudge **in the slide** (S2-B) | ✅ press `e` |
+| Markdown + LaTeX in notes | ✅ mistletoe + latex2mathml (falls back to plain) |
 
 ## Usage
 
@@ -69,10 +70,14 @@ that screenshot/output block live — no rebuild, focus stays put.
 Press **`e`** (or the ✎ nav button): elements get dashed outlines.
 **Drag** notes/outputs anywhere; **code cells drag by their toolbar strip**
 (textarea/Run keep working). Click selects; **arrows nudge 1px**
-(Shift = 10px); **Esc** deselects, then exits. A plain click never changes
-an element's layout mode — only actual movement pins it. Every drop/nudge
-flows through the bridge into the overlay and persists to the dialog
-(debounced, focus-guarded). First drag of a flow element freezes its
-current width so the text keeps its wrap.
+(Shift = 10px); **Esc exits edit mode** (✎/`e` toggle it back). A plain
+click never changes an element's layout mode — only actual movement pins it.
+Every drop/nudge flows through the bridge into the overlay and persists to
+the dialog (debounced, focus-guarded). First drag of a flow element freezes
+its current width so the text keeps its wrap.
+
+Notes render full markdown (bold, lists, images, code) and LaTeX
+(`$...$` / `$$...$$` → MathML) when `mistletoe` + `latex2mathml` are
+installed — same pipeline as sslides.
 
 Keep driver cells under **`%local`**.
