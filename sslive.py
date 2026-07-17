@@ -1153,8 +1153,15 @@ class LiveExecutor:
         parts: list[OutputPart] = []
         hook = make_capture_hook(parts, echo_to_dialog=echo_to_dialog)
         try:
-            # Pure Python on remote GPU (same client as execute_remote)
-            reply = kc.execute_interactive(code=code, output_hook=hook)
+            # Pure Python on remote GPU (same client as execute_remote).
+            # timeout prevents infinite "Running on GPU…" when the kernel wedges.
+            try:
+                reply = kc.execute_interactive(
+                    code=code, output_hook=hook, timeout=90
+                )
+            except TypeError:
+                # Older jupyter_client without timeout=
+                reply = kc.execute_interactive(code=code, output_hook=hook)
         except KeyboardInterrupt:
             self.interrupt()
             return ExecResult(
@@ -2209,11 +2216,11 @@ def generate_presenter_html(
         if (o && /Running/i.test(o.textContent || '')) {{
           o.innerHTML = '<pre style="background:#7f1d1d;color:#fecaca;padding:0.5rem;' +
             'font:13px/1.4 ui-monospace,monospace;border-radius:6px">' +
-            'Timed out waiting for result (check kernel / Plotly output size).</pre>';
+            'Timed out waiting for result. Re-run %slive or check the GPU kernel.</pre>';
         }}
         const badge = document.getElementById('status-badge');
         if (badge) {{ badge.textContent = 'gpu · timeout'; badge.className = 'bad'; }}
-      }}, 120000);
+      }}, 95000);
     }}
 
     // Re-run <script> tags after HTML inject (innerHTML does not execute them).
@@ -2850,8 +2857,8 @@ def generate_presenter_html(
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>sslive</title>
-  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
-  <!-- Plotly figures from GPU/HTML outputs need this global in the slide iframe -->
+  <!-- No HTMX in the slide iframe — SolveIt parent already uses it; loading it
+       here caused oobSwap/insertBefore errors on Plotly HTML injects. -->
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <style>{css}</style>
 </head>
@@ -3328,7 +3335,7 @@ def _run_and_refresh(
     full_refresh: bool = False,
     quiet: bool = False,
 ) -> ExecResult:
-    """Execute on GPU; update slide outputs in place (default) or full rebuild."""
+    """Execute; always push a result so the slide spinner cannot stick."""
     deck = _SESSION.get("deck")
     executor = _SESSION.get("executor")
     if deck is None or executor is None:
@@ -3337,7 +3344,14 @@ def _run_and_refresh(
         _apply_source_to_deck(cell_id, source)
 
     echo = bool(_SESSION.get("echo_to_dialog", False))
-    result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo)
+    try:
+        result = executor.execute_cell(deck, cell_id, echo_to_dialog=echo)
+    except Exception as e:
+        result = ExecResult(
+            ok=False,
+            parts=[OutputPart(kind="error", text=str(e))],
+            error=str(e),
+        )
     if not quiet:
         preview = ""
         if result.parts:
@@ -3350,9 +3364,29 @@ def _run_and_refresh(
             + (f" err={result.error}" if result.error else "")
         )
     if full_refresh:
-        refresh_presenter()
+        try:
+            refresh_presenter()
+        except Exception as e:
+            _SESSION["_refresh_err"] = str(e)
+            push_slide_result(cell_id, result, source=source)
     else:
-        push_slide_result(cell_id, result, source=source)
+        try:
+            push_slide_result(cell_id, result, source=source)
+        except Exception as e:
+            _SESSION["_last_push_err"] = str(e)
+            # Minimal payload so the iframe always clears "Running…"
+            try:
+                push_slide_result(
+                    cell_id,
+                    ExecResult(
+                        ok=False,
+                        parts=[OutputPart(kind="error", text=f"push failed: {e}")],
+                        error=str(e),
+                    ),
+                    source=source,
+                )
+            except Exception as e2:
+                _SESSION["_last_push_err"] = f"{e} / {e2}"
     return result
 
 
@@ -3494,11 +3528,10 @@ async def _flush_pending_dialog_sync(*, refocus: bool = True) -> int:
 
 
 async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = None) -> ExecResult:
-    """Update deck → GPU → in-place slide output → quiet deferred dialog write.
+    """Update deck → execute (thread) → push result → deferred dialog write.
 
-    Hot path never calls ``refresh_presenter`` / ``refocus_presenter`` (those
-    reset slides / exit fullscreen). Dialog ``update_msg`` runs in a deferred
-    task after the slide UI has updated, with no follow-up UI thrash.
+    Execution runs in a worker thread so ``execute_interactive`` / ``run_cell``
+    cannot freeze the asyncio bridge (which would leave the slide spinner stuck).
     """
     if slide_index is not None:
         _SESSION["slide_index"] = int(slide_index)
@@ -3506,22 +3539,53 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
     _apply_source_to_deck(cell_id, source)
     _queue_dialog_sync(cell_id, source)
 
-    # Quiet GPU execute + push result into existing iframe (no rebuild)
-    result = _run_and_refresh(
-        cell_id, source=source, full_refresh=False, quiet=True
-    )
+    loop = asyncio.get_running_loop()
+    try:
+        # Hard ceiling so a wedged kernel cannot spin forever
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: _run_and_refresh(
+                    cell_id, source=source, full_refresh=False, quiet=True
+                ),
+            ),
+            timeout=90.0,
+        )
+    except asyncio.TimeoutError:
+        result = ExecResult(
+            ok=False,
+            parts=[
+                OutputPart(
+                    kind="error",
+                    text=(
+                        "Timed out after 90s waiting for the kernel. "
+                        "Interrupt the kernel or simplify the cell, then ▶ Run again."
+                    ),
+                )
+            ],
+            error="timeout",
+        )
+        try:
+            push_slide_result(cell_id, result, source=source)
+        except Exception as e:
+            _SESSION["_last_push_err"] = str(e)
+    except Exception as e:
+        result = ExecResult(
+            ok=False,
+            parts=[OutputPart(kind="error", text=str(e))],
+            error=str(e),
+        )
+        try:
+            push_slide_result(cell_id, result, source=source)
+        except Exception as e2:
+            _SESSION["_last_push_err"] = f"{e} / {e2}"
 
-    # Deferred dialog write-back (unified source). Never refresh_presenter.
-    # After update_msg, SolveIt focuses the dialog cell in *preview* mode —
-    # steal focus back to #sslive-frame (fullscreen already keeps focus).
+    # Deferred dialog write-back (never block the result path on this)
     if _SESSION.get("auto_sync_dialog", True):
 
         async def _deferred_dialog_write(cid=cell_id, src=source):
             try:
                 await asyncio.sleep(0.2)
-                # Preview: arm the parent-page guard *before* update_msg so the
-                # host's focus/scroll-on-update is swallowed at the source
-                # instead of corrected after the fact (no visible jump).
                 in_fs = await _parent_in_fullscreen()
                 if not in_fs:
                     _arm_focus_guard(2000)
@@ -3530,10 +3594,7 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
                 _SESSION["pending_dialog_sync"] = {}
                 for pcid, psrc in pending.items():
                     await write_back_cell(pcid, psrc)
-                push_slide_result(cid, result, source=src)
                 if not in_fs:
-                    # Backstop for host paths the guard can't intercept —
-                    # no-op when focus never left the slides.
                     for delay in (0.1, 0.4):
                         await asyncio.sleep(delay)
                         refocus_presenter()
@@ -3541,12 +3602,11 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
                 _SESSION["_dialog_sync_err"] = str(e)
 
         try:
-            asyncio.get_running_loop().create_task(_deferred_dialog_write())
+            loop.create_task(_deferred_dialog_write())
         except RuntimeError:
             try:
                 _arm_focus_guard(2000)
                 await write_back_cell(cell_id, source)
-                refocus_presenter()
             except Exception:
                 pass
 
