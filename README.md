@@ -162,22 +162,23 @@ Edit-mode **move / resize / font / reveal** is stored in **one** hidden dialog n
 { "version": 1, "elements": { "el-code-_abc": {"x":120,"y":80,"w":900}, ... } }
 ```
 
+**When it saves:** while ✎ edit is on, positions update live on the slide (and in memory). The dialog note is written when you **leave edit mode** (`e` / ✎ / Esc). Also flushed automatically before a new `%slive` / reload so you do not lose work if you never toggled edit off.
+
 - **Created automatically at the end of `%slive`** if none exists (empty overlay is fine).
-- Also written on first drag/resize / leaving edit mode / `await save_layout()`.
 - **`skipped=1`** (red eye — not in LLM / not a slide).
-- Later edits **update the same note** (find includes skipped messages so we never spawn copies).
+- Later exits **update the same note** (find includes skipped messages so we never spawn copies).
 - If several layout notes exist, the next `%slive` **merges** them into one and retires the rest.
 - Coordinates are design-space **1920×1080** px.
 
 ```python
 await ensure_layout_note()   # create/find the single layout cell now
-layout_status()              # see msg id / errors if creation failed
+layout_status()              # msg id, dirty, errors
 ```
 
 ```python
 layout_ids()           # see which elements have overrides
-layout_status()        # msg id, pending save, orphan keys
-await flush_layout_save()  # force write after a long edit session
+layout_status()        # msg id, dirty, orphan keys
+await flush_layout_save()  # force dialog write now (same as leave-edit)
 ```
 
 **Note:** fine note pieces use ids `el-{index}-{cell_id}`. Editing the note text (add/remove bullets) can renumber indices so old keys become orphans — positions for those pieces may reset.

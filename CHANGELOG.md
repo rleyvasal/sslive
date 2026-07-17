@@ -30,6 +30,12 @@ End-to-end working version for SolveIt + CRAFT. **Do not paste this file into th
 - **reset** restores original **size and position** (back to document flow); code+output reset **together** so one does not jump while the other stays absolute
 - Edit drag: pin **all** in-flow siblings at their visual boxes before one leaves the flex stack; raise z-index of the dragged element (no more code slipping under the plot)
 
+### Layout save on leave-edit
+
+- Drag/resize no longer debounces a dialog write on every gesture (that was inconsistent)
+- In-memory overlay only while ✎ is on; **leave edit** (`e` / ✎ / Esc) drains patches and writes `#| sslive-layout` once
+- Still flushed before `%slive` / reload if you never left edit
+
 ### Export (0.1.1)
 
 - `export_html("talk.html")` / `export_html_str()` / `%slive_export` — static portable player

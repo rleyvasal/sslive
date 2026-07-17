@@ -814,6 +814,7 @@ async def save_layout(
     def _mark_ok(mid: str, *, created: bool) -> None:
         _SESSION["layout_msg_id"] = mid
         _SESSION["_layout_save_ok_ts"] = time.time()
+        _SESSION["_layout_dirty"] = False
         _SESSION.pop("_layout_save_err", None)
         if quiet:
             return
@@ -1006,7 +1007,10 @@ async def _drain_layout_queue_only() -> list[dict]:
 
 
 async def flush_layout_save(*, quiet: bool = False, force: bool = False) -> bool:
-    """Cancel debounce and write layout to the dialog now.
+    """Write layout to the dialog now (exit-edit / %slive / explicit flush).
+
+    Edit gestures only update in-memory ``deck.layout``; this is the moment
+    that persists the ``#| sslive-layout`` note.
 
     Skips the dialog write when nothing is dirty (avoids focusing the layout
     note on a clean re-``%slive``). Use ``force=True`` to always write.
@@ -1034,6 +1038,7 @@ async def flush_layout_save(*, quiet: bool = False, force: bool = False) -> bool
         force
         or had_pending_task
         or bool(_SESSION.get("_layout_save_pending"))
+        or bool(_SESSION.get("_layout_dirty"))
         or bool(layout_patches)
     )
     if not dirty:
@@ -1042,6 +1047,8 @@ async def flush_layout_save(*, quiet: bool = False, force: bool = False) -> bool
 
     ok = await save_layout(quiet=quiet)
     _SESSION["_layout_save_pending"] = False
+    if ok:
+        _SESSION["_layout_dirty"] = False
     return ok
 
 
@@ -1061,6 +1068,7 @@ def layout_status(deck: "Deck | None" = None) -> dict:
         "n_elements": len(els),
         "n_orphans": len(orphans),
         "orphans": orphans[:12],
+        "dirty": bool(_SESSION.get("_layout_dirty")),
         "pending_debounce": pending,
         "last_err": _SESSION.get("_layout_save_err") or _SESSION.get("_layout_add_err"),
         "last_add_ok": _SESSION.get("_layout_add_ok"),
@@ -1273,7 +1281,8 @@ async def set_layout(
     ``reveal`` is the segmented-reveal step (1, 2, 3…); omit/0 = always shown.
     Right arrow advances reveal steps before changing slides. ``fs`` px,
     ``ff`` CSS family, ``z`` stacking, ``align`` left/center/right/justify.
-    Applied live in the iframe; persisted (debounced) to the dialog.
+    Applied live in the iframe. With ``save=True`` (default), schedules a dialog
+    write. In-slide edit mode instead saves when you leave ✎ (see flush on exit).
     """
     deck: Deck | None = _SESSION.get("deck")
     if deck is None:
@@ -1287,6 +1296,7 @@ async def set_layout(
     spec = _apply_layout_patch(
         deck, el_id, {k: v for k, v in updates.items() if v is not _UNSET}
     )
+    _SESSION["_layout_dirty"] = True
     _push_layout(el_id)
     if save:
         _schedule_layout_save()
@@ -1305,6 +1315,8 @@ async def clear_layout(el_id: str | None = None, *, save: bool = True) -> int:
         if els.pop(eid, None) is not None:
             n += 1
         _push_layout(eid)
+    if n:
+        _SESSION["_layout_dirty"] = True
     if save and n:
         _schedule_layout_save()
     return n
@@ -3659,9 +3671,10 @@ def generate_presenter_html(
       try {{ window.parent.__sslive_slide_index = currentSlide; }} catch (e) {{}}
       if (!editing) selectEl(null);
       applyFragments();  // show all while editing; restore hide when done
-      // Leaving edit mode: ask host to flush debounced layout to the dialog now
+      // Leaving edit mode: persist layout once (host drains patches + save_layout)
       if (was && !editing) {{
         try {{
+          window.parent.__sslive_layout_flush = true;
           window.parent.postMessage({{ type: 'sslive_layout_flush', t: Date.now() }}, '*');
         }} catch (e) {{}}
       }}
@@ -4429,7 +4442,7 @@ def generate_presenter_html(
   <div id="chrome">
     <strong>sslive</strong>
     <span id="status-badge" class="ok">{html_module.escape(backend_label)}</span>
-    <span id="edit-badge">✎ edit</span>
+    <span id="edit-badge">✎ edit · leave e/✎ to save layout</span>
     <span style="opacity:0.7">Shift+Enter run · ←/→ reveal then slides · f fullscreen · e edit</span>
   </div>
   <div id="viewport">
@@ -6175,7 +6188,11 @@ async def _drain_slide_queue() -> tuple[list[dict], list[dict], bool]:
 
 
 def _apply_slide_layout_patches(items: list[dict]) -> int:
-    """Apply edit-mode patches from the slide to the overlay + persist.
+    """Apply edit-mode patches from the slide to the in-memory overlay only.
+
+    Does **not** write the dialog note — that happens on leave-edit
+    (``sslive_layout_flush`` → ``flush_layout_save``) or ``%slive`` / reload.
+    Mid-drag debounced dialog writes were the main source of inconsistent saves.
 
     No ``_push_layout`` echo — the iframe DOM already shows the dragged
     position; pushing back could fight a drag still in progress.
@@ -6212,7 +6229,8 @@ def _apply_slide_layout_patches(items: list[dict]) -> int:
             _SESSION.get("_layout_patch_orphans") or 0
         ) + orphans
     if n:
-        _schedule_layout_save()
+        # Memory only until leave-edit / flush_layout_save / %slive
+        _SESSION["_layout_dirty"] = True
     return n
 
 
