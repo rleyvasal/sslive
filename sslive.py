@@ -2435,19 +2435,6 @@ def _mark_sslive_local_magic() -> None:
                     pass
     except Exception:
         pass
-    # Some CRAFT builds keep a set of local magic names
-    try:
-        ns = ip.user_ns or {}
-        for key in ("_local_magics", "local_magics", "_craft_local_magics"):
-            bag = ns.get(key)
-            if isinstance(bag, set):
-                bag.update(names)
-            elif isinstance(bag, list):
-                for n in names:
-                    if n not in bag:
-                        bag.append(n)
-    except Exception:
-        pass
 
 
 def _ensure_local_magic():
