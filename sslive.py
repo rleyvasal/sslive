@@ -187,13 +187,34 @@ dialoghelper does not exist — that causes this error.
 If %sslive is missing after a bad order:  register_sslive()
 """.strip()
 
+def _is_sslive_infra_msg(m: dict) -> bool:
+    """sslive's own machinery — never a slide, whatever its skipped state."""
+    c = (m.get("content") or "").strip()
+    if m.get("msg_type") == "note":
+        return c.startswith("#| sslive-layout") or c.startswith(LAYOUT_STUB_MARK)
+    if m.get("msg_type") == "code":
+        return bool(
+            c.startswith("%sslive") or re.match(r"(?:await\s+)?sslive\s*\(", c)
+        )
+    return False
+
+
 async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[dict]:
-    """Cells after `#| s` marker. Requires dialoghelper (async API)."""
+    """Cells after `#| s` marker. Requires dialoghelper (async API).
+
+    Skipped (red eye) cells ARE included: skipped means "out of LLM context"
+    (e.g. pcviz hides its huge viewer HTML), not "out of the deck" — slides are
+    already opt-in via the marker. Only sslive's own infra is filtered.
+    """
     if find_msgs is None:
         raise RuntimeError(
             "dialoghelper not available — host ran on remote GPU?\n" + _HOST_LOAD_HELP
         )
-    all_msgs = await find_msgs()
+    try:
+        all_msgs = await find_msgs(include_skipped=True)
+    except TypeError:
+        # Older dialoghelper without include_skipped — degrades to old behavior
+        all_msgs = await find_msgs()
     marker_idx = None
     for i, m in enumerate(all_msgs):
         if m.get("msg_type") == "note" and m.get("content", "").strip() == "#| s":
@@ -207,7 +228,7 @@ async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[di
     return [
         m
         for m in all_msgs[marker_idx + 1 :]
-        if m.get("msg_type") in allowed and not m.get("skipped", 0)
+        if m.get("msg_type") in allowed and not _is_sslive_infra_msg(m)
     ]
 
 
