@@ -178,13 +178,13 @@ _HOST_LOAD_HELP = """
 sslive host must load on the SolveIt kernel (not the remote GPU).
 
   %local
-  %run sslive/sslive.py   # auto-registers %slive
+  %run sslive/sslive.py   # auto-registers %sslive
   %gpu                    # optional — stay here for torch / %pointcloud
-  %slive                  # or: await slive()
+  %sslive                 # or: await slive()
 
 If you %run under %gpu, this file executes on the remote kernel where
 dialoghelper does not exist — that causes this error.
-If %slive is missing after a bad order:  register_slive()
+If %sslive is missing after a bad order:  register_sslive()
 """.strip()
 
 async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[dict]:
@@ -702,7 +702,7 @@ async def _cleanup_extra_layout_notes(keeper: str | None) -> int:
 
 
 async def _create_layout_msg(content: str) -> str | None:
-    """Create the single layout note **below the %slive preview**, not at top."""
+    """Create the single layout note **below the %sslive preview**, not at top."""
     if add_msg is None:
         _SESSION["_layout_add_err"] = "add_msg is None"
         return None
@@ -793,7 +793,7 @@ async def save_layout(
       * Extra layout notes + old "safe to delete" stubs are deleted.
 
     ``quiet=True``: no slide-restore postMessage / no console chatter (used during
-    ``%slive`` startup so the preview does not flash or steal focus).
+    ``%sslive`` startup so the preview does not flash or steal focus).
     """
     if layout is None:
         deck = _SESSION.get("deck")
@@ -900,7 +900,7 @@ async def save_layout(
 async def ensure_layout_note(*, quiet: bool = True) -> str | None:
     """Ensure exactly one ``#| sslive-layout`` note; create only if none exist.
 
-    On a warm re-``%slive`` when a single good note already exists, **do not**
+    On a warm re-``%sslive`` when a single good note already exists, **do not**
     call ``update_msg`` (that was focusing the layout cell then the preview).
     Only write when creating, merging duplicates, or cleaning stubs.
     """
@@ -1007,13 +1007,13 @@ async def _drain_layout_queue_only() -> list[dict]:
 
 
 async def flush_layout_save(*, quiet: bool = False, force: bool = False) -> bool:
-    """Write layout to the dialog now (exit-edit / %slive / explicit flush).
+    """Write layout to the dialog now (exit-edit / %sslive / explicit flush).
 
     Edit gestures only update in-memory ``deck.layout``; this is the moment
     that persists the ``#| sslive-layout`` note.
 
     Skips the dialog write when nothing is dirty (avoids focusing the layout
-    note on a clean re-``%slive``). Use ``force=True`` to always write.
+    note on a clean re-``%sslive``). Use ``force=True`` to always write.
 
     ``quiet=True`` avoids slide-restore postMessage / console noise.
 
@@ -1092,7 +1092,7 @@ def layout_status(deck: "Deck | None" = None) -> dict:
         "last_ok_ts": _SESSION.get("_layout_save_ok_ts"),
         "ids": list(els.keys())[:24],
         "hint": (
-            "Look for a Note starting with #| sslive-layout under the %slive "
+            "Look for a Note starting with #| sslive-layout under the %sslive "
             "cell (red eye). If missing: await ensure_layout_note()"
         ),
     }
@@ -2252,7 +2252,8 @@ def _html_for_export(html: str, *, min_height: int = 420) -> str:
             "This was a SolveIt/host viewer (e.g. %pointcloud / Three.js) served from "
             f"<code style='color:#93c5fd'>{html_module.escape(src[:120])}</code>. "
             "That URL is not available outside the live environment. "
-            "Re-open in SolveIt, or use a static plot (matplotlib/Plotly) for portable export.",
+            "For portable export use <code style='color:#93c5fd'>%pointcloud_plotly PATH</code> "
+            "(pcviz) or matplotlib/Plotly, then re-run the cell and re-export.",
             min_height=min_height,
         )
 
@@ -2413,17 +2414,15 @@ def _pick_port(start: int = 8100, span: int = 50) -> int:
 
 
 def _mark_slive_local_magic() -> None:
-    """Tell CRAFT/SolveIt that %slive / %slive_export run on the *host* under %gpu."""
+    """Tell CRAFT/SolveIt that %sslive / %sslive_export run on the *host* under %gpu."""
     if get_ipython is None:
         return
     ip = get_ipython()
     names = (
-        "%slive",
-        "slive",
         "%sslive",
         "sslive",
-        "%slive_export",
-        "slive_export",
+        "%sslive_export",
+        "sslive_export",
     )
     # CRAFT helper
     try:
@@ -2452,7 +2451,7 @@ def _mark_slive_local_magic() -> None:
 
 
 def _ensure_local_magic():
-    """Register ``%slive`` as a *local* magic so it works under ``%gpu`` mode."""
+    """Register ``%sslive`` as a *local* magic so it works under ``%gpu`` mode."""
     _mark_slive_local_magic()
 
 def _host_ok() -> tuple[bool, str]:
@@ -3220,7 +3219,7 @@ def generate_presenter_html(
     """
 
     js = f"""
-    // Start at Python initial_slide (0 on fresh %slive). Only honor a sticky
+    // Start at Python initial_slide (0 on fresh %sslive). Only honor a sticky
     // parent index when force-restore is set (layout-save iframe rebuild).
     let currentSlide = {initial_slide};
     try {{
@@ -3491,7 +3490,7 @@ def generate_presenter_html(
         if (o && /Running/i.test(o.textContent || '')) {{
           o.innerHTML = '<pre style="background:#7f1d1d;color:#fecaca;padding:0.5rem;' +
             'font:13px/1.4 ui-monospace,monospace;border-radius:6px">' +
-            'Timed out waiting for result. Re-run %slive or check the GPU kernel.</pre>';
+            'Timed out waiting for result. Re-run %sslive or check the GPU kernel.</pre>';
         }}
         const badge = document.getElementById('status-badge');
         if (badge) {{ badge.textContent = 'gpu · timeout'; badge.className = 'bad'; }}
@@ -5645,7 +5644,7 @@ def _refocus_presenter_js(*, soft: bool = True) -> str:
     """JS to return focus to the slide iframe after dialog ``update_msg`` churn.
 
     ``soft``: only focus if needed; avoid scrollIntoView when the frame is
-    already on-screen (repeated scroll was flashing the preview on %slive).
+    already on-screen (repeated scroll was flashing the preview on %sslive).
     """
     soft_js = "true" if soft else "false"
     return f"""
@@ -5816,7 +5815,7 @@ async def _sync_slide_index_from_parent() -> int | None:
 
 
 def _reset_slide_index_for_open() -> None:
-    """Fresh ``%slive``: always start at slide 1 (index 0).
+    """Fresh ``%sslive``: always start at slide 1 (index 0).
 
     Without this, a sticky ``parent.__sslive_slide_index`` from the previous
     session (e.g. 6 → UI 7/7) wins over ``initial_slide=0`` and re-opens the
@@ -5838,10 +5837,10 @@ def _reset_slide_index_for_open() -> None:
 
 
 def _push_slide_index_restore(*, keep_edit: bool = False) -> None:
-    """One-shot: restore slide after a layout-save rebuild (not on fresh %slive).
+    """One-shot: restore slide after a layout-save rebuild (not on fresh %sslive).
 
     Sets ``__sslive_force_slide_restore`` so the new iframe may honor the index;
-    normal ``%slive`` clears that flag and always opens at slide 0.
+    normal ``%sslive`` clears that flag and always opens at slide 0.
     """
     idx = int(_SESSION.get("slide_index") or 0)
     if iife is None:
@@ -6257,7 +6256,7 @@ def _apply_slide_layout_patches(items: list[dict]) -> int:
     """Apply edit-mode patches from the slide to the in-memory overlay only.
 
     Does **not** write the dialog note — that happens on leave-edit
-    (``sslive_layout_flush`` → ``flush_layout_save``) or ``%slive`` / reload.
+    (``sslive_layout_flush`` → ``flush_layout_save``) or ``%sslive`` / reload.
     Mid-drag debounced dialog writes were the main source of inconsistent saves.
 
     No ``_push_layout`` echo — the iframe DOM already shows the dragged
@@ -6295,7 +6294,7 @@ def _apply_slide_layout_patches(items: list[dict]) -> int:
             _SESSION.get("_layout_patch_orphans") or 0
         ) + orphans
     if n:
-        # Memory only until leave-edit / flush_layout_save / %slive
+        # Memory only until leave-edit / flush_layout_save / %sslive
         _SESSION["_layout_dirty"] = True
     return n
 
@@ -6405,7 +6404,7 @@ def _show_presenter(port: int | None, height: str = "720px"):
     Callers should red-eye the launcher **before** this (or not at all after),
     because ``update_msg(skipped=1)`` after display reloads the srcdoc (2nd flash).
 
-    Reuses the existing display handle when present so a re-``%slive`` updates
+    Reuses the existing display handle when present so a re-``%sslive`` updates
     in place instead of stacking outputs.
     """
     if isinstance(height, int):
@@ -6766,12 +6765,12 @@ async def slive(
 ):
     """Start the live deck (host magic; slide ▶ Run uses GPU).
 
-    Load the module on the **host** first, then use ``%slive`` under ``%gpu``::
+    Load the module on the **host** first, then use ``%sslive`` under ``%gpu``::
 
         %local
-        %run path/to/sslive.py   # MUST be %local — auto-registers %slive
+        %run path/to/sslive.py   # MUST be %local — auto-registers %sslive
         %gpu                     # stay here for torch / %pointcloud
-        %slive                   # local magic → host deck, Run → GPU
+        %sslive                   # local magic → host deck, Run → GPU
 
     Soft-start: if CRAFT is offline, the deck still opens; ▶ Run waits until ready.
     Returns ``None`` by default (clean output). Session: ``session()``.
@@ -6795,7 +6794,7 @@ async def slive(
         print(f"sslive: GPU not ready — {msg}")
         print(
             "Load CRAFT on the SolveIt host so `_exec_mgr` exists, run %gpu, "
-            "then %slive again."
+            "then %sslive again."
         )
         return None
 
@@ -6804,7 +6803,7 @@ async def slive(
 
     theme_dict = theme if isinstance(theme, dict) else dict(THEME_DARK)
     # Only flush layout if a debounced save is actually pending (dirty).
-    # Always flushing on re-%slive rewrote the layout note → focus layout → preview.
+    # Always flushing on re-%sslive rewrote the layout note → focus layout → preview.
     if _SESSION.get("deck") is not None:
         try:
             await flush_layout_save(quiet=True, force=False)
@@ -7026,8 +7025,8 @@ def session() -> LiveSession | None:
     return _SESSION.get("session")
 
 
-def _run_slive_from_magic(line: str = "") -> Any:
-    """Shared body for %slive / %sslive line magics."""
+def _run_sslive_from_magic(line: str = "") -> Any:
+    """Shared body for the ``%sslive`` line magic."""
     height = "720px"
     line = (line or "").strip()
     if line:
@@ -7053,8 +7052,8 @@ def _run_slive_from_magic(line: str = "") -> Any:
         return loop.create_task(_run())
 
 
-def _run_slive_export_magic(line: str = "") -> Any:
-    """``%slive_export path.html`` — host-local; works under ``%gpu``.
+def _run_sslive_export_magic(line: str = "") -> Any:
+    """``%sslive_export path.html`` — host-local; works under ``%gpu``.
 
     Under ``%gpu``, bare ``export_html(...)`` runs on the *remote* kernel and
     fails with NameError. This magic always runs on the SolveIt host where the
@@ -7074,9 +7073,9 @@ def _run_slive_export_magic(line: str = "") -> Any:
     if _SESSION.get("deck") is None:
         print(
             "sslive: no deck in host session — open slides first:\n"
-            "  %slive\n"
+            "  %sslive\n"
             "then export with:\n"
-            "  %slive_export talk.html"
+            "  %sslive_export talk.html"
         )
         return None
     try:
@@ -7086,10 +7085,15 @@ def _run_slive_export_magic(line: str = "") -> Any:
         return None
 
 
+# Back-compat private aliases (older call sites)
+_run_slive_from_magic = _run_sslive_from_magic
+_run_slive_export_magic = _run_sslive_export_magic
+
+
 def _inject_public_api_into_user_ns() -> None:
     """Expose export helpers on the *host* user_ns (for %local cells).
 
-    Under ``%gpu``, prefer ``%slive_export`` (local magic) — bare names still
+    Under ``%gpu``, prefer ``%sslive_export`` (local magic) — bare names still
     execute on the remote kernel.
     """
     if get_ipython is None:
@@ -7104,15 +7108,17 @@ def _inject_public_api_into_user_ns() -> None:
         ("export_html_a", export_html_a),
         ("generate_export_html", generate_export_html),
         ("slive", slive),
+        ("sslive", slive),  # consistent name for await-style calls
         ("hold_dialog_focus", hold_dialog_focus),
         ("layout_status", layout_status),
         ("cleanup_layout_notes", cleanup_layout_notes),
+        ("register_sslive", register_sslive),
     ):
         ns[name] = obj
 
 
-def _register_slive_magic(*, quiet: bool = True) -> bool:
-    """Install ``%slive`` / ``%slive_export`` and mark them local for ``%gpu``.
+def _register_sslive_magic(*, quiet: bool = True) -> bool:
+    """Install ``%sslive`` / ``%sslive_export`` and mark them local for ``%gpu``.
 
     Always re-registers (safe) so ``%run`` then ``%gpu`` still finds the magics.
     Returns True on success.
@@ -7127,10 +7133,11 @@ def _register_slive_magic(*, quiet: bool = True) -> bool:
     # 1) Preferred: magics_manager.register_function (reliable under %run)
     try:
         mm = ip.magics_manager
-        mm.register_function(_run_slive_from_magic, magic_kind="line", magic_name="slive")
-        mm.register_function(_run_slive_from_magic, magic_kind="line", magic_name="sslive")
         mm.register_function(
-            _run_slive_export_magic, magic_kind="line", magic_name="slive_export"
+            _run_sslive_from_magic, magic_kind="line", magic_name="sslive"
+        )
+        mm.register_function(
+            _run_sslive_export_magic, magic_kind="line", magic_name="sslive_export"
         )
         ok = True
     except Exception as e:
@@ -7143,17 +7150,13 @@ def _register_slive_magic(*, quiet: bool = True) -> bool:
 
             @magics_class
             class SSliveMagics(Magics):
-                @line_magic("slive")
-                def slive_magic(self, line: str = ""):
-                    return _run_slive_from_magic(line)
-
                 @line_magic("sslive")
                 def sslive_magic(self, line: str = ""):
-                    return _run_slive_from_magic(line)
+                    return _run_sslive_from_magic(line)
 
-                @line_magic("slive_export")
-                def slive_export_magic(self, line: str = ""):
-                    return _run_slive_export_magic(line)
+                @line_magic("sslive_export")
+                def sslive_export_magic(self, line: str = ""):
+                    return _run_sslive_export_magic(line)
 
             ip.register_magics(SSliveMagics(ip))
             ok = True
@@ -7171,15 +7174,15 @@ def _register_slive_magic(*, quiet: bool = True) -> bool:
     # Verify
     try:
         lm = ip.magics_manager.magics.get("line", {})
-        if "slive" not in lm and "sslive" not in lm:
+        if "sslive" not in lm:
             ok = False
             if not quiet:
                 print(
-                    "sslive: %slive failed to register — use: await slive()"
+                    "sslive: %sslive failed to register — use: await slive()"
                 )
         elif not quiet:
             print(
-                "sslive: %slive / %slive_export ready "
+                "sslive: %sslive / %sslive_export ready "
                 "(local magics — work under %gpu)"
             )
     except Exception:
@@ -7189,26 +7192,30 @@ def _register_slive_magic(*, quiet: bool = True) -> bool:
     return ok
 
 
-def register_slive() -> bool:
-    """Public: re-register ``%slive`` (call after ``%gpu`` if magic is missing)."""
-    return _register_slive_magic(quiet=False)
+def register_sslive() -> bool:
+    """Public: re-register ``%sslive`` (call after ``%gpu`` if magic is missing)."""
+    return _register_sslive_magic(quiet=False)
+
+
+# Back-compat alias
+register_slive = register_sslive
 
 
 def load_ipython_extension(ip=None) -> None:
     """``%load_ext sslive`` / auto on ``%run`` when possible."""
-    _register_slive_magic(quiet=True)
+    _register_sslive_magic(quiet=True)
 
 
 # Auto-register when the file is %run (must run at end of module)
 try:
     if get_ipython is not None and get_ipython() is not None:
-        _ok = _register_slive_magic(quiet=True)
+        _ok = _register_sslive_magic(quiet=True)
         if not _ok and _SESSION.get("_magic_reg_err"):
             print(f"sslive: magic registration issue: {_SESSION['_magic_reg_err']}")
-            print("sslive: use  await slive()  or  register_slive()")
+            print("sslive: use  await slive()  or  register_sslive()")
 except Exception as _e:
     try:
-        print(f"sslive: could not auto-register %slive ({_e}); use await slive()")
+        print(f"sslive: could not auto-register %sslive ({_e}); use await slive()")
     except Exception:
         pass
 
@@ -7225,12 +7232,14 @@ __all__ = [
     "parse_note_to_elements",
     "slive",
     "session",
+    "register_sslive",
     "register_slive",
     "hide_from_ai",
     "load_ipython_extension",
     "sstop",
     "run_cell",
     "run_cell_index",
+
     "reload_deck",
     "fetch_dialog_source",
     "write_back_cell",
