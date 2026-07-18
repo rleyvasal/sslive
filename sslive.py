@@ -11,7 +11,7 @@ Usage::
     %run path/to/sslive.py   # do not paste this file into the dialog
     %gpu                     # connect remote kernel once
     %local
-    await slive()            # host must stay under %local
+    await sslive()            # host must stay under %local
     # edit in the slide → ▶ Run → GPU execute → in-place output
 """
 
@@ -180,7 +180,7 @@ sslive host must load on the SolveIt kernel (not the remote GPU).
   %local
   %run sslive/sslive.py   # auto-registers %sslive
   %gpu                    # optional — stay here for torch / %pointcloud
-  %sslive                 # or: await slive()
+  %sslive                 # or: await sslive()
 
 If you %run under %gpu, this file executes on the remote kernel where
 dialoghelper does not exist — that causes this error.
@@ -1303,7 +1303,7 @@ async def set_layout(
     """
     deck: Deck | None = _SESSION.get("deck")
     if deck is None:
-        raise RuntimeError("Call await slive() first")
+        raise RuntimeError("Call await sslive() first")
     if el_id not in deck.elements:
         raise KeyError(f"unknown element {el_id!r} — see layout_ids() for options")
     updates = {
@@ -1324,7 +1324,7 @@ async def clear_layout(el_id: str | None = None, *, save: bool = True) -> int:
     """Remove layout overrides for one element (or all when ``el_id`` is None)."""
     deck: Deck | None = _SESSION.get("deck")
     if deck is None:
-        raise RuntimeError("Call await slive() first")
+        raise RuntimeError("Call await sslive() first")
     els = deck.layout.setdefault("elements", {})
     targets = [el_id] if el_id else list(els)
     n = 0
@@ -2413,7 +2413,7 @@ def _pick_port(start: int = 8100, span: int = 50) -> int:
     raise RuntimeError(f"No free port in {start}..{start + span - 1}")
 
 
-def _mark_slive_local_magic() -> None:
+def _mark_sslive_local_magic() -> None:
     """Tell CRAFT/SolveIt that %sslive / %sslive_export run on the *host* under %gpu."""
     if get_ipython is None:
         return
@@ -2452,13 +2452,13 @@ def _mark_slive_local_magic() -> None:
 
 def _ensure_local_magic():
     """Register ``%sslive`` as a *local* magic so it works under ``%gpu`` mode."""
-    _mark_slive_local_magic()
+    _mark_sslive_local_magic()
 
 def _host_ok() -> tuple[bool, str]:
     """Whether the sslive *host* can run (SolveIt host + dialoghelper).
 
     Under ``%gpu``, *code cells* run remotely — including ``%run sslive`` and
-    bare ``await slive()`` unless they are local magics. dialoghelper only
+    bare ``await sslive()`` unless they are local magics. dialoghelper only
     exists on the SolveIt host, so the module must be loaded with ``%local``.
     """
     if find_msgs is None or update_msg is None:
@@ -4482,7 +4482,7 @@ def generate_presenter_html(
             "<h2 class='slide-h2'>No slides</h2>"
             "<p class='slide-p'>Add a note with exactly <code>#| s</code>, "
             "then <code>#</code> / <code>##</code> content below it. "
-            "Re-run <code>await slive()</code>.</p></section>"
+            "Re-run <code>await sslive()</code>.</p></section>"
         )
 
     return f"""<!DOCTYPE html>
@@ -5045,7 +5045,7 @@ def export_html_str(
     """Return portable HTML for ``deck`` (default: current session deck)."""
     deck = deck or _SESSION.get("deck")
     if deck is None:
-        raise RuntimeError("No deck — call await slive() first, or pass deck=")
+        raise RuntimeError("No deck — call await sslive() first, or pass deck=")
     return generate_export_html(
         deck, title=title, offline=offline, initial_slide=initial_slide
     )
@@ -5066,14 +5066,14 @@ def export_html(
 
     ::
 
-        await slive()
+        await sslive()
         # ▶ Run cells you want frozen, then:
         export_html("talk.html")
         export_html("talk.html", title="Demo")
     """
     deck = deck or _SESSION.get("deck")
     if deck is None:
-        raise RuntimeError("No deck — call await slive() first, or pass deck=")
+        raise RuntimeError("No deck — call await sslive() first, or pass deck=")
     html = generate_export_html(
         deck, title=title, offline=offline, initial_slide=initial_slide
     )
@@ -5115,7 +5115,7 @@ def _do_execute(cell_id: str) -> tuple[str, dict[str, str], int]:
     }
     if not deck or not executor:
         html = render_output_html(
-            [OutputPart(kind="error", text="sslive not initialized — await slive() first")],
+            [OutputPart(kind="error", text="sslive not initialized — await sslive() first")],
             cell_id or "unknown",
             theme,
         )
@@ -5589,7 +5589,7 @@ def _run_and_refresh(
     deck = _SESSION.get("deck")
     executor = _SESSION.get("executor")
     if deck is None or executor is None:
-        raise RuntimeError("Call await slive() first")
+        raise RuntimeError("Call await sslive() first")
     if source is not None:
         _apply_source_to_deck(cell_id, source)
 
@@ -6013,7 +6013,7 @@ async def sync_dialog() -> int:
     """
     deck = _SESSION.get("deck")
     if deck is None:
-        raise RuntimeError("Call await slive() first")
+        raise RuntimeError("Call await sslive() first")
     pending = _SESSION.get("pending_dialog_sync") or {}
     for cid, src in pending.items():
         if cid in deck.cells:
@@ -6494,7 +6494,7 @@ def _msg_id_from_obj(msg: Any) -> str | None:
 
 
 async def _resolve_launcher_msg_id(hint: str | None = None) -> str | None:
-    """Resolve the cell that is running ``slive()`` — no reliance on ``__msg_id`` alone.
+    """Resolve the cell that is running ``sslive()`` — no reliance on ``__msg_id`` alone.
 
     Order (dialoghelper-native first, matching current-message semantics)::
 
@@ -6503,7 +6503,7 @@ async def _resolve_launcher_msg_id(hint: str | None = None) -> str | None:
       3. read_msg(n=0, relative=True)  — defaults to *current* message
       4. msg_idx() + find_msgs
       5. browser selectedMsgId (js_eval)
-      6. find_msgs content: code cells calling slive(
+      6. find_msgs content: code cells calling sslive(
     """
     if hint:
         return str(hint)
@@ -6568,12 +6568,12 @@ try {
         except Exception as e:
             _SESSION["_skip_js_err"] = str(e)
 
-    # 6) content heuristic: last code cell that calls slive(
+    # 6) content heuristic: last code cell that calls sslive(
     if find_msgs is not None:
         try:
             msgs = await find_msgs(
                 msg_type="code",
-                re_pattern=r"slive\s*\(",
+                re_pattern=r"sslive\s*\(",
                 include_output=False,
                 include_meta=True,
                 include_skipped=True,
@@ -6594,7 +6594,7 @@ try {
                     if ln.strip() and not ln.strip().startswith("%")
                 ]
                 body = "\n".join(lines)
-                if re.search(r"(?:await\s+)?slive\s*\(", body):
+                if re.search(r"(?:await\s+)?sslive\s*\(", body):
                     best = mid_m
             if best:
                 return str(best)
@@ -6753,7 +6753,7 @@ class LiveSession:
         return f"LiveSession(backend={self.backend!r}, slides={n_s}, code_cells={n_c})"
 
 
-async def slive(
+async def sslive(
     theme: str | dict = "dark",
     *,
     height: str = "720px",
@@ -6779,7 +6779,7 @@ async def slive(
     launcher_msg_id = _find_caller_msg_id()
     _SESSION["launcher_msg_id"] = launcher_msg_id
 
-    _register_slive_magic(quiet=True)
+    _register_sslive_magic(quiet=True)
 
     host_ok, host_msg = _host_ok()
     if not host_ok:
@@ -6905,7 +6905,7 @@ async def slive(
                 ):
                     await ensure_layout_note(quiet=True)
             except Exception as e:
-                _SESSION["_slive_housekeeping_err"] = str(e)
+                _SESSION["_sslive_housekeeping_err"] = str(e)
 
         try:
             asyncio.get_running_loop().create_task(_deferred_layout_only())
@@ -6913,7 +6913,7 @@ async def slive(
             try:
                 await _deferred_layout_only()
             except Exception as e:
-                _SESSION["_slive_housekeeping_err"] = str(e)
+                _SESSION["_sslive_housekeeping_err"] = str(e)
     else:
         mid = await _resolve_launcher_msg_id(launcher_msg_id)
         _SESSION["launcher_msg_id"] = mid
@@ -6944,7 +6944,7 @@ async def run_cell(
     deck: Deck | None = _SESSION.get("deck")
     executor: LiveExecutor | None = _SESSION.get("executor")
     if deck is None or executor is None:
-        raise RuntimeError("Call await slive() first")
+        raise RuntimeError("Call await sslive() first")
     if cell_id not in deck.cells or deck.cells[cell_id].kind != "code":
         raise KeyError(f"not a code cell: {cell_id!r}")
 
@@ -6976,7 +6976,7 @@ async def run_cell_index(i: int = 0, **kw) -> ExecResult:
     """Run ordered code cell ``i`` (deck / optional dialog reload)."""
     deck: Deck | None = _SESSION.get("deck")
     if deck is None:
-        raise RuntimeError("Call await slive() first")
+        raise RuntimeError("Call await sslive() first")
     if not deck.ordered_code_ids:
         raise RuntimeError("No code cells in deck")
     if i < 0 or i >= len(deck.ordered_code_ids):
@@ -7021,7 +7021,7 @@ def deck_summary(deck: Deck | None = None) -> str:
 
 
 def session() -> LiveSession | None:
-    """Active ``LiveSession`` from the last ``await slive()`` (if any)."""
+    """Active ``LiveSession`` from the last ``await sslive()`` (if any)."""
     return _SESSION.get("session")
 
 
@@ -7035,7 +7035,7 @@ def _run_sslive_from_magic(line: str = "") -> Any:
             height = f"{m.group(1)}px"
 
     async def _run():
-        return await slive(height=height, return_session=False)
+        return await sslive(height=height, return_session=False)
 
     coro = _run()
     try:
@@ -7093,11 +7093,6 @@ def _run_sslive_export_magic(line: str = "") -> Any:
         return None
 
 
-# Back-compat private aliases (older call sites)
-_run_slive_from_magic = _run_sslive_from_magic
-_run_slive_export_magic = _run_sslive_export_magic
-
-
 def _inject_public_api_into_user_ns() -> None:
     """Expose export helpers on the *host* user_ns (for %local cells).
 
@@ -7115,8 +7110,7 @@ def _inject_public_api_into_user_ns() -> None:
         ("export_html_str", export_html_str),
         ("export_html_a", export_html_a),
         ("generate_export_html", generate_export_html),
-        ("slive", slive),
-        ("sslive", slive),  # consistent name for await-style calls
+        ("sslive", sslive),
         ("hold_dialog_focus", hold_dialog_focus),
         ("layout_status", layout_status),
         ("cleanup_layout_notes", cleanup_layout_notes),
@@ -7172,7 +7166,7 @@ def _register_sslive_magic(*, quiet: bool = True) -> bool:
             _SESSION["_magic_reg_err"] = f"Magics class: {e}"
 
     # Critical under %gpu: route magics to host, not remote kernel
-    _mark_slive_local_magic()
+    _mark_sslive_local_magic()
     _ensure_local_magic()
     try:
         _inject_public_api_into_user_ns()
@@ -7186,7 +7180,7 @@ def _register_sslive_magic(*, quiet: bool = True) -> bool:
             ok = False
             if not quiet:
                 print(
-                    "sslive: %sslive failed to register — use: await slive()"
+                    "sslive: %sslive failed to register — use: await sslive()"
                 )
         elif not quiet:
             print(
@@ -7205,10 +7199,6 @@ def register_sslive() -> bool:
     return _register_sslive_magic(quiet=False)
 
 
-# Back-compat alias
-register_slive = register_sslive
-
-
 def load_ipython_extension(ip=None) -> None:
     """``%load_ext sslive`` / auto on ``%run`` when possible."""
     _register_sslive_magic(quiet=True)
@@ -7220,10 +7210,10 @@ try:
         _ok = _register_sslive_magic(quiet=True)
         if not _ok and _SESSION.get("_magic_reg_err"):
             print(f"sslive: magic registration issue: {_SESSION['_magic_reg_err']}")
-            print("sslive: use  await slive()  or  register_sslive()")
+            print("sslive: use  await sslive()  or  register_sslive()")
 except Exception as _e:
     try:
-        print(f"sslive: could not auto-register %sslive ({_e}); use await slive()")
+        print(f"sslive: could not auto-register %sslive ({_e}); use await sslive()")
     except Exception:
         pass
 
@@ -7238,10 +7228,9 @@ __all__ = [
     "LiveSession",
     "build_deck",
     "parse_note_to_elements",
-    "slive",
+    "sslive",
     "session",
     "register_sslive",
-    "register_slive",
     "hide_from_ai",
     "load_ipython_extension",
     "sstop",

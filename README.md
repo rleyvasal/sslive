@@ -29,7 +29,7 @@ With CRAFT (same pattern):
 |--------------|------|
 | `%sslive` / `%sslive 800` | Open live deck |
 | `%sslive_export talk.html` | Portable HTML snapshot |
-| `await slive()` | Same as `%sslive` (Python API) |
+| `await sslive()` | Same as `%sslive` (Python API) |
 | `register_sslive()` | Re-register magics if missing |
 
 ## How it fits
