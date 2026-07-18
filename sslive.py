@@ -7037,19 +7037,27 @@ def _run_sslive_from_magic(line: str = "") -> Any:
     async def _run():
         return await slive(height=height, return_session=False)
 
+    coro = _run()
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(_run())
+        return asyncio.run(coro)
 
+    # SolveIt often has a running loop — never return a bare pending Task.
     try:
         import nest_asyncio  # type: ignore
 
         nest_asyncio.apply()
-        return loop.run_until_complete(_run())
+        return loop.run_until_complete(coro)
     except Exception:
-        # Last resort: schedule on the running loop (display still happens)
-        return loop.create_task(_run())
+        # Fallback: new event loop in a worker thread
+        import concurrent.futures
+
+        def _in_thread():
+            return asyncio.run(_run())
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_in_thread).result()
 
 
 def _run_sslive_export_magic(line: str = "") -> Any:
