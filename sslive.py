@@ -629,8 +629,11 @@ _UNSET = object()
 _ALIGN_VALUES = {"left", "center", "right", "justify"}
 # ``reveal`` = segmented reveal step (1,2,3…);  omit/0 = always visible.
 # ``order``/``z`` remain for low-level CSS (API); toolbar uses ``reveal`` only.
-_LAYOUT_KEYS = ("x", "y", "w", "h", "z", "order", "reveal", "fs", "ff", "align")
+_LAYOUT_KEYS = (
+    "x", "y", "w", "h", "z", "order", "reveal", "fs", "ff", "align", "color",
+)
 _FF_SAFE_RE = re.compile(r"[^\w\s,'\"-]")
+_COLOR_SAFE_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
 
 
 def _empty_layout() -> dict:
@@ -1365,6 +1368,11 @@ def _apply_layout_patch(deck: "Deck", el_id: str, patch: dict) -> dict:
             spec[k] = int(v)
         elif k == "ff":
             spec[k] = str(v)
+        elif k == "color":
+            s = str(v).strip()
+            if not _COLOR_SAFE_RE.match(s):
+                raise ValueError("color must be #RGB, #RRGGBB, or #RRGGBBAA")
+            spec[k] = s
         elif k == "align":
             if v not in _ALIGN_VALUES:
                 raise ValueError(f"align must be one of {sorted(_ALIGN_VALUES)}")
@@ -1427,6 +1435,9 @@ def _el_style(spec: dict) -> str:
     align = spec.get("align")
     if align in _ALIGN_VALUES:
         parts.append(f"text-align:{align}")
+    color = spec.get("color")
+    if color and _COLOR_SAFE_RE.match(str(color).strip()):
+        parts.append(f"color:{str(color).strip()}")
     return ";".join(parts) + (";" if parts else "")
 
 
@@ -1523,6 +1534,7 @@ async def set_layout(
     fs: Any = _UNSET,
     ff: Any = _UNSET,
     align: Any = _UNSET,
+    color: Any = _UNSET,
     save: bool = True,
 ) -> dict:
     """Position/style one slide element. Design space is 1920×1080 px.
@@ -1533,12 +1545,13 @@ async def set_layout(
         await set_layout('el-output-_def456', x=1100, y=200, w=700)
         await set_layout('el-note-_abc123', x=None, y=None)  # back to flow
         await set_layout('el-note-_abc123', reveal=1)  # appear on first → press
+        await set_layout('el-note-_abc123', color='#93c5fd')
 
     Omit a param to leave it unchanged; pass ``None`` to clear it.
     ``x``/``y`` position absolutely; without them the element stays in flow.
     ``reveal`` is the segmented-reveal step (1, 2, 3…); omit/0 = always shown.
     Right arrow advances reveal steps before changing slides. ``fs`` px,
-    ``ff`` CSS family, ``z`` stacking, ``align`` left/center/right/justify.
+    ``ff`` CSS family, ``color`` #hex, ``z`` stacking, ``align`` left/center/right/justify.
     Applied live in the iframe. With ``save=True`` (default), schedules a dialog
     write. In-slide edit mode instead saves when you leave ✎ (see flush on exit).
     """
@@ -1550,6 +1563,7 @@ async def set_layout(
     updates = {
         "x": x, "y": y, "w": w, "h": h, "z": z,
         "order": order, "reveal": reveal, "fs": fs, "ff": ff, "align": align,
+        "color": color,
     }
     spec = _apply_layout_patch(
         deck, el_id, {k: v for k, v in updates.items() if v is not _UNSET}
@@ -3501,8 +3515,13 @@ def generate_presenter_html(
       outline:1px dashed rgba(96,165,250,0.5); outline-offset:2px; cursor:move; }}
     body.editing .code-wrap {{ outline:1px dashed rgba(96,165,250,0.5); outline-offset:2px; }}
     body.editing .el-editsel {{ outline:2px solid #f59e0b; outline-offset:2px; }}
+    body.editing .el-editsel.el-primary {{ outline-color:#60a5fa; box-shadow:0 0 0 1px rgba(96,165,250,0.45); }}
     body.editing img {{ -webkit-user-drag:none; user-drag:none; }}
     body.editing .code-toolbar {{ cursor:move; }}
+    #edit-toolbar input[type=color] {{
+      width:28px; height:24px; padding:0; border:1px solid #4b5563; border-radius:4px;
+      background:#1f2937; cursor:pointer; }}
+    #edit-toolbar .tb-count {{ color:#93c5fd; font-weight:600; font-size:11px; }}
     /* Viz/output embeds (iframe/canvas) steal clicks — disable hit-testing in
        edit mode so the output *box* can be selected, dragged, and resized. */
     body.editing [data-type="output"] {{
@@ -3933,7 +3952,8 @@ def generate_presenter_html(
         tmp.innerHTML = html;
         const neu = tmp.firstElementChild;
         if (neu) {{
-          const wasSel = (typeof editSel !== 'undefined' && editSel === out);
+          const wasSel = (typeof isSelected === 'function' && isSelected(out))
+            || (typeof editSel !== 'undefined' && editSel === out);
           // Preserve live drag/resize geometry. Plotly HTML always ships a
           // non-empty style (width:100%;height:…); a naive "neu || live" merge
           // dropped absolute left/top — matplotlib (empty style) looked fine.
@@ -4052,9 +4072,10 @@ def generate_presenter_html(
       placeRsBox();
     }}
 
-    // ── S2-B edit mode: select / drag / nudge → layout patches to parent ──
+    // ── S2-B edit mode: multi-select / drag / nudge → layout patches ──
     let editing = false;
-    let editSel = null;
+    let editSels = [];   // selected elements (order: primary last)
+    let editSel = null;  // primary = editSels[last]
     let drag = null;
     let nudgeTimer = null;
 
@@ -4099,14 +4120,61 @@ def generate_presenter_html(
       }}
     }}
 
-    function selectEl(el) {{
-      if (editSel) editSel.classList.remove('el-editsel');
-      editSel = el || null;
-      if (editSel) editSel.classList.add('el-editsel');
+    function paintSelection() {{
+      document.querySelectorAll('.el-editsel').forEach((e) => {{
+        e.classList.remove('el-editsel', 'el-primary');
+      }});
+      editSels.forEach((el, i) => {{
+        el.classList.add('el-editsel');
+        if (i === editSels.length - 1) el.classList.add('el-primary');
+      }});
+      editSel = editSels.length ? editSels[editSels.length - 1] : null;
+    }}
+
+    function setSelection(els, primary) {{
+      const uniq = [];
+      const seen = new Set();
+      (els || []).forEach((el) => {{
+        if (!el || seen.has(el)) return;
+        seen.add(el);
+        uniq.push(el);
+      }});
+      if (primary && seen.has(primary)) {{
+        editSels = uniq.filter((e) => e !== primary).concat([primary]);
+      }} else {{
+        editSels = uniq;
+      }}
+      paintSelection();
       updateToolbar();
     }}
 
-    // ── S2-C toolbar: font / reveal step / external resize frame ──
+    /** @param el element|null  @param opts {{toggle?:bool, add?:bool}} */
+    function selectEl(el, opts) {{
+      opts = opts || {{}};
+      if (!el) {{ setSelection([]); return; }}
+      if (opts.toggle) {{
+        if (editSels.indexOf(el) >= 0)
+          setSelection(editSels.filter((e) => e !== el));
+        else
+          setSelection(editSels.concat([el]), el);
+        return;
+      }}
+      if (opts.add) {{
+        if (editSels.indexOf(el) < 0) setSelection(editSels.concat([el]), el);
+        else setSelection(editSels, el);
+        return;
+      }}
+      setSelection([el], el);
+    }}
+
+    function isSelected(el) {{ return editSels.indexOf(el) >= 0; }}
+    function selectionOr(el) {{
+      // If target is in multi-selection, operate on the whole set
+      if (el && isSelected(el) && editSels.length > 1) return editSels.slice();
+      return el ? [el] : editSels.slice();
+    }}
+
+    // ── S2-C toolbar: font / color / reveal / external resize frame ──
     const TB_FONTS = [
       ['', 'Default'],
       ["Georgia, 'Times New Roman', serif", 'Serif'],
@@ -4117,14 +4185,53 @@ def generate_presenter_html(
     const RS_MIN = 40;
 
     function selElId() {{ return editSel ? (editSel.dataset.elId || editSel.id) : null; }}
-    function curFs() {{
-      if (!editSel) return 28;
-      return Math.round(parseFloat(editSel.style.fontSize)
-        || parseFloat(getComputedStyle(editSel).fontSize) || 28);
+    function curFs(el) {{
+      const t = el || editSel;
+      if (!t) return 28;
+      return Math.round(parseFloat(t.style.fontSize)
+        || parseFloat(getComputedStyle(t).fontSize) || 28);
     }}
-    function curReveal() {{
-      if (!editSel) return 0;
-      return revealOf(editSel);
+    function curReveal(el) {{
+      const t = el || editSel;
+      if (!t) return 0;
+      return revealOf(t);
+    }}
+    function curColor(el) {{
+      const t = el || editSel;
+      if (!t) return '#e5e7eb';
+      const c = (t.style.color || '').trim();
+      if (/^#([0-9a-fA-F]{{3}}|[0-9a-fA-F]{{6}})$/.test(c)) return c.length === 4
+        ? ('#' + c[1]+c[1]+c[2]+c[2]+c[3]+c[3]) : c;
+      // computed rgb → hex
+      try {{
+        const cs = getComputedStyle(t).color || '';
+        const m = cs.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+        if (m) {{
+          const h = (n) => ('0' + parseInt(n, 10).toString(16)).slice(-2);
+          return '#' + h(m[1]) + h(m[2]) + h(m[3]);
+        }}
+      }} catch (e) {{}}
+      return '#e5e7eb';
+    }}
+
+    function selBBoxDesign(slide, els) {{
+      // Bounding box of els in design-space px relative to slide
+      const sr = slide.getBoundingClientRect();
+      const sc = sr.width / 1920 || 1;
+      let minL = Infinity, minT = Infinity, maxR = -Infinity, maxB = -Infinity;
+      els.forEach((el) => {{
+        const er = el.getBoundingClientRect();
+        const l = (er.left - sr.left) / sc;
+        const t = (er.top - sr.top) / sc;
+        const r = l + er.width / sc;
+        const b = t + er.height / sc;
+        if (l < minL) minL = l; if (t < minT) minT = t;
+        if (r > maxR) maxR = r; if (b > maxB) maxB = b;
+      }});
+      if (!Number.isFinite(minL)) return null;
+      return {{
+        x: minL, y: minT, w: Math.max(80, maxR - minL), h: Math.max(48, maxB - minT), sc: sc
+      }};
     }}
 
     // Resize frame lives on the slide (sibling overlay), so handles are never
@@ -4134,32 +4241,28 @@ def generate_presenter_html(
     }}
     function placeRsBox() {{
       removeHandle();
-      if (!editing || !editSel) return;
-      const slide = editSel.closest('[data-slide]');
+      if (!editing || !editSels.length) return;
+      const slide = editSels[0].closest('[data-slide]');
       if (!slide) return;
-      // Pin a min box size so tiny/collapsed outputs still get grab targets
-      const sr = slide.getBoundingClientRect();
-      const er = editSel.getBoundingClientRect();
-      const sc = sr.width / 1920 || 1;
-      const left = (er.left - sr.left) / sc;
-      const top = (er.top - sr.top) / sc;
-      const w = Math.max(80, er.width / sc);
-      const h = Math.max(48, er.height / sc);
+      const bb = selBBoxDesign(slide, editSels);
+      if (!bb) return;
       const box = document.createElement('div');
       box.id = 'rs-box';
-      box.style.left = left + 'px';
-      box.style.top = top + 'px';
-      box.style.width = w + 'px';
-      box.style.height = h + 'px';
+      box.style.left = bb.x + 'px';
+      box.style.top = bb.y + 'px';
+      box.style.width = bb.w + 'px';
+      box.style.height = bb.h + 'px';
       RS_DIRS.forEach((dir) => {{
         const hEl = document.createElement('div');
         hEl.className = 'rs-handle rs-' + dir;
         hEl.dataset.dir = dir;
-        hEl.title = 'drag to resize';
+        hEl.title = editSels.length > 1 ? 'resize group' : 'drag to resize';
         box.appendChild(hEl);
       }});
-      // Extra center drag strip for large viz outputs (easier than edge-only)
-      if (editSel.getAttribute('data-type') === 'output' || editSel.dataset.type === 'output') {{
+      // Move strip when multi or output
+      const needMove = editSels.length > 1 || editSels.some((e) =>
+        e.getAttribute('data-type') === 'output' || e.dataset.type === 'output');
+      if (needMove) {{
         const bar = document.createElement('div');
         bar.className = 'rs-move';
         bar.title = 'drag to move';
@@ -4167,7 +4270,7 @@ def generate_presenter_html(
           + 'padding:4px 12px;border-radius:6px;background:#60a5fa;color:#0b1220;'
           + 'font:700 11px/1 system-ui,sans-serif;pointer-events:auto;cursor:move;'
           + 'z-index:42;user-select:none;touch-action:none;';
-        bar.textContent = 'move';
+        bar.textContent = editSels.length > 1 ? ('move ×' + editSels.length) : 'move';
         bar.addEventListener('pointerdown', (ev) => {{
           ev.preventDefault();
           ev.stopPropagation();
@@ -4179,25 +4282,31 @@ def generate_presenter_html(
     }}
     function ensureHandle() {{ placeRsBox(); }}
 
-    // Float toolbar next to the selected element (Google Slides–style), not
-    // stuck at the top of the viewport — easier when editing many pieces.
+    // Float toolbar next to the selection (Google Slides–style)
     function placeToolbar() {{
       const tb = document.getElementById('edit-toolbar');
-      if (!tb || !editing || !editSel) return;
+      if (!tb || !editing || !editSels.length) return;
       if (!tb.classList.contains('show')) return;
-      const er = editSel.getBoundingClientRect();
+      const er = (editSels.length === 1)
+        ? editSel.getBoundingClientRect()
+        : (() => {{
+            let L=Infinity,T=Infinity,R=-Infinity,B=-Infinity;
+            editSels.forEach((el) => {{
+              const r = el.getBoundingClientRect();
+              if (r.left < L) L = r.left; if (r.top < T) T = r.top;
+              if (r.right > R) R = r.right; if (r.bottom > B) B = r.bottom;
+            }});
+            return {{ left:L, top:T, right:R, bottom:B, width:R-L, height:B-T }};
+          }})();
       const gap = 8;
       const pad = 8;
-      // measure after show so width/height are real
-      const tw = tb.offsetWidth || 280;
+      const tw = tb.offsetWidth || 320;
       const th = tb.offsetHeight || 40;
       const vw = window.innerWidth;
       const vh = window.innerHeight;
-      // Prefer just above the selection; fall below if no room.
       let top = er.top - th - gap;
       if (top < pad) top = er.bottom + gap;
       if (top + th > vh - pad) top = Math.max(pad, vh - th - pad);
-      // Align left edges; clamp into the viewport.
       let left = er.left;
       if (left + tw > vw - pad) left = vw - tw - pad;
       if (left < pad) left = pad;
@@ -4208,52 +4317,61 @@ def generate_presenter_html(
     function updateToolbar() {{
       const tb = document.getElementById('edit-toolbar');
       if (!tb) return;
-      if (!editing || !editSel) {{ tb.classList.remove('show'); removeHandle(); return; }}
+      if (!editing || !editSels.length) {{ tb.classList.remove('show'); removeHandle(); return; }}
       tb.classList.add('show');
-      document.getElementById('tb-el').textContent = selElId();
+      const n = editSels.length;
+      document.getElementById('tb-el').textContent = n > 1
+        ? (n + ' selected') : (selElId() || '—');
+      const count = document.getElementById('tb-count');
+      if (count) count.textContent = n > 1 ? ('×' + n) : '';
       document.getElementById('tb-fs-val').textContent = curFs();
       const sel = document.getElementById('tb-font');
       if (sel) sel.value = editSel.style.fontFamily || '';
+      const col = document.getElementById('tb-color');
+      if (col && document.activeElement !== col) col.value = curColor();
       const rIn = document.getElementById('tb-reveal');
       if (rIn && document.activeElement !== rIn) {{
         const r = curReveal();
         rIn.value = r > 0 ? String(r) : '';
       }}
       ensureHandle();
-      // Position after layout so size is known (double-rAF for flex wrap)
       requestAnimationFrame(() => {{
         placeToolbar();
         requestAnimationFrame(placeToolbar);
       }});
     }}
 
-    function tbPatch(patch) {{
-      // apply locally (live, no rebuild) + persist via bridge
-      if (!editSel) return;
-      const isCode = editSel.classList.contains('code-wrap')
-        || editSel.dataset.type === 'code';
+    function applyPatchToEl(el, patch) {{
+      if (!el) return;
+      const isCode = el.classList.contains('code-wrap') || el.dataset.type === 'code';
       if ('fs' in patch) {{
         if (patch.fs == null) {{
-          editSel.style.fontSize = '';
-          editSel.style.removeProperty('--code-fs');
+          el.style.fontSize = '';
+          el.style.removeProperty('--code-fs');
         }} else {{
-          editSel.style.fontSize = patch.fs + 'px';
-          editSel.style.setProperty('--code-fs', patch.fs + 'px');
+          el.style.fontSize = patch.fs + 'px';
+          el.style.setProperty('--code-fs', patch.fs + 'px');
         }}
       }}
-      if ('ff' in patch) editSel.style.fontFamily = patch.ff || '';
+      if ('ff' in patch) el.style.fontFamily = patch.ff || '';
+      if ('color' in patch) el.style.color = patch.color || '';
       if ('reveal' in patch) {{
-        if (patch.reveal == null || patch.reveal <= 0) editSel.removeAttribute('data-reveal');
-        else editSel.setAttribute('data-reveal', String(patch.reveal));
+        if (patch.reveal == null || patch.reveal <= 0) el.removeAttribute('data-reveal');
+        else el.setAttribute('data-reveal', String(patch.reveal));
       }}
-      if ('w' in patch) editSel.style.width = patch.w == null ? '' : patch.w + 'px';
-      // Code bars stay one-line; height is owned by the floating editor
+      if ('w' in patch) el.style.width = patch.w == null ? '' : patch.w + 'px';
       if ('h' in patch && !isCode) {{
-        editSel.style.height = patch.h == null ? '' : patch.h + 'px';
+        el.style.height = patch.h == null ? '' : patch.h + 'px';
       }}
-      if ('x' in patch) editSel.style.left = patch.x == null ? '' : patch.x + 'px';
-      if ('y' in patch) editSel.style.top = patch.y == null ? '' : patch.y + 'px';
-      sendLayoutPatch(selElId(), patch);
+      if ('x' in patch) el.style.left = patch.x == null ? '' : patch.x + 'px';
+      if ('y' in patch) el.style.top = patch.y == null ? '' : patch.y + 'px';
+      sendLayoutPatch(el.dataset.elId || el.id, patch);
+    }}
+
+    function tbPatch(patch) {{
+      // apply to every selected element
+      if (!editSels.length) return;
+      editSels.forEach((el) => applyPatchToEl(el, patch));
       updateToolbar();
     }}
 
@@ -4367,33 +4485,43 @@ def generate_presenter_html(
     function beginDrag(el, ev) {{
       // Conversion to absolute is deferred to the first real movement —
       // a plain click must not change the element's layout mode.
+      const targets = selectionOr(el);
       const slide = el.closest('[data-slide]');
       const sc = slide ? (slide.getBoundingClientRect().width / 1920 || 1) : 1;
-      drag = {{ el: el, elId: el.dataset.elId || el.id, sx: ev.clientX, sy: ev.clientY,
-               ox: 0, oy: 0, w: 0, includeW: false, sc: sc, started: false }};
+      drag = {{
+        els: targets,
+        sx: ev.clientX, sy: ev.clientY, sc: sc, started: false,
+        starts: null,  // filled on first move: [{{el, elId, x, y, w, converted}}]
+      }};
       ev.preventDefault();
       try {{ el.setPointerCapture(ev.pointerId); }} catch (e) {{}}
     }}
 
     function nudgeSel(dx, dy) {{
-      if (!editSel) return;
-      const cur = ensureAbs(editSel);
-      const nx = cur.x + dx, ny = cur.y + dy;
-      editSel.style.left = nx + 'px';
-      editSel.style.top = ny + 'px';
+      if (!editSels.length) return;
+      const patches = [];
+      editSels.forEach((el) => {{
+        const cur = ensureAbs(el);
+        const nx = cur.x + dx, ny = cur.y + dy;
+        el.style.left = nx + 'px';
+        el.style.top = ny + 'px';
+        const patch = {{ x: nx, y: ny }};
+        if (cur.converted) patch.w = cur.w;
+        patches.push({{ elId: el.dataset.elId || el.id, patch }});
+      }});
       placeRsBox();
-      const elId = editSel.dataset.elId || editSel.id;
-      const patch = {{ x: nx, y: ny }};
-      if (cur.converted) {{ patch.w = cur.w; updateToolbar(); }}
-      else placeToolbar();
+      placeToolbar();
       clearTimeout(nudgeTimer);
-      nudgeTimer = setTimeout(() => sendLayoutPatch(elId, patch), 350);
+      nudgeTimer = setTimeout(() => {{
+        patches.forEach((p) => sendLayoutPatch(p.elId, p.patch));
+      }}, 350);
     }}
 
     let rsDrag = null;
 
     function applyResizeFrame(state, clientX, clientY) {{
-      // Google Slides–style: drag a corner/edge → box grows/shrinks from that side.
+      // Single element: classic corner/edge resize.
+      // Multi: resize the group bounding box and scale members proportionally.
       const dx = (clientX - state.sx) / state.sc;
       const dy = (clientY - state.sy) / state.sc;
       let x = state.ox, y = state.oy, w = state.ow, h = state.oh;
@@ -4410,30 +4538,58 @@ def generate_presenter_html(
         h = Math.max(RS_MIN, state.oh - dy);
         y = state.oy + (state.oh - h);
       }}
-      // Corner drag on notes (or Alt+corner anywhere): scale font with the box
-      if (state.scaleFs && state.ofs && dir.length === 2) {{
-        const sx = w / Math.max(1, state.ow), sy = h / Math.max(1, state.oh);
-        const scale = Math.max(0.25, Math.min(sx, sy));
-        const fs = Math.max(8, Math.round(state.ofs * scale));
-        state.el.style.fontSize = fs + 'px';
-        state.el.style.setProperty('--code-fs', fs + 'px');
-        state.fs = fs;
-      }}
       x = Math.round(x); y = Math.round(y);
       w = Math.round(w); h = Math.round(h);
-      state.el.style.left = x + 'px';
-      state.el.style.top = y + 'px';
-      if (touchW) state.el.style.width = w + 'px';
-      // Code bars stay one-line tall — height is owned by the floating editor
-      const isCode = state.el.classList.contains('code-wrap')
-        || state.el.dataset.type === 'code';
-      if (touchH && !isCode) {{
-        state.el.style.height = h + 'px';
-        state.el.style.overflow = 'auto';
-      }}
       state.cx = x; state.cy = y; state.cw = w; state.ch = h;
-      state.touchW = touchW; state.touchH = touchH && !isCode;
-      // Keep external frame + floating toolbar in sync while resizing
+      state.touchW = touchW; state.touchH = touchH;
+
+      if (state.group && state.members) {{
+        const sx = w / Math.max(1, state.ow);
+        const sy = h / Math.max(1, state.oh);
+        const scaleFs = state.scaleFs && dir.length === 2;
+        state.results = state.members.map((m) => {{
+          const nx = Math.round(x + (m.rx * w));
+          const ny = Math.round(y + (m.ry * h));
+          const nw = Math.max(RS_MIN, Math.round(m.rw * sx));
+          const nh = Math.max(RS_MIN, Math.round(m.rh * sy));
+          m.el.style.left = nx + 'px';
+          m.el.style.top = ny + 'px';
+          m.el.style.width = nw + 'px';
+          const isCode = m.el.classList.contains('code-wrap') || m.el.dataset.type === 'code';
+          if (!isCode) {{
+            m.el.style.height = nh + 'px';
+            m.el.style.overflow = 'auto';
+          }}
+          let fs = null;
+          if (scaleFs && m.ofs) {{
+            const s = Math.max(0.25, Math.min(sx, sy));
+            fs = Math.max(8, Math.round(m.ofs * s));
+            m.el.style.fontSize = fs + 'px';
+            m.el.style.setProperty('--code-fs', fs + 'px');
+          }}
+          return {{ elId: m.elId, x: nx, y: ny, w: nw, h: isCode ? null : nh, fs: fs, isCode }};
+        }});
+      }} else {{
+        const el = state.el;
+        // Corner drag on notes (or Alt+corner): scale font with the box
+        if (state.scaleFs && state.ofs && dir.length === 2) {{
+          const sx = w / Math.max(1, state.ow), sy = h / Math.max(1, state.oh);
+          const scale = Math.max(0.25, Math.min(sx, sy));
+          const fs = Math.max(8, Math.round(state.ofs * scale));
+          el.style.fontSize = fs + 'px';
+          el.style.setProperty('--code-fs', fs + 'px');
+          state.fs = fs;
+        }}
+        el.style.left = x + 'px';
+        el.style.top = y + 'px';
+        if (touchW) el.style.width = w + 'px';
+        const isCode = el.classList.contains('code-wrap') || el.dataset.type === 'code';
+        if (touchH && !isCode) {{
+          el.style.height = h + 'px';
+          el.style.overflow = 'auto';
+        }}
+        state.touchH = touchH && !isCode;
+      }}
       const box = document.getElementById('rs-box');
       if (box) {{
         box.style.left = x + 'px';
@@ -4444,60 +4600,115 @@ def generate_presenter_html(
       placeToolbar();
     }}
 
+    function pickSelectOpts(e) {{
+      if (e.shiftKey || e.metaKey || e.ctrlKey) return {{ toggle: true }};
+      return {{}};
+    }}
+
     document.addEventListener('pointerdown', (e) => {{
       if (!editing || e.button !== 0) return;
-      if (e.target.closest('#edit-toolbar')) return;  // toolbar clicks never drag/deselect
+      if (e.target.closest('#edit-toolbar, #info-pop, #nav, #chrome')) return;
       const rh = e.target.closest('#rs-box .rs-handle, .rs-handle');
       if (rh) {{
-        const el = editSel;  // handles live on #rs-box, not inside the element
-        if (!el) return;
-        const start = ensureAbs(el);
-        bringToFront(el);
-        const slide = el.closest('[data-slide]');
+        if (!editSels.length) return;
+        const slide = editSels[0].closest('[data-slide]');
         const sc = slide ? (slide.getBoundingClientRect().width / 1920 || 1) : 1;
-        // Prefer explicit layout size; fall back to measured box.
-        const explicitH = parseFloat(el.style.height);
-        const oh = Number.isFinite(explicitH) && explicitH > 0 ? explicitH : start.h;
-        const explicitW = parseFloat(el.style.width);
-        const ow = Number.isFinite(explicitW) && explicitW > 0 ? explicitW : start.w;
-        const isNote = el.classList.contains('note-block');
-        rsDrag = {{
-          el: el, elId: el.dataset.elId || el.id, dir: rh.dataset.dir || 'se',
-          sx: e.clientX, sy: e.clientY, sc: sc,
-          ox: start.x, oy: start.y, ow: ow, oh: oh,
-          converted: start.converted,
-          // Corner-drag notes scale font with the box (Google-ish text grow);
-          // hold Alt on any element to force font-scale on corner drag.
-          scaleFs: isNote || e.altKey,
-          ofs: curFs(), fs: null,
-          cx: start.x, cy: start.y, cw: ow, ch: oh
-        }};
+        // Absolute-ize everything selected first
+        editSels.forEach((el) => {{ ensureAbs(el); bringToFront(el); }});
+        const multi = editSels.length > 1;
+        if (multi) {{
+          const bb = selBBoxDesign(slide, editSels);
+          if (!bb) return;
+          const members = editSels.map((el) => {{
+            const st = ensureAbs(el);
+            return {{
+              el, elId: el.dataset.elId || el.id,
+              x: st.x, y: st.y, w: st.w, h: st.h,
+              rx: (st.x - bb.x) / Math.max(1, bb.w),
+              ry: (st.y - bb.y) / Math.max(1, bb.h),
+              rw: st.w, rh: st.h,
+              ofs: curFs(el),
+            }};
+          }});
+          rsDrag = {{
+            group: true, members,
+            dir: rh.dataset.dir || 'se',
+            sx: e.clientX, sy: e.clientY, sc: sc,
+            ox: bb.x, oy: bb.y, ow: bb.w, oh: bb.h,
+            scaleFs: e.altKey || members.every((m) => m.el.classList.contains('note-block')),
+            results: null,
+            cx: bb.x, cy: bb.y, cw: bb.w, ch: bb.h,
+          }};
+        }} else {{
+          const el = editSel;
+          const start = ensureAbs(el);
+          const explicitH = parseFloat(el.style.height);
+          const oh = Number.isFinite(explicitH) && explicitH > 0 ? explicitH : start.h;
+          const explicitW = parseFloat(el.style.width);
+          const ow = Number.isFinite(explicitW) && explicitW > 0 ? explicitW : start.w;
+          const isNote = el.classList.contains('note-block');
+          rsDrag = {{
+            group: false, el: el, elId: el.dataset.elId || el.id,
+            dir: rh.dataset.dir || 'se',
+            sx: e.clientX, sy: e.clientY, sc: sc,
+            ox: start.x, oy: start.y, ow: ow, oh: oh,
+            converted: start.converted,
+            scaleFs: isNote || e.altKey,
+            ofs: curFs(el), fs: null,
+            cx: start.x, cy: start.y, cw: ow, ch: oh
+          }};
+        }}
         e.preventDefault();
         e.stopPropagation();
         try {{ rh.setPointerCapture(e.pointerId); }} catch (err) {{}}
         return;
       }}
+      const multiKey = e.shiftKey || e.metaKey || e.ctrlKey;
       const grip = e.target.closest('.drag-grip');
       if (grip) {{
         const el = document.getElementById(grip.dataset.dragFor);
-        if (el) {{ selectEl(el); beginDrag(el, e); }}
+        if (el) {{
+          if (multiKey) selectEl(el, {{ toggle: true }});
+          else if (!isSelected(el)) selectEl(el);
+          beginDrag(el, e);
+        }}
         return;
       }}
       // interactive bits keep working while editing
       if (e.target.closest('textarea, button, a, input, select')) return;
-      // code cells drag by their toolbar strip (big target; textarea untouched)
+      // code cells drag by their toolbar strip
       const tb = e.target.closest('.code-toolbar');
       if (tb) {{
         const cw = tb.closest('.code-wrap');
-        if (cw) {{ selectEl(cw); beginDrag(cw, e); return; }}
+        if (cw) {{
+          if (multiKey) selectEl(cw, {{ toggle: true }});
+          else if (!isSelected(cw)) selectEl(cw);
+          beginDrag(cw, e);
+          return;
+        }}
       }}
-      // Outputs / viz (pointcloud iframe, images) — whole mount is one layout el
       const out = e.target.closest('[data-type="output"]');
-      if (out) {{ selectEl(out); beginDrag(out, e); return; }}
+      if (out) {{
+        if (multiKey) selectEl(out, {{ toggle: true }});
+        else if (!isSelected(out)) selectEl(out);
+        beginDrag(out, e);
+        return;
+      }}
       const el = e.target.closest('.note-block');
-      if (el) {{ selectEl(el); beginDrag(el, e); return; }}
+      if (el) {{
+        if (multiKey) selectEl(el, {{ toggle: true }});
+        else if (!isSelected(el)) selectEl(el);
+        beginDrag(el, e);
+        return;
+      }}
       const cw = e.target.closest('.code-wrap');
-      selectEl(cw || null);  // code body: select only; move via toolbar/arrows
+      if (cw) {{
+        if (multiKey) selectEl(cw, {{ toggle: true }});
+        else selectEl(cw);
+        return;
+      }}
+      // empty slide click: clear selection unless multi-key held
+      if (!multiKey) selectEl(null);
     }}, true);
 
     document.addEventListener('pointermove', (e) => {{
@@ -4508,15 +4719,22 @@ def generate_presenter_html(
       if (!drag) return;
       if (!drag.started) {{
         if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) <= 2) return;
-        // Pin siblings at current spots, then lift this element above them
-        const start = ensureAbs(drag.el);
-        bringToFront(drag.el);
-        drag.ox = start.x; drag.oy = start.y;
-        drag.w = start.w; drag.includeW = start.converted;
+        drag.starts = drag.els.map((el) => {{
+          const st = ensureAbs(el);
+          bringToFront(el);
+          return {{
+            el, elId: el.dataset.elId || el.id,
+            x: st.x, y: st.y, w: st.w, converted: st.converted
+          }};
+        }});
         drag.started = true;
       }}
-      drag.el.style.left = (drag.ox + (e.clientX - drag.sx) / drag.sc) + 'px';
-      drag.el.style.top = (drag.oy + (e.clientY - drag.sy) / drag.sc) + 'px';
+      const ddx = (e.clientX - drag.sx) / drag.sc;
+      const ddy = (e.clientY - drag.sy) / drag.sc;
+      drag.starts.forEach((s) => {{
+        s.el.style.left = (s.x + ddx) + 'px';
+        s.el.style.top = (s.y + ddy) + 'px';
+      }});
       placeRsBox();
       placeToolbar();
     }});
@@ -4524,23 +4742,34 @@ def generate_presenter_html(
     document.addEventListener('pointerup', (e) => {{
       if (rsDrag) {{
         applyResizeFrame(rsDrag, e.clientX, e.clientY);
-        const patch = {{ x: rsDrag.cx, y: rsDrag.cy }};
-        if (rsDrag.touchW) patch.w = rsDrag.cw;
-        if (rsDrag.touchH) patch.h = rsDrag.ch;
-        if (rsDrag.fs != null) patch.fs = rsDrag.fs;
-        sendLayoutPatch(rsDrag.elId, patch);
+        if (rsDrag.group && rsDrag.results) {{
+          rsDrag.results.forEach((r) => {{
+            const patch = {{ x: r.x, y: r.y, w: r.w }};
+            if (r.h != null) patch.h = r.h;
+            if (r.fs != null) patch.fs = r.fs;
+            sendLayoutPatch(r.elId, patch);
+          }});
+        }} else if (rsDrag.el) {{
+          const patch = {{ x: rsDrag.cx, y: rsDrag.cy }};
+          if (rsDrag.touchW) patch.w = rsDrag.cw;
+          if (rsDrag.touchH) patch.h = rsDrag.ch;
+          if (rsDrag.fs != null) patch.fs = rsDrag.fs;
+          sendLayoutPatch(rsDrag.elId, patch);
+        }}
         rsDrag = null;
         updateToolbar();
         return;
       }}
       if (!drag) return;
-      if (drag.started) {{
-        const patch = {{
-          x: Math.round(parseFloat(drag.el.style.left) || 0),
-          y: Math.round(parseFloat(drag.el.style.top) || 0)
-        }};
-        if (drag.includeW) patch.w = drag.w;
-        sendLayoutPatch(drag.elId, patch);
+      if (drag.started && drag.starts) {{
+        drag.starts.forEach((s) => {{
+          const patch = {{
+            x: Math.round(parseFloat(s.el.style.left) || 0),
+            y: Math.round(parseFloat(s.el.style.top) || 0)
+          }};
+          if (s.converted) patch.w = s.w;
+          sendLayoutPatch(s.elId, patch);
+        }});
         updateToolbar();
       }}
       drag = null;
@@ -4639,14 +4868,21 @@ def generate_presenter_html(
         return;
       }}
       // While editing + selection: arrows nudge. Otherwise arrows navigate slides.
-      if (editing && editSel && e.key.startsWith('Arrow')) {{
+      if (editing && editSels.length && e.key.startsWith('Arrow')) {{
         e.preventDefault();
-        const step = e.shiftKey ? 10 : 1;
+        // Shift alone = larger nudge; Shift+click is multi-select (not here)
+        const step = e.altKey ? 10 : 1;
         if (e.key === 'ArrowLeft')  nudgeSel(-step, 0);
         if (e.key === 'ArrowRight') nudgeSel(step, 0);
         if (e.key === 'ArrowUp')    nudgeSel(0, -step);
         if (e.key === 'ArrowDown')  nudgeSel(0, step);
         placeRsBox();
+        return;
+      }}
+      // Escape clears multi-selection while editing (not fullscreen)
+      if (editing && e.key === 'Escape' && editSels.length && !isPresenterFs()) {{
+        e.preventDefault();
+        selectEl(null);
         return;
       }}
       if (e.key === 'ArrowRight') {{ e.preventDefault(); goNext(); return; }}
@@ -4744,7 +4980,7 @@ def generate_presenter_html(
       // Full clear → original document-flow size + position (no absolute box).
       const CLEAR_LAYOUT = {{
         x: null, y: null, w: null, h: null, z: null,
-        order: null, reveal: null, fs: null, ff: null, align: null
+        order: null, reveal: null, fs: null, ff: null, align: null, color: null
       }};
       function restoreFlowLayout(el) {{
         if (!el) return;
@@ -4753,7 +4989,7 @@ def generate_presenter_html(
         // Explicitly drop absolute geometry so the element re-enters the slide
         // flex stack in DOM order (title → code → output).
         ['position','left','top','width','height','margin','overflow',
-         'zIndex','order','fontSize','fontFamily','textAlign'].forEach((p) => {{
+         'zIndex','order','fontSize','fontFamily','textAlign','color'].forEach((p) => {{
           try {{ el.style[p] = ''; }} catch (e) {{}}
         }});
         try {{ el.style.removeProperty('--code-fs'); }} catch (e) {{}}
@@ -4772,19 +5008,35 @@ def generate_presenter_html(
           return document.getElementById('el-code-' + id.slice(10));
         return null;
       }}
+      const colIn = document.getElementById('tb-color');
+      if (colIn) {{
+        colIn.addEventListener('input', () => {{
+          if (!editSels.length) return;
+          tbPatch({{ color: colIn.value || null }});
+        }});
+        colIn.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+      }}
       document.getElementById('tb-reset').addEventListener('click', () => {{
-        if (!editSel) return;
-        const el = editSel;
-        const elId = el.dataset.elId || el.id;
-        const pair = layoutPairOf(el);
-        restoreFlowLayout(el);
-        sendLayoutPatch(elId, Object.assign({{}}, CLEAR_LAYOUT));
-        if (pair) {{
-          restoreFlowLayout(pair);
-          sendLayoutPatch(pair.dataset.elId || pair.id, Object.assign({{}}, CLEAR_LAYOUT));
-        }}
-        // Keep selection on the element the user reset; refresh handles
-        selectEl(el);
+        if (!editSels.length) return;
+        const keep = editSels.slice();
+        const done = new Set();
+        keep.forEach((el) => {{
+          const elId = el.dataset.elId || el.id;
+          if (done.has(elId)) return;
+          restoreFlowLayout(el);
+          sendLayoutPatch(elId, Object.assign({{}}, CLEAR_LAYOUT));
+          done.add(elId);
+          const pair = layoutPairOf(el);
+          if (pair) {{
+            const pid = pair.dataset.elId || pair.id;
+            if (!done.has(pid)) {{
+              restoreFlowLayout(pair);
+              sendLayoutPatch(pid, Object.assign({{}}, CLEAR_LAYOUT));
+              done.add(pid);
+            }}
+          }}
+        }});
+        setSelection(keep.filter((el) => document.body.contains(el)));
         updateToolbar();
       }});
     }})();
@@ -4897,17 +5149,19 @@ def generate_presenter_html(
   </div>
   <div id="edit-toolbar">
     <span class="tb-label" id="tb-el">—</span>
+    <span class="tb-count" id="tb-count"></span>
     <span class="tb-sep"></span>
-    <button type="button" id="tb-fs-minus" title="smaller text">A−</button>
+    <button type="button" id="tb-fs-minus" title="smaller text (all selected)">A−</button>
     <span id="tb-fs-val">–</span>
-    <button type="button" id="tb-fs-plus" title="bigger text">A+</button>
-    <select id="tb-font" title="font family"></select>
+    <button type="button" id="tb-fs-plus" title="bigger text (all selected)">A+</button>
+    <select id="tb-font" title="font family (all selected)"></select>
+    <input type="color" id="tb-color" title="text color (all selected)" value="#e5e7eb" />
     <span class="tb-sep"></span>
     <span class="tb-field" title="Reveal step: blank = always visible. 1 appears on first →, 2 on second →, …">reveal
       <input type="number" id="tb-reveal" min="0" step="1" placeholder="—" />
     </span>
     <span class="tb-sep"></span>
-    <button type="button" id="tb-reset" title="Restore original size &amp; position (code+output together)">reset</button>
+    <button type="button" id="tb-reset" title="Restore original size &amp; position (all selected)">reset</button>
   </div>
   <div id="live-code-pop" hidden>
     <div class="live-code-pop-head">
@@ -4928,8 +5182,10 @@ def generate_presenter_html(
       <li><kbd>←</kbd> <kbd>→</kbd> · reveal, then slides</li>
       <li><kbd>Shift</kbd>+<kbd>Enter</kbd> · run code</li>
       <li><kbd>e</kbd> · edit layout on/off (saves on exit)</li>
+      <li><kbd>Shift</kbd>/<kbd>⌘</kbd>+click · multi-select</li>
+      <li><kbd>Alt</kbd>+arrows · nudge 10px · drag · move group</li>
       <li><kbd>f</kbd> · fullscreen</li>
-      <li><kbd>Esc</kbd> · leave fullscreen / collapse editor</li>
+      <li><kbd>Esc</kbd> · clear selection / leave fullscreen</li>
       <li>Click code · floating editor</li>
     </ul>
   </div>
