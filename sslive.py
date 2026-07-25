@@ -3362,14 +3362,16 @@ def generate_presenter_html(
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
     /* Regular slides: large type, tight vertical rhythm for projection */
     .slide:not(.title-slide) {{ padding:56px 96px; gap:12px; }}
-    /* Base ~44px body; headings scale in em so layout `fs` still works */
-    .note-block {{ font-size:2.75rem; }}
+    /* Base ~44px body; headings scale in em so layout `fs` still works.
+       Text color lives on .note-block so layout `color` / toolbar recolor
+       cascades into p/li/bullets (do not hard-code color on children). */
+    .note-block {{ font-size:2.75rem; color:{theme.get("fg", "#eee")}; }}
     .title-slide .note-block {{ font-size:2.5rem; }}
     .slide-h1, .note-block h1 {{ font-size:2.35em; font-weight:700; margin:0 0 0.35rem;
-      line-height:1.12; letter-spacing:-0.02em; }}
+      line-height:1.12; letter-spacing:-0.02em; color:inherit; }}
     .slide-h2, .note-block h2 {{ font-size:1.65em; font-weight:700; margin:0 0 0.4rem;
-      line-height:1.18; letter-spacing:-0.015em; }}
-    .note-block h3 {{ font-size:1.15em; font-weight:700; margin:0 0 0.3rem; }}
+      line-height:1.18; letter-spacing:-0.015em; color:inherit; }}
+    .note-block h3 {{ font-size:1.15em; font-weight:700; margin:0 0 0.3rem; color:inherit; }}
     /* Center slide titles on regular slides (## Heading / # Title piece) */
     .slide:not(.title-slide) .slide-h1,
     .slide:not(.title-slide) .slide-h2,
@@ -3380,12 +3382,13 @@ def generate_presenter_html(
     .title-slide .slide-h1, .title-slide .slide-h2,
     .title-slide .note-block[data-type="heading"] {{ text-align:center; width:100%; }}
     .slide-p, .note-block p {{ font-size:1.05em; line-height:1.35; margin:0.15rem 0;
-      color:{theme.get("fg", "#eee")}; }}
+      color:inherit; }}
     .note-block ul, .note-block ol {{ font-size:1.05em; line-height:1.35; margin:0.15rem 0;
-      padding-left:1.2em; }}
-    .note-block li {{ margin:0.12em 0; }}
+      padding-left:1.2em; color:inherit; }}
+    .note-block li {{ margin:0.12em 0; color:inherit; }}
+    .note-block li::marker {{ color:inherit; }}
     .note-block[data-type="list_item"] {{ margin:0.08rem 0; }}
-    .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.2em; }}
+    .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.2em; color:inherit; }}
     .note-block[data-type="math"] {{ margin:0.45rem 0; }}
     .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow-x:auto;
       font-size:1.2em; }}
@@ -5359,13 +5362,13 @@ def generate_export_html(
     .slide.hidden {{ display:none; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
     .slide:not(.title-slide) {{ padding:56px 96px; gap:12px; }}
-    .note-block {{ font-size:2.75rem; }}
+    .note-block {{ font-size:2.75rem; color:{theme.get("fg", "#eee")}; }}
     .title-slide .note-block {{ font-size:2.5rem; }}
     .slide-h1, .note-block h1 {{ font-size:2.35em; font-weight:700; margin:0 0 0.35rem;
-      line-height:1.12; letter-spacing:-0.02em; }}
+      line-height:1.12; letter-spacing:-0.02em; color:inherit; }}
     .slide-h2, .note-block h2 {{ font-size:1.65em; font-weight:700; margin:0 0 0.4rem;
-      line-height:1.18; letter-spacing:-0.015em; }}
-    .note-block h3 {{ font-size:1.15em; font-weight:700; margin:0 0 0.3rem; }}
+      line-height:1.18; letter-spacing:-0.015em; color:inherit; }}
+    .note-block h3 {{ font-size:1.15em; font-weight:700; margin:0 0 0.3rem; color:inherit; }}
     .slide:not(.title-slide) .slide-h1,
     .slide:not(.title-slide) .slide-h2,
     .slide:not(.title-slide) .note-block[data-type="heading"],
@@ -5375,11 +5378,13 @@ def generate_export_html(
     .title-slide .slide-h1, .title-slide .slide-h2,
     .title-slide .note-block[data-type="heading"] {{ text-align:center; width:100%; }}
     .slide-p, .note-block p {{ font-size:1.05em; line-height:1.35; margin:0.15rem 0;
-      color:{theme.get("fg", "#eee")}; }}
+      color:inherit; }}
     .note-block ul, .note-block ol {{ font-size:1.05em; line-height:1.35; margin:0.15rem 0;
-      padding-left:1.2em; }}
-    .note-block li {{ margin:0.12em 0; }}
+      padding-left:1.2em; color:inherit; }}
+    .note-block li {{ margin:0.12em 0; color:inherit; }}
+    .note-block li::marker {{ color:inherit; }}
     .note-block[data-type="list_item"] {{ margin:0.08rem 0; }}
+    .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.2em; color:inherit; }}
     .note-block[data-type="math"] {{ margin:0.45rem 0; }}
     .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow-x:auto;
       font-size:1.2em; }}
