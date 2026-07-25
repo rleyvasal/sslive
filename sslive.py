@@ -3341,21 +3341,21 @@ def generate_presenter_html(
       font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; }}
     #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
     #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
-    .slide {{ width:1920px; height:1080px; padding:48px 64px; display:none; flex-direction:column;
-      justify-content:flex-start; align-items:stretch; overflow:auto; gap:12px; position:relative; }}
+    .slide {{ width:1920px; height:1080px; padding:56px 80px; display:none; flex-direction:column;
+      justify-content:flex-start; align-items:stretch; overflow:auto; gap:18px; position:relative; }}
     .slide.active {{ display:flex; }}
     .slide.hidden {{ display:none; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
-    /* Regular slides: larger type for projection; title slides keep centered chrome */
-    .slide:not(.title-slide) {{ padding:56px 88px; gap:20px; }}
-    /* note typography in em off .note-block so layout overlay `fs` scales all text */
-    .note-block {{ font-size:2.15rem; }}  /* ~34px body on 1920 stage */
-    .title-slide .note-block {{ font-size:2.0rem; }}
-    .slide-h1, .note-block h1 {{ font-size:2.45em; font-weight:700; margin:0 0 0.85rem;
-      line-height:1.15; letter-spacing:-0.01em; }}
-    .slide-h2, .note-block h2 {{ font-size:1.85em; font-weight:700; margin:0 0 0.9rem;
-      line-height:1.2; letter-spacing:-0.01em; }}
-    .note-block h3 {{ font-size:1.25em; font-weight:700; margin:0 0 0.65rem; }}
+    /* Regular slides: projection-scale type (1920×1080 design space) */
+    .slide:not(.title-slide) {{ padding:72px 110px; gap:32px; }}
+    /* Base ~48px body; headings scale in em so layout `fs` still works */
+    .note-block {{ font-size:3rem; }}
+    .title-slide .note-block {{ font-size:2.75rem; }}
+    .slide-h1, .note-block h1 {{ font-size:2.35em; font-weight:700; margin:0 0 0.75rem;
+      line-height:1.12; letter-spacing:-0.02em; }}
+    .slide-h2, .note-block h2 {{ font-size:1.75em; font-weight:700; margin:0 0 0.85rem;
+      line-height:1.18; letter-spacing:-0.015em; }}
+    .note-block h3 {{ font-size:1.2em; font-weight:700; margin:0 0 0.6rem; }}
     /* Center slide titles on regular slides (## Heading / # Title piece) */
     .slide:not(.title-slide) .slide-h1,
     .slide:not(.title-slide) .slide-h2,
@@ -3365,17 +3365,17 @@ def generate_presenter_html(
       text-align:center; width:100%; align-self:stretch; }}
     .title-slide .slide-h1, .title-slide .slide-h2,
     .title-slide .note-block[data-type="heading"] {{ text-align:center; width:100%; }}
-    .slide-p, .note-block p {{ font-size:1.05em; line-height:1.55; margin:0.55rem 0;
+    .slide-p, .note-block p {{ font-size:1.08em; line-height:1.55; margin:0.55rem 0;
       color:{theme.get("fg", "#eee")}; }}
-    .note-block ul, .note-block ol {{ font-size:1.05em; line-height:1.55; margin:0.55rem 0;
-      padding-left:1.35em; }}
-    .note-block li {{ margin:0.35em 0; }}
-    .note-block[data-type="list_item"] {{ margin:0.28rem 0; }}
-    .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.35em; }}
-    .note-block[data-type="math"] {{ margin:0.85rem 0; }}
-    .note-block .math-block {{ text-align:center; margin:0.65em 0; overflow-x:auto;
-      font-size:1.2em; }}
-    .note-block .math-inline {{ display:inline; font-size:1.05em; }}
+    .note-block ul, .note-block ol {{ font-size:1.08em; line-height:1.55; margin:0.55rem 0;
+      padding-left:1.25em; }}
+    .note-block li {{ margin:0.45em 0; }}
+    .note-block[data-type="list_item"] {{ margin:0.4rem 0; }}
+    .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.25em; }}
+    .note-block[data-type="math"] {{ margin:1rem 0; }}
+    .note-block .math-block {{ text-align:center; margin:0.75em 0; overflow-x:auto;
+      font-size:1.25em; }}
+    .note-block .math-inline {{ display:inline; font-size:1.08em; }}
     .note-block[data-type="image"], .note-block .note-image {{ margin:0.5rem 0; }}
     .note-block .note-image {{ margin:0; }}
     .note-block .note-image img, .note-block[data-type="image"] img {{
@@ -3464,18 +3464,36 @@ def generate_presenter_html(
       border-radius:0 0 8px 0; opacity:0.85;
     }}
     #live-code-pop .live-code-pop-rs:hover {{ opacity:1; }}
-    #chrome {{ position:fixed; left:12px; top:12px; z-index:50; display:flex; gap:10px; align-items:center;
-      background:rgba(0,0,0,0.55); color:#fff; padding:6px 12px; border-radius:8px; font-size:13px; }}
+    #chrome {{ position:fixed; left:12px; top:12px; z-index:50; display:flex; gap:8px; align-items:center;
+      background:rgba(0,0,0,0.5); color:#fff; padding:5px 10px; border-radius:8px; font-size:12px; }}
     #chrome .ok {{ color:#86efac; }} #chrome .bad {{ color:#fca5a5; }}
-    #nav {{ position:fixed; right:16px; bottom:16px; z-index:50; display:flex; gap:12px; align-items:center;
-      background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.35;
+    #nav {{ position:fixed; right:16px; bottom:16px; z-index:50; display:flex; gap:10px; align-items:center;
+      background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.4;
       transition:opacity 0.15s; }}
-    #nav:hover {{ opacity:1; }}
-    #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer; padding:0 6px; }}
+    #nav:hover, #nav:focus-within {{ opacity:1; }}
+    #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer;
+      padding:0 6px; line-height:1; border-radius:6px; }}
+    #nav button:hover {{ background:rgba(255,255,255,0.1); }}
     /* ── edit mode (S2-B): outlines + drag affordances ── */
     #edit-btn.on {{ color:#f59e0b; }}
-    #edit-badge {{ display:none; color:#f59e0b; font-weight:600; }}
-    body.editing #edit-badge {{ display:inline; }}
+    #info-btn {{ font-size:18px; opacity:0.9; }}
+    #info-btn[aria-expanded="true"] {{ color:#93c5fd; }}
+    #info-pop {{
+      position:fixed; right:16px; bottom:58px; z-index:55; display:none;
+      width:min(340px, 92vw); padding:12px 14px; border-radius:10px;
+      background:rgba(3,7,18,0.96); border:1px solid #4b5563; color:#e5e7eb;
+      font:13px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;
+      box-shadow:0 10px 28px rgba(0,0,0,0.55); }}
+    #info-pop.open {{ display:block; }}
+    #info-pop h4 {{ margin:0 0 8px; font-size:12px; font-weight:700; color:#93c5fd;
+      letter-spacing:0.04em; text-transform:uppercase; }}
+    #info-pop ul {{ margin:0; padding:0 0 0 1.1em; }}
+    #info-pop li {{ margin:0.25em 0; }}
+    #info-pop kbd {{ font:12px/1.2 ui-monospace,Menlo,monospace; background:#1f2937;
+      border:1px solid #4b5563; border-radius:4px; padding:1px 5px; color:#f8fafc; }}
+    #info-pop .info-close {{ float:right; background:transparent; border:0; color:#9ca3af;
+      cursor:pointer; font-size:16px; padding:0 2px; line-height:1; }}
+    #info-pop .info-close:hover {{ color:#fff; }}
     body.editing .note-block, body.editing [data-type="output"] {{
       outline:1px dashed rgba(96,165,250,0.5); outline-offset:2px; cursor:move; }}
     body.editing .code-wrap {{ outline:1px dashed rgba(96,165,250,0.5); outline-offset:2px; }}
@@ -4653,6 +4671,35 @@ def generate_presenter_html(
     document.getElementById('edit-btn')?.addEventListener('click', (e) => {{
       e.preventDefault(); e.stopPropagation(); setEditing(!editing);
     }});
+    (function wireInfoPop() {{
+      const btn = document.getElementById('info-btn');
+      const pop = document.getElementById('info-pop');
+      const close = document.getElementById('info-pop-close');
+      if (!btn || !pop) return;
+      function setOpen(on) {{
+        pop.classList.toggle('open', !!on);
+        pop.setAttribute('aria-hidden', on ? 'false' : 'true');
+        btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+      }}
+      btn.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation();
+        setOpen(!pop.classList.contains('open'));
+      }});
+      close?.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation(); setOpen(false);
+      }});
+      document.addEventListener('click', (e) => {{
+        if (!pop.classList.contains('open')) return;
+        const t = e.target;
+        if (pop.contains(t) || btn.contains(t)) return;
+        setOpen(false);
+      }});
+      document.addEventListener('keydown', (e) => {{
+        if (e.key === 'Escape' && pop.classList.contains('open')) {{
+          setOpen(false);
+        }}
+      }});
+    }})();
     // Keep floating toolbar glued to the selection on viewport changes
     window.addEventListener('resize', () => {{ placeRsBox(); placeToolbar(); }});
     document.addEventListener('scroll', () => {{ placeRsBox(); placeToolbar(); }}, true);
@@ -4840,8 +4887,6 @@ def generate_presenter_html(
   <div id="chrome">
     <strong>sslive</strong>
     <span id="status-badge" class="ok">{html_module.escape(backend_label)}</span>
-    <span id="edit-badge">✎ edit · press e to save &amp; exit</span>
-    <span style="opacity:0.7">Shift+Enter run · ←/→ reveal then slides · f fullscreen · e edit on/off</span>
   </div>
   <div id="viewport">
     <div id="stage">
@@ -4874,8 +4919,22 @@ def generate_presenter_html(
     <textarea id="live-code-pop-ta" spellcheck="false"></textarea>
     <div class="live-code-pop-rs" title="Drag to resize"></div>
   </div>
+  <div id="info-pop" role="dialog" aria-label="Keyboard shortcuts" aria-hidden="true">
+    <button type="button" class="info-close" id="info-pop-close" aria-label="Close">×</button>
+    <h4>Shortcuts</h4>
+    <ul>
+      <li><kbd>←</kbd> <kbd>→</kbd> · reveal, then slides</li>
+      <li><kbd>Shift</kbd>+<kbd>Enter</kbd> · run code</li>
+      <li><kbd>e</kbd> · edit layout on/off (saves on exit)</li>
+      <li><kbd>f</kbd> · fullscreen</li>
+      <li><kbd>Esc</kbd> · leave fullscreen / collapse editor</li>
+      <li>Click code · floating editor</li>
+    </ul>
+  </div>
   <div id="nav">
-    <button type="button" id="edit-btn" title="edit layout (e)" aria-label="Edit layout">✎</button>
+    <button type="button" id="edit-btn" title="Edit layout (e)" aria-label="Edit layout">✎</button>
+    <button type="button" id="info-btn" title="Shortcuts" aria-label="Show shortcuts"
+      aria-expanded="false" aria-controls="info-pop">ⓘ</button>
     <button type="button" id="prev-btn" aria-label="Previous">‹</button>
     <span id="slide-counter">1 / {max(n, 1)}</span>
     <button type="button" id="next-btn" aria-label="Next">›</button>
@@ -5036,19 +5095,19 @@ def generate_export_html(
       font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; }}
     #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
     #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
-    .slide {{ width:1920px; height:1080px; padding:48px 64px; display:none; flex-direction:column;
-      justify-content:flex-start; align-items:stretch; overflow:auto; gap:12px; position:relative; }}
+    .slide {{ width:1920px; height:1080px; padding:56px 80px; display:none; flex-direction:column;
+      justify-content:flex-start; align-items:stretch; overflow:auto; gap:18px; position:relative; }}
     .slide.active {{ display:flex; }}
     .slide.hidden {{ display:none; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
-    .slide:not(.title-slide) {{ padding:56px 88px; gap:20px; }}
-    .note-block {{ font-size:2.15rem; }}
-    .title-slide .note-block {{ font-size:2.0rem; }}
-    .slide-h1, .note-block h1 {{ font-size:2.45em; font-weight:700; margin:0 0 0.85rem;
-      line-height:1.15; letter-spacing:-0.01em; }}
-    .slide-h2, .note-block h2 {{ font-size:1.85em; font-weight:700; margin:0 0 0.9rem;
-      line-height:1.2; letter-spacing:-0.01em; }}
-    .note-block h3 {{ font-size:1.25em; font-weight:700; margin:0 0 0.65rem; }}
+    .slide:not(.title-slide) {{ padding:72px 110px; gap:32px; }}
+    .note-block {{ font-size:3rem; }}
+    .title-slide .note-block {{ font-size:2.75rem; }}
+    .slide-h1, .note-block h1 {{ font-size:2.35em; font-weight:700; margin:0 0 0.75rem;
+      line-height:1.12; letter-spacing:-0.02em; }}
+    .slide-h2, .note-block h2 {{ font-size:1.75em; font-weight:700; margin:0 0 0.85rem;
+      line-height:1.18; letter-spacing:-0.015em; }}
+    .note-block h3 {{ font-size:1.2em; font-weight:700; margin:0 0 0.6rem; }}
     .slide:not(.title-slide) .slide-h1,
     .slide:not(.title-slide) .slide-h2,
     .slide:not(.title-slide) .note-block[data-type="heading"],
@@ -5057,16 +5116,16 @@ def generate_export_html(
       text-align:center; width:100%; align-self:stretch; }}
     .title-slide .slide-h1, .title-slide .slide-h2,
     .title-slide .note-block[data-type="heading"] {{ text-align:center; width:100%; }}
-    .slide-p, .note-block p {{ font-size:1.05em; line-height:1.55; margin:0.55rem 0;
+    .slide-p, .note-block p {{ font-size:1.08em; line-height:1.55; margin:0.55rem 0;
       color:{theme.get("fg", "#eee")}; }}
-    .note-block ul, .note-block ol {{ font-size:1.05em; line-height:1.55; margin:0.55rem 0;
-      padding-left:1.35em; }}
-    .note-block li {{ margin:0.35em 0; }}
-    .note-block[data-type="list_item"] {{ margin:0.28rem 0; }}
-    .note-block[data-type="math"] {{ margin:0.85rem 0; }}
-    .note-block .math-block {{ text-align:center; margin:0.65em 0; overflow-x:auto;
-      font-size:1.2em; }}
-    .note-block .math-inline {{ display:inline; font-size:1.05em; }}
+    .note-block ul, .note-block ol {{ font-size:1.08em; line-height:1.55; margin:0.55rem 0;
+      padding-left:1.25em; }}
+    .note-block li {{ margin:0.45em 0; }}
+    .note-block[data-type="list_item"] {{ margin:0.4rem 0; }}
+    .note-block[data-type="math"] {{ margin:1rem 0; }}
+    .note-block .math-block {{ text-align:center; margin:0.75em 0; overflow-x:auto;
+      font-size:1.25em; }}
+    .note-block .math-inline {{ display:inline; font-size:1.08em; }}
     .note-block img, .note-block[data-type="image"] img {{
       max-width:100%; height:auto; display:block; border-radius:6px; }}
     .note-block table {{ border-collapse:collapse; width:100%; font-size:0.95em; }}
@@ -5125,16 +5184,36 @@ def generate_export_html(
       background:#0b1220; display:block; }}
     [data-type="output"] {{ display:block; width:100%; max-width:100%; box-sizing:border-box; }}
     .frag-hidden {{ opacity:0 !important; visibility:hidden !important; pointer-events:none !important; }}
-    #chrome {{ position:fixed; left:12px; top:12px; z-index:50; display:flex; gap:10px; align-items:center;
-      background:rgba(0,0,0,0.55); color:#fff; padding:6px 12px; border-radius:8px; font-size:13px; }}
+    #chrome {{ position:fixed; left:12px; top:12px; z-index:50; display:flex; gap:8px; align-items:center;
+      background:rgba(0,0,0,0.5); color:#fff; padding:5px 10px; border-radius:8px; font-size:12px; }}
     #chrome .ok {{ color:#86efac; }}
-    #nav {{ position:fixed; right:16px; bottom:16px; z-index:50; display:flex; gap:12px; align-items:center;
-      background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.85; }}
-    #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer; padding:0 6px; }}
-    #nav button:hover {{ color:#93c5fd; }}
+    #nav {{ position:fixed; right:16px; bottom:16px; z-index:50; display:flex; gap:10px; align-items:center;
+      background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.4;
+      transition:opacity 0.15s; }}
+    #nav:hover, #nav:focus-within {{ opacity:1; }}
+    #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer;
+      padding:0 6px; line-height:1; border-radius:6px; }}
+    #nav button:hover {{ background:rgba(255,255,255,0.1); }}
+    #info-btn {{ font-size:18px; opacity:0.9; }}
+    #info-btn[aria-expanded="true"] {{ color:#93c5fd; }}
+    #info-pop {{
+      position:fixed; right:16px; bottom:58px; z-index:55; display:none;
+      width:min(340px, 92vw); padding:12px 14px; border-radius:10px;
+      background:rgba(3,7,18,0.96); border:1px solid #4b5563; color:#e5e7eb;
+      font:13px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;
+      box-shadow:0 10px 28px rgba(0,0,0,0.55); }}
+    #info-pop.open {{ display:block; }}
+    #info-pop h4 {{ margin:0 0 8px; font-size:12px; font-weight:700; color:#93c5fd;
+      letter-spacing:0.04em; text-transform:uppercase; }}
+    #info-pop ul {{ margin:0; padding:0 0 0 1.1em; }}
+    #info-pop li {{ margin:0.25em 0; }}
+    #info-pop kbd {{ font:12px/1.2 ui-monospace,Menlo,monospace; background:#1f2937;
+      border:1px solid #4b5563; border-radius:4px; padding:1px 5px; color:#f8fafc; }}
+    #info-pop .info-close {{ float:right; background:transparent; border:0; color:#9ca3af;
+      cursor:pointer; font-size:16px; padding:0 2px; line-height:1; }}
     @media print {{
       html, body {{ overflow:visible; height:auto; background:#fff; color:#000; }}
-      #chrome, #nav {{ display:none !important; }}
+      #chrome, #nav, #info-pop {{ display:none !important; }}
       .code-pop {{ position:static !important; width:auto !important; height:auto !important;
         max-height:none !important; box-shadow:none; border-color:#ccc; display:flex !important; }}
       .code-pop[hidden] {{ display:flex !important; }}
@@ -5327,6 +5406,29 @@ def generate_export_html(
     document.getElementById('next-btn')?.addEventListener('click', (e) => {{
       e.preventDefault(); goNext();
     }});
+    (function wireInfoPop() {{
+      const btn = document.getElementById('info-btn');
+      const pop = document.getElementById('info-pop');
+      const close = document.getElementById('info-pop-close');
+      if (!btn || !pop) return;
+      function setOpen(on) {{
+        pop.classList.toggle('open', !!on);
+        pop.setAttribute('aria-hidden', on ? 'false' : 'true');
+        btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+      }}
+      btn.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation();
+        setOpen(!pop.classList.contains('open'));
+      }});
+      close?.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation(); setOpen(false);
+      }});
+      document.addEventListener('click', (e) => {{
+        if (!pop.classList.contains('open')) return;
+        if (pop.contains(e.target) || btn.contains(e.target)) return;
+        setOpen(false);
+      }});
+    }})();
     (function scale() {{
       const DESIGN_W = 1920, DESIGN_H = 1080;
       const stage = document.getElementById('stage');
@@ -5371,7 +5473,6 @@ def generate_export_html(
   <div id="chrome">
     <strong>sslive</strong>
     <span id="status-badge" class="ok">exported · static</span>
-    <span style="opacity:0.7">←/→ reveal then slides · space next · f fullscreen · ?slide=N</span>
   </div>
   <div id="viewport">
     <div id="stage">
@@ -5380,7 +5481,19 @@ def generate_export_html(
       </div>
     </div>
   </div>
+  <div id="info-pop" role="dialog" aria-label="Keyboard shortcuts" aria-hidden="true">
+    <button type="button" class="info-close" id="info-pop-close" aria-label="Close">×</button>
+    <h4>Shortcuts</h4>
+    <ul>
+      <li><kbd>←</kbd> <kbd>→</kbd> · reveal, then slides</li>
+      <li><kbd>Space</kbd> · next</li>
+      <li><kbd>f</kbd> · fullscreen</li>
+      <li><code>?slide=N</code> · deep link</li>
+    </ul>
+  </div>
   <div id="nav">
+    <button type="button" id="info-btn" title="Shortcuts" aria-label="Show shortcuts"
+      aria-expanded="false" aria-controls="info-pop">ⓘ</button>
     <button type="button" id="prev-btn" aria-label="Previous">‹</button>
     <span id="slide-counter">1 / {max(n, 1)}</span>
     <button type="button" id="next-btn" aria-label="Next">›</button>
