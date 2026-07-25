@@ -1,18 +1,44 @@
-"""sslive — live GPU slides for SolveIt + CRAFT.
+"""sslive — live slides for SolveIt (optional CRAFT GPU).
 
-**Working version 0.1.0** — in-slide edit, layout, reveal; Run on GPU; dialog sync.
+**Working version 0.1.0** — in-slide edit, layout, reveal; Run; dialog sync.
 
-Architecture: **host on %local** (presenter, dialoghelper, bridge);
-**slide code on the CRAFT GPU** (▶ Run / Shift+Enter).
+Architecture: **host on %local** (presenter, dialoghelper, bridge).
+Slide ▶ Run uses **CRAFT remote GPU** when available, otherwise **host IPython**
+(slides-only demo / no CRAFT).
 
-Usage::
+Standalone (slides demo, no CRAFT)::
 
     %local
-    %run path/to/sslive.py   # do not paste this file into the dialog
-    %gpu                     # connect remote kernel once
+    %run path/to/sslive.py
+    %sslive                 # or: await sslive()
+
+With CRAFT GPU::
+
     %local
-    await sslive()            # host must stay under %local
+    %run path/to/CRAFT.py
+    %run path/to/sslive.py
+    %gpu
+    %sslive
     # edit in the slide → ▶ Run → GPU execute → in-place output
+
+Slide region (dialog note — not itself a slide)::
+
+    # sslive
+
+    This section defines slides for sslive.
+
+    Conventions:
+    - ``# sslive`` starts the slide region and is not itself a slide
+    - ``# ...`` creates a new slide
+    - ``## ...`` creates a subslide under the current slide
+    - cells after a slide/subslide belong to that heading until a new heading appears
+
+    Authoring intent:
+    - slide content is written at the end of the notebook
+    - it summarizes or reorganizes material introduced earlier
+    - content before ``# sslive`` should not be treated as slide structure
+
+See ``SSLIVE_USAGE`` / ``print_usage()`` (also printed once on ``%run``).
 """
 
 from __future__ import annotations
@@ -174,24 +200,150 @@ class Deck:
 # Piece 1 — Content loader (sslides logic; load only — no write-back)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Region marker: first line of a note cell. The marker note is not a slide.
+# Legacy ``#| s`` (exact body) still accepted for older notebooks.
+SLIDE_REGION_MARKER = "# sslive"
+_LEGACY_SLIDE_REGION_MARKERS = frozenset({"#| s", "#|s"})
+
 _HOST_LOAD_HELP = """
 sslive host must load on the SolveIt kernel (not the remote GPU).
 
   %local
-  %run sslive/sslive.py   # auto-registers %sslive
-  %gpu                    # optional — stay here for torch / %pointcloud
-  %sslive                 # or: await sslive()
+  %run sslive/sslive.py   # auto-registers %sslive — no CRAFT required
+  %sslive                 # slides-only demo (Run on host)
+
+Optional GPU (CRAFT)::
+
+  %run path/to/CRAFT.py
+  %gpu
+  %sslive                 # ▶ Run → remote GPU when connected
 
 If you %run under %gpu, this file executes on the remote kernel where
 dialoghelper does not exist — that causes this error.
 If %sslive is missing after a bad order:  register_sslive()
 """.strip()
 
+# Printed once on %run / import so the LLM (and humans) see authoring rules.
+SSLIVE_USAGE = """
+# sslive
+
+This section defines slides for sslive.
+
+Conventions:
+- `# sslive` starts the slide region and is not itself a slide
+- `# ...` creates a new slide
+- `## ...` creates a subslide under the current slide
+- cells after a slide/subslide belong to that heading until a new heading appears
+
+Authoring intent:
+- slide content is written at the end of the notebook
+- it summarizes or reorganizes material introduced earlier
+- content before `# sslive` should not be treated as slide structure
+
+Load / open:
+  %local
+  %run path/to/sslive.py   # registers %sslive (prints this note once)
+  %sslive                  # open deck; ▶ Run = host IPython or CRAFT GPU
+""".strip()
+
+
+_USAGE_PRINTED = False
+
+
+def print_usage(*, force: bool = False) -> None:
+    """Emit :data:`SSLIVE_USAGE` into the notebook cell output (for the LLM).
+
+    Called on every ``%run sslive.py``. Uses **both** stdout and IPython
+    ``display`` — SolveIt sometimes drops bare stream output from ``%run``
+    but keeps rich display payloads.
+    """
+    global _USAGE_PRINTED
+    if not force and _USAGE_PRINTED:
+        return
+    text = SSLIVE_USAGE if SSLIVE_USAGE.endswith("\n") else SSLIVE_USAGE + "\n"
+    any_ok = False
+
+    # 1) stdout stream
+    try:
+        import sys
+
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        any_ok = True
+    except Exception:
+        try:
+            print(SSLIVE_USAGE, flush=True)
+            any_ok = True
+        except Exception:
+            pass
+
+    # 2) IPython rich display (reliable in SolveIt dialog cells)
+    if display is not None:
+        try:
+            if IPyHTML is not None:
+                display(
+                    IPyHTML(
+                        "<pre style='white-space:pre-wrap;font:13px/1.45 ui-monospace,"
+                        "SFMono-Regular,Menlo,monospace;margin:0;padding:0.6rem 0.75rem;"
+                        "background:#0f172a;color:#e2e8f0;border-radius:8px;"
+                        "border:1px solid #334155'>"
+                        + html_module.escape(SSLIVE_USAGE)
+                        + "</pre>"
+                    )
+                )
+            else:
+                display({"text/plain": SSLIVE_USAGE}, raw=True)
+            any_ok = True
+        except Exception:
+            pass
+
+    # 3) Last resort: InteractiveShell write
+    if not any_ok and get_ipython is not None:
+        try:
+            ip = get_ipython()
+            if ip is not None and hasattr(ip, "write"):
+                ip.write(text)
+                any_ok = True
+        except Exception:
+            pass
+
+    if any_ok:
+        _USAGE_PRINTED = True
+        try:
+            _SESSION["_usage_printed"] = True
+        except Exception:
+            pass
+
+
+def _is_slide_region_marker(content: str) -> bool:
+    """True if this note starts the sslive slide region (not a slide itself).
+
+    Accepts:
+      * first line exactly ``# sslive`` (body may continue with conventions)
+      * legacy exact body ``#| s`` / ``#|s``
+    """
+    text = (content or "").strip()
+    if not text:
+        return False
+    if text in _LEGACY_SLIDE_REGION_MARKERS:
+        return True
+    first = text.splitlines()[0].strip()
+    if first in _LEGACY_SLIDE_REGION_MARKERS:
+        return True
+    # "# sslive" only — not "# sslive-extra" or "# sslives"
+    return first == SLIDE_REGION_MARKER or first.lower() == SLIDE_REGION_MARKER
+
+
 def _is_sslive_infra_msg(m: dict) -> bool:
     """sslive's own machinery — never a slide, whatever its skipped state."""
     c = (m.get("content") or "").strip()
     if m.get("msg_type") == "note":
-        return c.startswith("#| sslive-layout") or c.startswith(LAYOUT_STUB_MARK)
+        if c.startswith("#| sslive-layout") or c.startswith(LAYOUT_STUB_MARK):
+            return True
+        # Marker note itself (if it ever appears after the cut) is not a slide
+        if _is_slide_region_marker(c):
+            return True
+        return False
     if m.get("msg_type") == "code":
         return bool(
             c.startswith("%sslive") or re.match(r"(?:await\s+)?sslive\s*\(", c)
@@ -200,11 +352,12 @@ def _is_sslive_infra_msg(m: dict) -> bool:
 
 
 async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[dict]:
-    """Cells after `#| s` marker. Requires dialoghelper (async API).
+    """Cells after the ``# sslive`` region marker. Requires dialoghelper.
 
-    Skipped (red eye) cells ARE included: skipped means "out of LLM context"
-    (e.g. pcviz hides its huge viewer HTML), not "out of the deck" — slides are
-    already opt-in via the marker. Only sslive's own infra is filtered.
+    The marker note (``# sslive`` …) is **not** a slide. Everything before it
+    is ignored for deck structure. Skipped (red eye) cells after the marker
+    ARE included: skipped means "out of LLM context", not "out of the deck".
+    Only sslive infra (layout note, launcher, marker) is filtered.
     """
     if find_msgs is None:
         raise RuntimeError(
@@ -217,7 +370,9 @@ async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[di
         all_msgs = await find_msgs()
     marker_idx = None
     for i, m in enumerate(all_msgs):
-        if m.get("msg_type") == "note" and m.get("content", "").strip() == "#| s":
+        if m.get("msg_type") == "note" and _is_slide_region_marker(
+            m.get("content", "") or ""
+        ):
             marker_idx = i
             break
     if marker_idx is None:
@@ -249,11 +404,20 @@ def get_slides_cells_from_notebook(filepath: str | Path, dialog_cells: list[dict
 
 
 def group_dialog_cells_by_heading(dialog_slides_cells: list[dict]) -> list[list[dict]]:
+    """Split region cells into slides/subslides by heading notes.
+
+    * ``# ...`` → new slide (title)
+    * ``## ...`` → new subslide (still its own deck page; follows previous)
+    * other cells join the current heading until the next ``#`` / ``##``
+    """
     groups, current = [], []
     for cell in dialog_slides_cells:
         is_heading = False
         if cell.get("msg_type") == "note":
             content = cell.get("content", "").strip()
+            # Do not treat the region marker as a slide heading
+            if _is_slide_region_marker(content):
+                continue
             if content.startswith("## ") or (
                 content.startswith("# ") and not content.startswith("### ")
             ):
@@ -1438,6 +1602,63 @@ def get_craft_exec_mgr():
     return None
 
 
+def craft_gpu_ready() -> tuple[bool, str]:
+    """True when CRAFT has a live remote kernel for ▶ Run."""
+    mgr = get_craft_exec_mgr()
+    if mgr is None:
+        return False, "CRAFT not loaded"
+    if getattr(mgr, "remote_kc", None) is None:
+        return False, "remote kernel not connected — run %gpu"
+    if hasattr(mgr, "kernel_health"):
+        try:
+            return mgr.kernel_health()
+        except Exception as e:
+            return False, str(e)
+    return True, "connected"
+
+
+def host_ipython_ready() -> tuple[bool, str]:
+    """True when host IPython can run slide code (standalone / magics)."""
+    if get_ipython is None:
+        return False, "IPython not available"
+    try:
+        if get_ipython() is None:
+            return False, "no IPython shell"
+    except Exception as e:
+        return False, str(e)
+    return True, "host IPython"
+
+
+def exec_backend() -> tuple[str, str]:
+    """Active execute backend: ``gpu`` | ``local`` | ``offline``.
+
+    * **gpu** — CRAFT remote kernel (preferred when connected)
+    * **local** — host IPython (standalone slides demo, no CRAFT)
+    * **offline** — neither available
+    """
+    ok, msg = craft_gpu_ready()
+    if ok:
+        return "gpu", msg or "connected"
+    ip_ok, ip_msg = host_ipython_ready()
+    if ip_ok:
+        # Prefer a short reason that CRAFT is optional, not an error
+        return "local", "host · no CRAFT (slides demo)"
+    return "offline", msg if not ok else ip_msg
+
+
+def _backend_badge(backend: str | None = None, msg: str | None = None) -> str:
+    """Human status-badge text for the presenter chrome."""
+    if backend is None:
+        backend, msg = exec_backend()
+    msg = msg or ""
+    if backend == "gpu":
+        return "gpu · ready · ▶ Run"
+    if backend == "local":
+        return "local · ready · ▶ Run"
+    short = (msg or "offline")[:40]
+    return f"offline · {short}"
+
+
 def make_capture_hook(
     parts: list[OutputPart],
     *,
@@ -1599,7 +1820,10 @@ def _object_to_parts(obj: Any) -> list[OutputPart]:
     return []
 
 class LiveExecutor:
-    """Execute slide code: pure Python → CRAFT remote GPU; magics → host IPython.
+    """Execute slide code without requiring CRAFT.
+
+    * Pure Python → CRAFT remote GPU when connected, else **host IPython**
+    * Line/cell magics (``%pointcloud``, …) → always host IPython
 
     ``%pointcloud`` and similar magics are often registered on the SolveIt host
     (or only available through IPython's shell), so sending them with
@@ -1612,15 +1836,16 @@ class LiveExecutor:
         self._lock = threading.Lock()
         self.busy = False
 
+    def backend(self) -> tuple[str, str]:
+        """``(backend, msg)`` — see :func:`exec_backend`."""
+        return exec_backend()
+
     def kernel_ok(self) -> tuple[bool, str]:
-        mgr = get_craft_exec_mgr()
-        if mgr is None:
-            return False, "CRAFT _exec_mgr not found — load CRAFT and run %gpu"
-        if getattr(mgr, "remote_kc", None) is None:
-            return False, "remote kernel not connected — run %gpu"
-        if hasattr(mgr, "kernel_health"):
-            return mgr.kernel_health()
-        return True, "connected"
+        """True when *some* execute path works (GPU or local host)."""
+        backend, msg = self.backend()
+        if backend in ("gpu", "local"):
+            return True, msg
+        return False, msg or "no executor (load CRAFT+%gpu, or run under IPython)"
 
     def execute(self, code: str, *, echo_to_dialog: bool = False) -> ExecResult:
         with self._lock:
@@ -1631,7 +1856,25 @@ class LiveExecutor:
             try:
                 if _code_has_ipy_magic(code):
                     return self._execute_host_ipython(code, t0=t0)
-                return self._execute_gpu(code, echo_to_dialog=echo_to_dialog, t0=t0)
+                # Prefer CRAFT GPU for pure Python when live
+                gpu_ok, _ = craft_gpu_ready()
+                if gpu_ok:
+                    return self._execute_gpu(
+                        code, echo_to_dialog=echo_to_dialog, t0=t0
+                    )
+                # Standalone / slides-only demo: run on host IPython
+                ip_ok, ip_msg = host_ipython_ready()
+                if ip_ok:
+                    return self._execute_host_ipython(code, t0=t0)
+                return ExecResult(
+                    ok=False,
+                    parts=[],
+                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                    error=(
+                        "No execute backend: load CRAFT and run %gpu for GPU, "
+                        f"or run %sslive on the host IPython ({ip_msg})."
+                    ),
+                )
             finally:
                 self.busy = False
 
@@ -3005,12 +3248,14 @@ def generate_presenter_html(
     deck: Deck,
     *,
     backend_label: str = "gpu",
+    backend_mode: str | None = None,
     port: int | None = None,
     initial_slide: int = 0,
 ) -> str:
     """Full presenter page (custom JS). No Reveal.js.
 
     ``initial_slide`` restores position after a rare full rebuild.
+    ``backend_mode`` is ``gpu`` | ``local`` | ``offline`` (drives run spinner text).
     """
     theme = deck.theme or THEME_DARK
     n_slides = len(deck.slides)
@@ -3021,6 +3266,18 @@ def generate_presenter_html(
     n = n_slides
     first_code = deck.ordered_code_ids[0] if deck.ordered_code_ids else ""
     port = int(port or _SESSION.get("port") or 8000)
+    if backend_mode is None:
+        backend_mode, _ = exec_backend()
+    backend_mode = str(backend_mode or "local")
+    run_msg = (
+        "Running on GPU…"
+        if backend_mode == "gpu"
+        else "Running…"
+        if backend_mode == "local"
+        else "No executor…"
+    )
+    run_msg_js = json.dumps(run_msg)
+    backend_mode_js = json.dumps(backend_mode)
 
     css = f"""
     * {{ box-sizing: border-box; }}
@@ -3240,6 +3497,8 @@ def generate_presenter_html(
     let selectedCellId = {json.dumps(first_code)};
     let lastResultT = 0;
     let fragStep = 0;  // how far into this slide's reveal sequence we are
+    const BACKEND_MODE = {backend_mode_js};  // gpu | local | offline
+    const RUN_MSG = {run_msg_js};
     const slides = () => document.querySelectorAll('[data-slide]');
 
     function slideEls(slideEl) {{
@@ -3498,10 +3757,13 @@ def generate_presenter_html(
         if (o && /Running/i.test(o.textContent || '')) {{
           o.innerHTML = '<pre style="background:#7f1d1d;color:#fecaca;padding:0.5rem;' +
             'font:13px/1.4 ui-monospace,monospace;border-radius:6px">' +
-            'Timed out waiting for result. Re-run %sslive or check the GPU kernel.</pre>';
+            'Timed out waiting for result. Re-run %sslive or check the kernel.</pre>';
         }}
         const badge = document.getElementById('status-badge');
-        if (badge) {{ badge.textContent = 'gpu · timeout'; badge.className = 'bad'; }}
+        if (badge) {{
+          badge.textContent = (BACKEND_MODE || 'local') + ' · timeout';
+          badge.className = 'bad';
+        }}
       }}, 95000);
     }}
 
@@ -3670,7 +3932,8 @@ def generate_presenter_html(
       }}
       const badge = document.getElementById('status-badge');
       if (badge) {{
-        badge.textContent = msg.ok ? 'gpu · ok' : 'gpu · error';
+        const mode = BACKEND_MODE || 'local';
+        badge.textContent = msg.ok ? (mode + ' · ok') : (mode + ' · error');
         badge.className = msg.ok ? 'ok' : 'bad';
       }}
     }}
@@ -4246,7 +4509,7 @@ def generate_presenter_html(
     function runCellFromSlide(cellId) {{
       selectCell(cellId);
       const source = codeSource(cellId);
-      setRunning(cellId, 'Running on GPU…');
+      setRunning(cellId, RUN_MSG || 'Running…');
       try {{
         window.parent.__sslive_slide_index = currentSlide;
         window.parent.postMessage({{
@@ -4488,9 +4751,9 @@ def generate_presenter_html(
         empty = (
             "<section class='slide active' data-slide='0'>"
             "<h2 class='slide-h2'>No slides</h2>"
-            "<p class='slide-p'>Add a note with exactly <code>#| s</code>, "
-            "then <code>#</code> / <code>##</code> content below it. "
-            "Re-run <code>await sslive()</code>.</p></section>"
+            "<p class='slide-p'>Add a note starting with <code># sslive</code>, "
+            "then <code>#</code> / <code>##</code> headings below it. "
+            "Re-run <code>%sslive</code>.</p></section>"
         )
 
     return f"""<!DOCTYPE html>
@@ -5161,10 +5424,12 @@ def _presenter_page():
     """HTML document for the live deck (served at / and /sslive on JupyUvi)."""
     deck = _SESSION.get("deck") or Deck()
     ex = _SESSION.get("executor") or LiveExecutor()
-    ok, msg = ex.kernel_ok()
-    label = f"gpu · {msg}"
+    backend, msg = ex.backend()
+    label = _backend_badge(backend, msg)
     port = _SESSION.get("port")
-    html = generate_presenter_html(deck, backend_label=label, port=port)
+    html = generate_presenter_html(
+        deck, backend_label=label, backend_mode=backend, port=port
+    )
     if HTMLResponse is not None:
         return HTMLResponse(html)
     return html
@@ -5197,9 +5462,10 @@ def _ensure_live_server() -> int:
     def status():
         deck = _SESSION.get("deck")
         ex = _SESSION.get("executor") or LiveExecutor()
-        ok, msg = ex.kernel_ok()
+        backend, msg = ex.backend()
+        ok, _ = ex.kernel_ok()
         payload = {
-            "backend": "gpu",
+            "backend": backend,
             "busy": bool(getattr(ex, "busy", False)),
             "kernel_ok": ok,
             "kernel_msg": msg,
@@ -5307,17 +5573,17 @@ def _presenter_iframe_html(height: str = "720px", port: int | None = None) -> st
         height = f"{height}px"
     deck = _SESSION.get("deck") or Deck()
     ex = _SESSION.get("executor") or LiveExecutor()
-    ok, msg = ex.kernel_ok()
-    # Soft-start: show deck even if GPU offline; badge reflects attach state
-    if ok:
-        label = f"gpu · ready · ▶ Run"
-    else:
-        short = (msg or "offline")[:40]
-        label = f"gpu · offline · {short}"
+    backend, msg = ex.backend()
+    # Soft-start: deck always opens; badge shows gpu / local / offline
+    label = _backend_badge(backend, msg)
     # Fresh open always starts at 0 unless a force-restore is in flight
     initial = int(_SESSION.get("slide_index") or 0)
     html = generate_presenter_html(
-        deck, backend_label=label, port=port or 0, initial_slide=initial
+        deck,
+        backend_label=label,
+        backend_mode=backend,
+        port=port or 0,
+        initial_slide=initial,
     )
     escaped = html_module.escape(html, quote=True)
     return (
@@ -6736,12 +7002,13 @@ class LiveSession:
 
     def status(self) -> dict:
         ex = _SESSION.get("executor") or LiveExecutor()
-        ok, msg = ex.kernel_ok()
+        backend, msg = ex.backend()
+        ok, _ = ex.kernel_ok()
         d = _SESSION.get("deck")
         return {
             "port": self.port,
             "url": self.url,
-            "backend": self.backend,
+            "backend": backend,
             "kernel_ok": ok,
             "kernel_msg": msg,
             "in_solveit": _in_solveit(),
@@ -6771,16 +7038,24 @@ async def sslive(
     return_session: bool = False,
     require_gpu: bool = False,
 ):
-    """Start the live deck (host magic; slide ▶ Run uses GPU).
+    """Start the live deck (host magic; slide ▶ Run uses GPU or host).
 
-    Load the module on the **host** first, then use ``%sslive`` under ``%gpu``::
+    Standalone slides demo (no CRAFT)::
 
         %local
-        %run path/to/sslive.py   # MUST be %local — auto-registers %sslive
-        %gpu                     # stay here for torch / %pointcloud
-        %sslive                   # local magic → host deck, Run → GPU
+        %run path/to/sslive.py
+        %sslive                   # ▶ Run → host IPython
 
-    Soft-start: if CRAFT is offline, the deck still opens; ▶ Run waits until ready.
+    With CRAFT GPU::
+
+        %local
+        %run path/to/sslive.py
+        %gpu                      # after CRAFT is loaded
+        %sslive                   # ▶ Run → remote GPU when connected
+
+    Soft-start: deck always opens when the host is ready. Without CRAFT, Run
+    still works on the host (badge shows ``local``). Set ``require_gpu=True``
+    to refuse open without a live remote kernel.
     Returns ``None`` by default (clean output). Session: ``session()``.
     """
     # Sync probe first (may be empty under await — full resolve after embed).
@@ -6795,16 +7070,28 @@ async def sslive(
         print(_HOST_LOAD_HELP)
         return None
 
-    ok, msg = LiveExecutor().kernel_ok()
-    _SESSION["gpu_ok"] = ok
+    backend, msg = LiveExecutor().backend()
+    ok = backend in ("gpu", "local")
+    _SESSION["gpu_ok"] = backend == "gpu"
+    _SESSION["exec_backend"] = backend
     _SESSION["gpu_msg"] = msg
-    if not ok and require_gpu:
+    if require_gpu and backend != "gpu":
         print(f"sslive: GPU not ready — {msg}")
         print(
             "Load CRAFT on the SolveIt host so `_exec_mgr` exists, run %gpu, "
-            "then %sslive again."
+            "then %sslive again. For a slides-only demo, omit require_gpu "
+            "(default) so Run uses host IPython."
         )
         return None
+    if backend == "local" and not require_gpu:
+        # One quiet line so demos know ▶ Run is local, not broken
+        _SESSION.setdefault("_local_backend_announced", False)
+        if not _SESSION["_local_backend_announced"]:
+            _SESSION["_local_backend_announced"] = True
+            print(
+                "sslive: no CRAFT GPU — ▶ Run uses host IPython "
+                "(slides-only mode). Load CRAFT + %gpu for remote GPU."
+            )
 
     if use_http is None:
         use_http = not _in_solveit()
@@ -6848,13 +7135,17 @@ async def sslive(
     else:
         _SESSION["port"] = None
 
-    session = LiveSession(port=port or 0, backend="gpu" if ok else "offline", deck=deck)
+    session = LiveSession(
+        port=port or 0,
+        backend=backend if ok else "offline",
+        deck=deck,
+    )
 
     n_code = len(deck.ordered_code_ids)
     if n_code == 0 and len(deck.slides) == 0:
         print(
-            "sslive: no slides found — add a note with exactly `#| s`, "
-            "then `#` / `##` content below it."
+            "sslive: no slides found — add a note starting with `# sslive`, "
+            "then `#` / `##` headings below it (see SSLIVE_USAGE)."
         )
     _SESSION["slide_index"] = 0
     _SESSION.setdefault("pending_dialog_sync", {})
@@ -7123,6 +7414,9 @@ def _inject_public_api_into_user_ns() -> None:
         ("layout_status", layout_status),
         ("cleanup_layout_notes", cleanup_layout_notes),
         ("register_sslive", register_sslive),
+        ("SSLIVE_USAGE", SSLIVE_USAGE),
+        ("print_usage", print_usage),
+        ("SLIDE_REGION_MARKER", SLIDE_REGION_MARKER),
     ):
         ns[name] = obj
 
@@ -7209,21 +7503,47 @@ def register_sslive() -> bool:
 
 def load_ipython_extension(ip=None) -> None:
     """``%load_ext sslive`` / auto on ``%run`` when possible."""
+    print_usage(force=True)
     _register_sslive_magic(quiet=True)
 
 
-# Auto-register when the file is %run (must run at end of module)
-try:
-    if get_ipython is not None and get_ipython() is not None:
+def _bootstrap_on_load() -> None:
+    """End-of-module hook: print LLM usage, then register magics.
+
+    Usage is printed **first** and on every load so a registration error
+    cannot swallow the authoring note. ``%run`` and ``import`` under IPython
+    both emit the note (force on ``%run`` / ``__main__``).
+    """
+    # %run → __name__ == "__main__"; import sslive → "sslive"
+    name = str(globals().get("__name__", "") or "")
+    is_run = name in ("__main__", "builtins") or name.endswith("sslive")
+    in_ipy = False
+    try:
+        in_ipy = get_ipython is not None and get_ipython() is not None
+    except Exception:
+        in_ipy = False
+
+    # Always try to surface usage when this file is executed in a notebook.
+    # force=True on %run so re-%run refreshes LLM context every time.
+    if is_run or in_ipy:
+        print_usage(force=True)
+    else:
+        # plain python -c / scripts: still print once if someone imports
+        print_usage(force=False)
+
+    if not in_ipy:
+        return
+    try:
         _ok = _register_sslive_magic(quiet=True)
         if not _ok and _SESSION.get("_magic_reg_err"):
             print(f"sslive: magic registration issue: {_SESSION['_magic_reg_err']}")
             print("sslive: use  await sslive()  or  register_sslive()")
-except Exception as _e:
-    try:
-        print(f"sslive: could not auto-register %sslive ({_e}); use await sslive()")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"sslive: could not auto-register %sslive ({e}); use await sslive()")
+
+
+# Auto-register + print usage when the file is %run / imported under IPython
+_bootstrap_on_load()
 
 
 # Wire name for %run
@@ -7240,6 +7560,9 @@ __all__ = [
     "session",
     "register_sslive",
     "hide_from_ai",
+    "SSLIVE_USAGE",
+    "print_usage",
+    "SLIDE_REGION_MARKER",
     "load_ipython_extension",
     "sstop",
     "run_cell",
@@ -7270,4 +7593,7 @@ __all__ = [
     "export_html_str",
     "export_html_a",
     "get_craft_exec_mgr",
+    "exec_backend",
+    "craft_gpu_ready",
+    "host_ipython_ready",
 ]

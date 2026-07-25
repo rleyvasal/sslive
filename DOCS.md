@@ -6,18 +6,26 @@ Companion to [README.md](README.md). Architecture, layout model, and history.
 
 ## Architecture
 
-### Host vs GPU
+### Host vs execute backend
 
 | Concern | Location |
 |---------|----------|
 | `%sslive`, layout, dialoghelper, export | SolveIt **host** (local magics) |
-| Cell execution (▶ Run) | CRAFT **remote** kernel via `_exec_mgr` |
+| Cell execution (▶ Run) | **CRAFT remote** when connected; else **host IPython** |
 
-Load order is always:
+Standalone (slides demo — no CRAFT):
 
 ```text
-%local → %run sslive.py → %gpu → %sslive
+%local → %run sslive.py → %sslive
 ```
+
+With GPU:
+
+```text
+%local → %run CRAFT.py → %run sslive.py → %gpu → %sslive
+```
+
+`LiveExecutor` / `exec_backend()` returns `gpu` | `local` | `offline`. Badge and spinner text follow that mode.
 
 ### Data model
 
@@ -35,23 +43,41 @@ Element — id, cell_id, kind, html/content (layout via deck.layout overlay)
 OutputPart — stream|error|image/png|text/html|text/plain
 ```
 
-Note cells after `#| s` are split into fine pieces (`el-{idx}-{cell_id}`): headings, list items, display math, images, tables.
+### Slide region marker
+
+A note whose **first line** is `# sslive` starts the deck region (not a slide). Content before it is ignored. Legacy exact body `#| s` still works.
+
+```text
+# sslive
+…optional conventions text…
+
+# Title slide
+…
+## Subslide
+…
+```
+
+On `%run sslive.py`, `SSLIVE_USAGE` is printed once for LLM/human context.
+
+Note cells after the marker are split into fine pieces (`el-{idx}-{cell_id}`): headings, list items, display math, images, tables.
 
 ### Execute path
 
 ```text
 ▶ Run → postMessage sslive_run
-     → host poll → remote_kc.execute_interactive
+     → host poll
+     → if CRAFT live:  remote_kc.execute_interactive
+       else:           get_ipython().run_cell (host)
      → push_slide_result → in-place #el-output-{id}
 ```
 
-Prefer Plotly JSON MIME over fat HTML. After Run, live absolute layout on the output box is preserved (important for Plotly).
+Magics (`%pointcloud`, …) always use host IPython. Prefer Plotly JSON MIME over fat HTML. After Run, live absolute layout on the output box is preserved (important for Plotly).
 
 ### Presenter
 
 - Design space **1920×1080**, scaled to viewport
 - Bridge: `postMessage` → parent queue → `js_eval` poll
-- Soft-start: deck opens if GPU offline (badge shows status)
+- Soft-start: deck opens without CRAFT; badge `local · ready` and ▶ Run still works
 
 ---
 
@@ -135,7 +161,7 @@ Does **not** include: live Run, layout edit, host-only viewers without embed.
 | In LLM | Not in LLM |
 |--------|------------|
 | Short `%run` one-liner | Full `sslive.py` |
-| User slides under `#\| s` | `#\| sslive-layout` (skipped) |
+| User slides under `# sslive` | `#\| sslive-layout` (skipped) |
 | Short CRAFT loader | `%sslive` preview iframe (skipped) |
 
 ---
@@ -158,6 +184,13 @@ Does **not** include: live Run, layout edit, host-only viewers without embed.
 - Stable note fragment ids
 - Optional offline Plotly / HL bundles
 - Thin package split if the single file grows too large
+
+### Standalone execute (no CRAFT)
+
+- `exec_backend()` / `LiveExecutor.backend()` → `gpu` | `local` | `offline`
+- ▶ Run falls back to host IPython when CRAFT is missing or not connected
+- Badge: `local · ready · ▶ Run` for slides-only demos
+- `require_gpu=True` still forces CRAFT for callers that need remote kernels only
 
 ---
 
