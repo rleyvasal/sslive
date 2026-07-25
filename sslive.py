@@ -4980,7 +4980,7 @@ def generate_presenter_html(
         }});
         rIn.addEventListener('pointerdown', (ev) => ev.stopPropagation());
       }}
-      // Full clear → original document-flow size + position (no absolute box).
+      // Full clear of freeform overrides (fs/color/position/…).
       const CLEAR_LAYOUT = {{
         x: null, y: null, w: null, h: null, z: null,
         order: null, reveal: null, fs: null, ff: null, align: null, color: null
@@ -4990,7 +4990,7 @@ def generate_presenter_html(
         el.style.cssText = '';
         el.removeAttribute('data-reveal');
         // Explicitly drop absolute geometry so the element re-enters the slide
-        // flex stack in DOM order (title → code → output).
+        // flex stack in DOM order (title → bullets → code → output).
         ['position','left','top','width','height','margin','overflow',
          'zIndex','order','fontSize','fontFamily','textAlign','color'].forEach((p) => {{
           try {{ el.style[p] = ''; }} catch (e) {{}}
@@ -5011,6 +5011,105 @@ def generate_presenter_html(
           return document.getElementById('el-code-' + id.slice(10));
         return null;
       }}
+      function expandResetSet(els) {{
+        // Include code↔output pairs; de-dupe; preserve DOM order on the slide
+        const set = new Set();
+        (els || []).forEach((el) => {{
+          if (!el) return;
+          set.add(el);
+          const pair = layoutPairOf(el);
+          if (pair) set.add(pair);
+        }});
+        if (!set.size) return [];
+        const slide = (els[0] && els[0].closest('[data-slide]')) || null;
+        if (!slide) return Array.from(set);
+        return slideLayoutEls(slide).filter((el) => set.has(el));
+      }}
+      /**
+       * Reset freeform layout without stacking under a still-absolute title.
+       *
+       * First drag pins *every* sibling absolute (pinFlowElements). If we only
+       * clear the selected bullets, they re-enter flex flow at y≈0 while the
+       * title stays absolute — so they draw on top of the title.
+       *
+       * Fix: measure natural document-order positions with a temporary full
+       * flow pass, restore non-selected freeform coords, then either leave
+       * reset els in pure flow (when nothing else is absolute) or pin them at
+       * those natural spots so they sit under the title again.
+       */
+      function resetElementsToNaturalLayout(elsIn) {{
+        const targets = expandResetSet(elsIn);
+        if (!targets.length) return [];
+        const slide = targets[0].closest('[data-slide]');
+        if (!slide) return targets;
+        const all = slideLayoutEls(slide);
+        const resetSet = new Set(targets);
+
+        // Snapshot freeform styles of elements we are NOT resetting
+        const kept = all.filter((el) => !resetSet.has(el)).map((el) => ({{
+          el,
+          css: el.style.cssText,
+          reveal: el.getAttribute('data-reveal'),
+        }}));
+
+        // Temporary pure flow for measurement (title → bullets in DOM order)
+        all.forEach((el) => restoreFlowLayout(el));
+        void slide.offsetHeight;
+
+        const sr = slide.getBoundingClientRect();
+        const sc = sr.width / 1920 || 1;
+        const natural = new Map();
+        all.forEach((el) => {{
+          const er = el.getBoundingClientRect();
+          natural.set(el, {{
+            x: Math.round((er.left - sr.left) / sc),
+            y: Math.round((er.top - sr.top) / sc),
+            w: Math.max(1, Math.round(er.width / sc)),
+            h: Math.max(1, Math.round(er.height / sc)),
+          }});
+        }});
+
+        // Put non-selected back where the user left them
+        kept.forEach(({{ el, css, reveal }}) => {{
+          el.style.cssText = css || '';
+          if (reveal != null && reveal !== '') el.setAttribute('data-reveal', reveal);
+          else el.removeAttribute('data-reveal');
+        }});
+
+        const keptStillAbs = kept.some(
+          ({{ el }}) => (el.style.position || '') === 'absolute'
+        );
+
+        targets.forEach((el) => {{
+          const elId = el.dataset.elId || el.id;
+          restoreFlowLayout(el);
+          if (!keptStillAbs) {{
+            // Whole freeform set cleared → pure document flow
+            sendLayoutPatch(elId, Object.assign({{}}, CLEAR_LAYOUT));
+            return;
+          }}
+          // Mixed: pin at natural flow slots so bullets stay under the title
+          const n = natural.get(el) || {{ x: 0, y: 0, w: 800, h: 48 }};
+          const isCode = el.classList.contains('code-wrap') || el.dataset.type === 'code';
+          el.style.position = 'absolute';
+          el.style.margin = '0';
+          el.style.left = n.x + 'px';
+          el.style.top = n.y + 'px';
+          el.style.width = n.w + 'px';
+          if (!isCode) {{
+            el.style.height = n.h + 'px';
+            el.style.overflow = 'auto';
+          }}
+          const patch = {{
+            x: n.x, y: n.y, w: n.w,
+            h: isCode ? null : n.h,
+            z: null, order: null, reveal: null,
+            fs: null, ff: null, align: null, color: null,
+          }};
+          sendLayoutPatch(elId, patch);
+        }});
+        return targets;
+      }}
       const colIn = document.getElementById('tb-color');
       if (colIn) {{
         colIn.addEventListener('input', () => {{
@@ -5022,23 +5121,7 @@ def generate_presenter_html(
       document.getElementById('tb-reset').addEventListener('click', () => {{
         if (!editSels.length) return;
         const keep = editSels.slice();
-        const done = new Set();
-        keep.forEach((el) => {{
-          const elId = el.dataset.elId || el.id;
-          if (done.has(elId)) return;
-          restoreFlowLayout(el);
-          sendLayoutPatch(elId, Object.assign({{}}, CLEAR_LAYOUT));
-          done.add(elId);
-          const pair = layoutPairOf(el);
-          if (pair) {{
-            const pid = pair.dataset.elId || pair.id;
-            if (!done.has(pid)) {{
-              restoreFlowLayout(pair);
-              sendLayoutPatch(pid, Object.assign({{}}, CLEAR_LAYOUT));
-              done.add(pid);
-            }}
-          }}
-        }});
+        resetElementsToNaturalLayout(keep);
         setSelection(keep.filter((el) => document.body.contains(el)));
         updateToolbar();
       }});
