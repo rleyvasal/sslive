@@ -3341,41 +3341,41 @@ def generate_presenter_html(
       font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; }}
     #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
     #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
-    .slide {{ width:1920px; height:1080px; padding:56px 80px; display:none; flex-direction:column;
-      justify-content:flex-start; align-items:stretch; overflow:auto; gap:18px; position:relative; }}
+    .slide {{ width:1920px; height:1080px; padding:48px 72px; display:none; flex-direction:column;
+      justify-content:flex-start; align-items:stretch; overflow:auto; gap:10px; position:relative; }}
     .slide.active {{ display:flex; }}
     .slide.hidden {{ display:none; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
-    /* Regular slides: projection-scale type (1920×1080 design space) */
-    .slide:not(.title-slide) {{ padding:72px 110px; gap:32px; }}
-    /* Base ~48px body; headings scale in em so layout `fs` still works */
-    .note-block {{ font-size:3rem; }}
-    .title-slide .note-block {{ font-size:2.75rem; }}
-    .slide-h1, .note-block h1 {{ font-size:2.35em; font-weight:700; margin:0 0 0.75rem;
+    /* Regular slides: large type, tight vertical rhythm for projection */
+    .slide:not(.title-slide) {{ padding:56px 96px; gap:12px; }}
+    /* Base ~44px body; headings scale in em so layout `fs` still works */
+    .note-block {{ font-size:2.75rem; }}
+    .title-slide .note-block {{ font-size:2.5rem; }}
+    .slide-h1, .note-block h1 {{ font-size:2.35em; font-weight:700; margin:0 0 0.35rem;
       line-height:1.12; letter-spacing:-0.02em; }}
-    .slide-h2, .note-block h2 {{ font-size:1.75em; font-weight:700; margin:0 0 0.85rem;
+    .slide-h2, .note-block h2 {{ font-size:1.65em; font-weight:700; margin:0 0 0.4rem;
       line-height:1.18; letter-spacing:-0.015em; }}
-    .note-block h3 {{ font-size:1.2em; font-weight:700; margin:0 0 0.6rem; }}
+    .note-block h3 {{ font-size:1.15em; font-weight:700; margin:0 0 0.3rem; }}
     /* Center slide titles on regular slides (## Heading / # Title piece) */
     .slide:not(.title-slide) .slide-h1,
     .slide:not(.title-slide) .slide-h2,
     .slide:not(.title-slide) .note-block[data-type="heading"],
     .slide:not(.title-slide) .note-block[data-type="heading"] h1,
     .slide:not(.title-slide) .note-block[data-type="heading"] h2 {{
-      text-align:center; width:100%; align-self:stretch; }}
+      text-align:center; width:100%; align-self:stretch; margin-bottom:0.5rem; }}
     .title-slide .slide-h1, .title-slide .slide-h2,
     .title-slide .note-block[data-type="heading"] {{ text-align:center; width:100%; }}
-    .slide-p, .note-block p {{ font-size:1.08em; line-height:1.55; margin:0.55rem 0;
+    .slide-p, .note-block p {{ font-size:1.05em; line-height:1.35; margin:0.15rem 0;
       color:{theme.get("fg", "#eee")}; }}
-    .note-block ul, .note-block ol {{ font-size:1.08em; line-height:1.55; margin:0.55rem 0;
-      padding-left:1.25em; }}
-    .note-block li {{ margin:0.45em 0; }}
-    .note-block[data-type="list_item"] {{ margin:0.4rem 0; }}
-    .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.25em; }}
-    .note-block[data-type="math"] {{ margin:1rem 0; }}
-    .note-block .math-block {{ text-align:center; margin:0.75em 0; overflow-x:auto;
-      font-size:1.25em; }}
-    .note-block .math-inline {{ display:inline; font-size:1.08em; }}
+    .note-block ul, .note-block ol {{ font-size:1.05em; line-height:1.35; margin:0.15rem 0;
+      padding-left:1.2em; }}
+    .note-block li {{ margin:0.12em 0; }}
+    .note-block[data-type="list_item"] {{ margin:0.08rem 0; }}
+    .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.2em; }}
+    .note-block[data-type="math"] {{ margin:0.45rem 0; }}
+    .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow-x:auto;
+      font-size:1.2em; }}
+    .note-block .math-inline {{ display:inline; font-size:1.05em; }}
     .note-block[data-type="image"], .note-block .note-image {{ margin:0.5rem 0; }}
     .note-block .note-image {{ margin:0; }}
     .note-block .note-image img, .note-block[data-type="image"] img {{
@@ -3464,11 +3464,11 @@ def generate_presenter_html(
       border-radius:0 0 8px 0; opacity:0.85;
     }}
     #live-code-pop .live-code-pop-rs:hover {{ opacity:1; }}
-    #chrome {{ position:fixed; left:12px; top:12px; z-index:50; display:flex; gap:8px; align-items:center;
-      background:rgba(0,0,0,0.5); color:#fff; padding:5px 10px; border-radius:8px; font-size:12px; }}
-    #chrome .ok {{ color:#86efac; }} #chrome .bad {{ color:#fca5a5; }}
+    /* Status lives in the ⓘ panel — no always-on chrome during presentation */
+    #chrome {{ display:none !important; }}
+    #status-badge.ok {{ color:#86efac; }} #status-badge.bad {{ color:#fca5a5; }}
     #nav {{ position:fixed; right:16px; bottom:16px; z-index:50; display:flex; gap:10px; align-items:center;
-      background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.4;
+      background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.35;
       transition:opacity 0.15s; }}
     #nav:hover, #nav:focus-within {{ opacity:1; }}
     #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer;
@@ -3487,6 +3487,9 @@ def generate_presenter_html(
     #info-pop.open {{ display:block; }}
     #info-pop h4 {{ margin:0 0 8px; font-size:12px; font-weight:700; color:#93c5fd;
       letter-spacing:0.04em; text-transform:uppercase; }}
+    #info-pop .info-status {{
+      margin:0 0 10px; padding:6px 8px; border-radius:6px; background:#0f172a;
+      border:1px solid #1f2937; font:12px/1.35 ui-monospace,Menlo,monospace; }}
     #info-pop ul {{ margin:0; padding:0 0 0 1.1em; }}
     #info-pop li {{ margin:0.25em 0; }}
     #info-pop kbd {{ font:12px/1.2 ui-monospace,Menlo,monospace; background:#1f2937;
@@ -4884,10 +4887,7 @@ def generate_presenter_html(
   <style>{css}</style>
 </head>
 <body>
-  <div id="chrome">
-    <strong>sslive</strong>
-    <span id="status-badge" class="ok">{html_module.escape(backend_label)}</span>
-  </div>
+  <div id="chrome" aria-hidden="true"></div>
   <div id="viewport">
     <div id="stage">
       <div id="slides-container">
@@ -4919,8 +4919,10 @@ def generate_presenter_html(
     <textarea id="live-code-pop-ta" spellcheck="false"></textarea>
     <div class="live-code-pop-rs" title="Drag to resize"></div>
   </div>
-  <div id="info-pop" role="dialog" aria-label="Keyboard shortcuts" aria-hidden="true">
+  <div id="info-pop" role="dialog" aria-label="Status and shortcuts" aria-hidden="true">
     <button type="button" class="info-close" id="info-pop-close" aria-label="Close">×</button>
+    <h4>sslive</h4>
+    <div class="info-status"><span id="status-badge" class="ok">{html_module.escape(backend_label)}</span></div>
     <h4>Shortcuts</h4>
     <ul>
       <li><kbd>←</kbd> <kbd>→</kbd> · reveal, then slides</li>
@@ -4933,7 +4935,7 @@ def generate_presenter_html(
   </div>
   <div id="nav">
     <button type="button" id="edit-btn" title="Edit layout (e)" aria-label="Edit layout">✎</button>
-    <button type="button" id="info-btn" title="Shortcuts" aria-label="Show shortcuts"
+    <button type="button" id="info-btn" title="Status &amp; shortcuts" aria-label="Status and shortcuts"
       aria-expanded="false" aria-controls="info-pop">ⓘ</button>
     <button type="button" id="prev-btn" aria-label="Previous">‹</button>
     <span id="slide-counter">1 / {max(n, 1)}</span>
@@ -5095,37 +5097,37 @@ def generate_export_html(
       font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; }}
     #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
     #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
-    .slide {{ width:1920px; height:1080px; padding:56px 80px; display:none; flex-direction:column;
-      justify-content:flex-start; align-items:stretch; overflow:auto; gap:18px; position:relative; }}
+    .slide {{ width:1920px; height:1080px; padding:48px 72px; display:none; flex-direction:column;
+      justify-content:flex-start; align-items:stretch; overflow:auto; gap:10px; position:relative; }}
     .slide.active {{ display:flex; }}
     .slide.hidden {{ display:none; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
-    .slide:not(.title-slide) {{ padding:72px 110px; gap:32px; }}
-    .note-block {{ font-size:3rem; }}
-    .title-slide .note-block {{ font-size:2.75rem; }}
-    .slide-h1, .note-block h1 {{ font-size:2.35em; font-weight:700; margin:0 0 0.75rem;
+    .slide:not(.title-slide) {{ padding:56px 96px; gap:12px; }}
+    .note-block {{ font-size:2.75rem; }}
+    .title-slide .note-block {{ font-size:2.5rem; }}
+    .slide-h1, .note-block h1 {{ font-size:2.35em; font-weight:700; margin:0 0 0.35rem;
       line-height:1.12; letter-spacing:-0.02em; }}
-    .slide-h2, .note-block h2 {{ font-size:1.75em; font-weight:700; margin:0 0 0.85rem;
+    .slide-h2, .note-block h2 {{ font-size:1.65em; font-weight:700; margin:0 0 0.4rem;
       line-height:1.18; letter-spacing:-0.015em; }}
-    .note-block h3 {{ font-size:1.2em; font-weight:700; margin:0 0 0.6rem; }}
+    .note-block h3 {{ font-size:1.15em; font-weight:700; margin:0 0 0.3rem; }}
     .slide:not(.title-slide) .slide-h1,
     .slide:not(.title-slide) .slide-h2,
     .slide:not(.title-slide) .note-block[data-type="heading"],
     .slide:not(.title-slide) .note-block[data-type="heading"] h1,
     .slide:not(.title-slide) .note-block[data-type="heading"] h2 {{
-      text-align:center; width:100%; align-self:stretch; }}
+      text-align:center; width:100%; align-self:stretch; margin-bottom:0.5rem; }}
     .title-slide .slide-h1, .title-slide .slide-h2,
     .title-slide .note-block[data-type="heading"] {{ text-align:center; width:100%; }}
-    .slide-p, .note-block p {{ font-size:1.08em; line-height:1.55; margin:0.55rem 0;
+    .slide-p, .note-block p {{ font-size:1.05em; line-height:1.35; margin:0.15rem 0;
       color:{theme.get("fg", "#eee")}; }}
-    .note-block ul, .note-block ol {{ font-size:1.08em; line-height:1.55; margin:0.55rem 0;
-      padding-left:1.25em; }}
-    .note-block li {{ margin:0.45em 0; }}
-    .note-block[data-type="list_item"] {{ margin:0.4rem 0; }}
-    .note-block[data-type="math"] {{ margin:1rem 0; }}
-    .note-block .math-block {{ text-align:center; margin:0.75em 0; overflow-x:auto;
-      font-size:1.25em; }}
-    .note-block .math-inline {{ display:inline; font-size:1.08em; }}
+    .note-block ul, .note-block ol {{ font-size:1.05em; line-height:1.35; margin:0.15rem 0;
+      padding-left:1.2em; }}
+    .note-block li {{ margin:0.12em 0; }}
+    .note-block[data-type="list_item"] {{ margin:0.08rem 0; }}
+    .note-block[data-type="math"] {{ margin:0.45rem 0; }}
+    .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow-x:auto;
+      font-size:1.2em; }}
+    .note-block .math-inline {{ display:inline; font-size:1.05em; }}
     .note-block img, .note-block[data-type="image"] img {{
       max-width:100%; height:auto; display:block; border-radius:6px; }}
     .note-block table {{ border-collapse:collapse; width:100%; font-size:0.95em; }}
@@ -5184,11 +5186,10 @@ def generate_export_html(
       background:#0b1220; display:block; }}
     [data-type="output"] {{ display:block; width:100%; max-width:100%; box-sizing:border-box; }}
     .frag-hidden {{ opacity:0 !important; visibility:hidden !important; pointer-events:none !important; }}
-    #chrome {{ position:fixed; left:12px; top:12px; z-index:50; display:flex; gap:8px; align-items:center;
-      background:rgba(0,0,0,0.5); color:#fff; padding:5px 10px; border-radius:8px; font-size:12px; }}
-    #chrome .ok {{ color:#86efac; }}
+    #chrome {{ display:none !important; }}
+    #status-badge.ok {{ color:#86efac; }} #status-badge.bad {{ color:#fca5a5; }}
     #nav {{ position:fixed; right:16px; bottom:16px; z-index:50; display:flex; gap:10px; align-items:center;
-      background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.4;
+      background:rgba(0,0,0,0.5); color:#fff; padding:8px 14px; border-radius:10px; opacity:0.35;
       transition:opacity 0.15s; }}
     #nav:hover, #nav:focus-within {{ opacity:1; }}
     #nav button {{ background:transparent; border:0; color:#fff; font-size:20px; cursor:pointer;
@@ -5205,6 +5206,9 @@ def generate_export_html(
     #info-pop.open {{ display:block; }}
     #info-pop h4 {{ margin:0 0 8px; font-size:12px; font-weight:700; color:#93c5fd;
       letter-spacing:0.04em; text-transform:uppercase; }}
+    #info-pop .info-status {{
+      margin:0 0 10px; padding:6px 8px; border-radius:6px; background:#0f172a;
+      border:1px solid #1f2937; font:12px/1.35 ui-monospace,Menlo,monospace; }}
     #info-pop ul {{ margin:0; padding:0 0 0 1.1em; }}
     #info-pop li {{ margin:0.25em 0; }}
     #info-pop kbd {{ font:12px/1.2 ui-monospace,Menlo,monospace; background:#1f2937;
@@ -5470,10 +5474,7 @@ def generate_export_html(
   <style>{css}</style>
 </head>
 <body>
-  <div id="chrome">
-    <strong>sslive</strong>
-    <span id="status-badge" class="ok">exported · static</span>
-  </div>
+  <div id="chrome" aria-hidden="true"></div>
   <div id="viewport">
     <div id="stage">
       <div id="slides-container">
@@ -5481,8 +5482,10 @@ def generate_export_html(
       </div>
     </div>
   </div>
-  <div id="info-pop" role="dialog" aria-label="Keyboard shortcuts" aria-hidden="true">
+  <div id="info-pop" role="dialog" aria-label="Status and shortcuts" aria-hidden="true">
     <button type="button" class="info-close" id="info-pop-close" aria-label="Close">×</button>
+    <h4>sslive</h4>
+    <div class="info-status"><span id="status-badge" class="ok">exported · static</span></div>
     <h4>Shortcuts</h4>
     <ul>
       <li><kbd>←</kbd> <kbd>→</kbd> · reveal, then slides</li>
@@ -5492,7 +5495,7 @@ def generate_export_html(
     </ul>
   </div>
   <div id="nav">
-    <button type="button" id="info-btn" title="Shortcuts" aria-label="Show shortcuts"
+    <button type="button" id="info-btn" title="Status &amp; shortcuts" aria-label="Status and shortcuts"
       aria-expanded="false" aria-controls="info-pop">ⓘ</button>
     <button type="button" id="prev-btn" aria-label="Previous">‹</button>
     <span id="slide-counter">1 / {max(n, 1)}</span>
