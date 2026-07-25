@@ -21,24 +21,24 @@ With CRAFT GPU::
     %sslive
     # edit in the slide → ▶ Run → GPU execute → in-place output
 
-Slide region (dialog note — not itself a slide)::
+Slide section marker (note cell — not a slide)::
 
     # sslive
 
-    This section defines slides for sslive.
+After that marker, **most slides use ``##``**; ``#`` is only for title slides::
 
-    Conventions:
-    - ``# sslive`` starts the slide region and is not itself a slide
-    - ``# ...`` creates a new slide
-    - ``## ...`` creates a subslide under the current slide
-    - cells after a slide/subslide belong to that heading until a new heading appears
+    # sslive
 
-    Authoring intent:
-    - slide content is written at the end of the notebook
-    - it summarizes or reorganizes material introduced earlier
-    - content before ``# sslive`` should not be treated as slide structure
+    # Talk title              ← title slide (use sparingly)
+    intro notes / code…
 
-See ``SSLIVE_USAGE`` / ``print_usage()`` (also printed once on ``%run``).
+    ## First content slide    ← normal slide
+    body notes / code…
+
+    ## Second content slide
+    …
+
+See ``SSLIVE_USAGE`` / ``print_usage()`` (printed on ``%run`` for the LLM).
 """
 
 from __future__ import annotations
@@ -223,26 +223,57 @@ dialoghelper does not exist — that causes this error.
 If %sslive is missing after a bad order:  register_sslive()
 """.strip()
 
-# Printed once on %run / import so the LLM (and humans) see authoring rules.
+# Printed on %run / import so the LLM (and humans) see authoring rules.
+# Be explicit: LLMs otherwise create only `#` title slides and skip `##`.
 SSLIVE_USAGE = """
-# sslive
+# sslive — slide authoring rules (for humans + LLM)
 
-This section defines slides for sslive.
+`# sslive` marks the **start of the slide section**. It is a section marker
+only — **not a slide**. Content before `# sslive` is never part of the deck.
 
-Conventions:
-- `# sslive` starts the slide region and is not itself a slide
-- `# ...` creates a new slide
-- `## ...` creates a subslide under the current slide
-- cells after a slide/subslide belong to that heading until a new heading appears
+After `# sslive`, each slide is introduced by a heading note:
+
+| Heading | Meaning |
+|---------|---------|
+| `# Title of the talk` | **Title slide** (main deck title). Use for the opening slide only. |
+| `## Regular slide` | **Normal content slide**. This is the usual form for most slides. |
+| `### ...` | Not a slide break (stays inside the current slide as body text). |
+
+Rules:
+1. `# sslive` = section marker only (not a slide).
+2. `# Slide title` = starts a new **title** slide.
+3. `## Regular slide` = starts a new **regular** slide (preferred for body slides).
+4. Any following note/code cells belong to the **most recent** `#` or `##`
+   heading until the next `#` / `##` heading appears.
+5. Do **not** put every slide under `#` — reserve `#` for title slides;
+   write ordinary slides as `## Heading`.
+
+Example structure (note cells unless marked code):
+
+    # sslive
+
+    # My Demo Talk
+    short subtitle or agenda notes
+
+    ## Motivation
+    why this matters…
+    [code cell]
+
+    ## Method
+    steps…
+    [code cell]
+
+    ## Results
+    plots / tables…
 
 Authoring intent:
-- slide content is written at the end of the notebook
-- it summarizes or reorganizes material introduced earlier
-- content before `# sslive` should not be treated as slide structure
+- put the slide section at the **end** of the notebook
+- slides summarize or reorganize material introduced earlier
+- material before `# sslive` is background, not slide structure
 
 Load / open:
   %local
-  %run path/to/sslive.py   # registers %sslive (prints this note once)
+  %run path/to/sslive.py   # registers %sslive; prints this note
   %sslive                  # open deck; ▶ Run = host IPython or CRAFT GPU
 """.strip()
 
@@ -352,12 +383,15 @@ def _is_sslive_infra_msg(m: dict) -> bool:
 
 
 async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[dict]:
-    """Cells after the ``# sslive`` region marker. Requires dialoghelper.
+    """Cells after the ``# sslive`` **section** marker. Requires dialoghelper.
 
-    The marker note (``# sslive`` …) is **not** a slide. Everything before it
-    is ignored for deck structure. Skipped (red eye) cells after the marker
-    ARE included: skipped means "out of LLM context", not "out of the deck".
-    Only sslive infra (layout note, launcher, marker) is filtered.
+    ``# sslive`` is a section marker only (not a slide). Everything before it
+    is ignored. After it, ``# Title`` / ``## Heading`` notes start slides;
+    other cells attach to the latest heading (see ``group_dialog_cells_by_heading``).
+
+    Skipped (red eye) cells after the marker ARE included: skipped means
+    "out of LLM context", not "out of the deck". Only sslive infra (layout
+    note, launcher, marker) is filtered.
     """
     if find_msgs is None:
         raise RuntimeError(
@@ -404,11 +438,17 @@ def get_slides_cells_from_notebook(filepath: str | Path, dialog_cells: list[dict
 
 
 def group_dialog_cells_by_heading(dialog_slides_cells: list[dict]) -> list[list[dict]]:
-    """Split region cells into slides/subslides by heading notes.
+    """Split region cells into deck pages by slide heading notes.
 
-    * ``# ...`` → new slide (title)
-    * ``## ...`` → new subslide (still its own deck page; follows previous)
-    * other cells join the current heading until the next ``#`` / ``##``
+    After the ``# sslive`` section marker (already stripped by the loader):
+
+    * ``# Title``  → new **title** slide (``Slide.is_title``)
+    * ``## Title`` → new **regular** slide (usual body slides)
+    * other note/code cells → attach to the most recent heading until the
+      next ``#`` / ``##`` heading
+    * ``###`` and deeper are body text, not slide breaks
+
+    ``# sslive`` itself is never a slide (filtered as region marker / infra).
     """
     groups, current = [], []
     for cell in dialog_slides_cells:
@@ -418,6 +458,7 @@ def group_dialog_cells_by_heading(dialog_slides_cells: list[dict]) -> list[list[
             # Do not treat the region marker as a slide heading
             if _is_slide_region_marker(content):
                 continue
+            # Title slide (# …) or regular slide (## …); ###+ stay in body
             if content.startswith("## ") or (
                 content.startswith("# ") and not content.startswith("### ")
             ):
@@ -4751,8 +4792,9 @@ def generate_presenter_html(
         empty = (
             "<section class='slide active' data-slide='0'>"
             "<h2 class='slide-h2'>No slides</h2>"
-            "<p class='slide-p'>Add a note starting with <code># sslive</code>, "
-            "then <code>#</code> / <code>##</code> headings below it. "
+            "<p class='slide-p'>Add a note starting with <code># sslive</code> "
+            "(section marker), then title slides with <code># Title</code> and "
+            "regular slides with <code>## Heading</code>. "
             "Re-run <code>%sslive</code>.</p></section>"
         )
 
@@ -7144,8 +7186,9 @@ async def sslive(
     n_code = len(deck.ordered_code_ids)
     if n_code == 0 and len(deck.slides) == 0:
         print(
-            "sslive: no slides found — add a note starting with `# sslive`, "
-            "then `#` / `##` headings below it (see SSLIVE_USAGE)."
+            "sslive: no slides found — add a note starting with `# sslive` "
+            "(section marker), then `# Title` (title slide) and/or "
+            "`## Heading` (regular slides). See SSLIVE_USAGE."
         )
     _SESSION["slide_index"] = 0
     _SESSION.setdefault("pending_dialog_sync", {})

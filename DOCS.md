@@ -43,21 +43,31 @@ Element — id, cell_id, kind, html/content (layout via deck.layout overlay)
 OutputPart — stream|error|image/png|text/html|text/plain
 ```
 
-### Slide region marker
+### Slide section marker and headings
 
-A note whose **first line** is `# sslive` starts the deck region (not a slide). Content before it is ignored. Legacy exact body `#| s` still works.
+A note whose **first line** is `# sslive` starts the deck **section** (not a slide). Content before it is ignored. Legacy exact body `#| s` still works.
+
+| Construct | Role |
+|-----------|------|
+| `# sslive` | Section marker only — **not** a slide |
+| `# Title` | **Title slide** (`Slide.is_title`) |
+| `## Heading` | **Regular slide** (usual form for body content) |
+| following note/code | Belong to the most recent `#` / `##` until the next heading |
+| `###` and deeper | Body text inside the current slide, not a break |
 
 ```text
 # sslive
-…optional conventions text…
 
-# Title slide
+# Demo Talk                 ← title slide
+intro…
+
+## Motivation               ← regular slide
 …
-## Subslide
+## Method                   ← regular slide
 …
 ```
 
-On `%run sslive.py`, `SSLIVE_USAGE` is printed once for LLM/human context.
+Prefer `##` for most slides; reserve `#` for the main title. On `%run`, `SSLIVE_USAGE` spells this out for the LLM.
 
 Note cells after the marker are split into fine pieces (`el-{idx}-{cell_id}`): headings, list items, display math, images, tables.
 

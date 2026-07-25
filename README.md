@@ -53,28 +53,39 @@ Status badge: `gpu · ready`, `local · ready`, or `offline · …`.
 
 ## Deck content
 
-Start the slide region with a **note** cell (the note itself is not a slide):
+### Section marker (not a slide)
+
+```text
+# sslive
+```
+
+`# sslive` only marks where the slide section **starts**. It is **not** a slide. Content before it is ignored.
+
+### After `# sslive`
+
+| Heading | Role |
+|---------|------|
+| `# Talk title` | **Title slide** (main deck title — use sparingly) |
+| `## Regular slide` | **Normal slide** — use this for almost all content slides |
+| following notes/code | Belong to the **most recent** `#` / `##` until the next heading |
 
 ```text
 # sslive
 
-This section defines slides for sslive.
+# My Demo Talk
+agenda notes…
 
-Conventions:
-- `# sslive` starts the slide region and is not itself a slide
-- `# ...` creates a new slide
-- `## ...` creates a subslide under the current slide
-- cells after a slide/subslide belong to that heading until a new heading appears
+## Motivation
+why this matters…
+[code]
 
-Authoring intent:
-- slide content is written at the end of the notebook
-- it summarizes or reorganizes material introduced earlier
-- content before `# sslive` should not be treated as slide structure
+## Results
+plots…
 ```
 
-Notes and code cells **after** that marker become the deck. Layout is stored in a separate skipped note `#| sslive-layout` (not LLM context).
+Do **not** make every slide a `#` heading — that produces only title-style slides. Prefer `##` for body slides.
 
-On `%run sslive.py`, this usage note is printed once (`SSLIVE_USAGE` / `print_usage()`) so the LLM has authoring context in the cell output. Legacy marker `#| s` is still recognized.
+Layout is stored in a separate skipped note `#| sslive-layout` (not LLM context). On `%run sslive.py`, `SSLIVE_USAGE` is printed for the LLM. Legacy marker `#| s` is still recognized.
 
 ## Edit mode
 
