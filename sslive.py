@@ -5026,17 +5026,27 @@ def generate_presenter_html(
         return slideLayoutEls(slide).filter((el) => set.has(el));
       }}
       /**
-       * Reset freeform layout without stacking under a still-absolute title.
+       * Reset freeform layout without stacking bullets over a still-absolute title.
        *
-       * First drag pins *every* sibling absolute (pinFlowElements). If we only
-       * clear the selected bullets, they re-enter flex flow at y≈0 while the
-       * title stays absolute — so they draw on top of the title.
+       * First drag pins *every* sibling absolute (pinFlowElements). Clearing only
+       * selected items returns them to flex at y≈0 while the title stays absolute
+       * — they draw on top of the title.
        *
-       * Fix: measure natural document-order positions with a temporary full
-       * flow pass, restore non-selected freeform coords, then either leave
-       * reset els in pure flow (when nothing else is absolute) or pin them at
-       * those natural spots so they sit under the title again.
+       * Fix:
+       *  - If nothing else is freeform → pure document flow (CLEAR_LAYOUT).
+       *  - If other freeform siblings remain → clear style overrides on the
+       *    selection, then stack each selected element *below the visual bottom*
+       *    of the previous layout sibling (title stays put; bullets sit under it).
        */
+      function isAbsLaidOut(el) {{
+        if (!el) return false;
+        if ((el.style.position || '') === 'absolute') return true;
+        try {{
+          return getComputedStyle(el).position === 'absolute';
+        }} catch (e) {{
+          return false;
+        }}
+      }}
       function resetElementsToNaturalLayout(elsIn) {{
         const targets = expandResetSet(elsIn);
         if (!targets.length) return [];
@@ -5044,69 +5054,88 @@ def generate_presenter_html(
         if (!slide) return targets;
         const all = slideLayoutEls(slide);
         const resetSet = new Set(targets);
-
-        // Snapshot freeform styles of elements we are NOT resetting
-        const kept = all.filter((el) => !resetSet.has(el)).map((el) => ({{
-          el,
-          css: el.style.cssText,
-          reveal: el.getAttribute('data-reveal'),
-        }}));
-
-        // Temporary pure flow for measurement (title → bullets in DOM order)
-        all.forEach((el) => restoreFlowLayout(el));
-        void slide.offsetHeight;
-
         const sr = slide.getBoundingClientRect();
         const sc = sr.width / 1920 || 1;
-        const natural = new Map();
-        all.forEach((el) => {{
-          const er = el.getBoundingClientRect();
-          natural.set(el, {{
-            x: Math.round((er.left - sr.left) / sc),
-            y: Math.round((er.top - sr.top) / sc),
-            w: Math.max(1, Math.round(er.width / sc)),
-            h: Math.max(1, Math.round(er.height / sc)),
+        const gap = 14;
+        const padX = 96; // matches regular-slide horizontal padding
+
+        // Drop fs/color/reveal/abs geometry on the selection first
+        targets.forEach((el) => restoreFlowLayout(el));
+
+        const anyOtherAbs = all.some((el) => !resetSet.has(el) && isAbsLaidOut(el));
+        if (!anyOtherAbs) {{
+          targets.forEach((el) => {{
+            sendLayoutPatch(
+              el.dataset.elId || el.id,
+              Object.assign({{}}, CLEAR_LAYOUT)
+            );
           }});
-        }});
+          return targets;
+        }}
 
-        // Put non-selected back where the user left them
-        kept.forEach(({{ el, css, reveal }}) => {{
-          el.style.cssText = css || '';
-          if (reveal != null && reveal !== '') el.setAttribute('data-reveal', reveal);
-          else el.removeAttribute('data-reveal');
-        }});
-
-        const keptStillAbs = kept.some(
-          ({{ el }}) => (el.style.position || '') === 'absolute'
-        );
-
-        targets.forEach((el) => {{
+        // DOM order among targets
+        const ordered = all.filter((el) => resetSet.has(el));
+        ordered.forEach((el) => {{
           const elId = el.dataset.elId || el.id;
-          restoreFlowLayout(el);
-          if (!keptStillAbs) {{
-            // Whole freeform set cleared → pure document flow
-            sendLayoutPatch(elId, Object.assign({{}}, CLEAR_LAYOUT));
-            return;
+          const elIndex = all.indexOf(el);
+          const isCode =
+            el.classList.contains('code-wrap') || el.dataset.type === 'code';
+
+          // Visual bottom of every layout el before this one (kept freeform or
+          // already re-stacked targets). That is the correct "under the title"
+          // anchor even when the title is still absolute.
+          let startY = 0;
+          let startX = padX;
+          for (let i = 0; i < elIndex; i++) {{
+            const prev = all[i];
+            // Skip targets not yet placed in this loop
+            if (resetSet.has(prev) && ordered.indexOf(prev) >= ordered.indexOf(el))
+              continue;
+            const er = prev.getBoundingClientRect();
+            if (er.width < 2 && er.height < 2) continue;
+            const bottom = (er.bottom - sr.top) / sc;
+            const left = (er.left - sr.left) / sc;
+            if (bottom > startY) startY = bottom;
+            // Prefer left edge of previous content block
+            if (prev === all[elIndex - 1] || !resetSet.has(prev))
+              startX = left;
           }}
-          // Mixed: pin at natural flow slots so bullets stay under the title
-          const n = natural.get(el) || {{ x: 0, y: 0, w: 800, h: 48 }};
-          const isCode = el.classList.contains('code-wrap') || el.dataset.type === 'code';
+          startY = Math.round(startY > 0 ? startY + gap : padX * 0.5);
+          startX = Math.round(
+            Number.isFinite(startX) ? startX : padX
+          );
+          const maxW = Math.max(120, Math.round(1920 - startX - padX));
+
+          // Measure content height at the target width
           el.style.position = 'absolute';
           el.style.margin = '0';
-          el.style.left = n.x + 'px';
-          el.style.top = n.y + 'px';
-          el.style.width = n.w + 'px';
+          el.style.left = startX + 'px';
+          el.style.top = startY + 'px';
+          el.style.width = maxW + 'px';
+          el.style.height = 'auto';
+          el.style.overflow = 'visible';
+          el.style.zIndex = '';
+          void el.offsetHeight;
+          const er = el.getBoundingClientRect();
+          const h = Math.max(isCode ? 34 : 24, Math.round(er.height / sc));
+          const w = Math.max(40, Math.round(er.width / sc));
           if (!isCode) {{
-            el.style.height = n.h + 'px';
+            el.style.height = h + 'px';
             el.style.overflow = 'auto';
           }}
-          const patch = {{
-            x: n.x, y: n.y, w: n.w,
-            h: isCode ? null : n.h,
-            z: null, order: null, reveal: null,
-            fs: null, ff: null, align: null, color: null,
-          }};
-          sendLayoutPatch(elId, patch);
+          sendLayoutPatch(elId, {{
+            x: startX,
+            y: startY,
+            w: w,
+            h: isCode ? null : h,
+            z: null,
+            order: null,
+            reveal: null,
+            fs: null,
+            ff: null,
+            align: null,
+            color: null,
+          }});
         }});
         return targets;
       }}
