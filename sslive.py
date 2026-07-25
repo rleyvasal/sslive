@@ -3,23 +3,19 @@
 **Working version 0.1.0** — in-slide edit, layout, reveal; Run; dialog sync.
 
 Architecture: **host on %local** (presenter, dialoghelper, bridge).
-Slide ▶ Run uses **CRAFT remote GPU** when available, otherwise **host IPython**
-(slides-only demo / no CRAFT).
+Slide ▶ Run uses **CRAFT remote GPU** when available, otherwise **host IPython**.
 
-Standalone (slides demo, no CRAFT)::
-
-    %local
-    %run path/to/sslive.py
-    %sslive                 # or: await sslive()
-
-With CRAFT GPU::
+**One load command** (local *and* GPU — CRAFT is auto-detected)::
 
     %local
-    %run path/to/CRAFT.py
-    %run path/to/sslive.py
+    %run /path/to/sslive/sslive.py   # or …/load.py / …/addons/sslive.py
+    %sslive                          # or: await sslive()
+
+Optional GPU (same sslive load — no second recipe)::
+
+    %run /path/to/gpudev/CRAFT.py
     %gpu
-    %sslive
-    # edit in the slide → ▶ Run → GPU execute → in-place output
+    # ▶ Run in the deck uses the remote when connected
 
 Slide section marker (note cell — not a slide)::
 
@@ -209,17 +205,17 @@ _HOST_LOAD_HELP = """
 sslive host must load on the SolveIt kernel (not the remote GPU).
 
   %local
-  %run sslive/sslive.py   # auto-registers %sslive — no CRAFT required
-  %sslive                 # slides-only demo (Run on host)
+  %run /path/to/sslive/sslive.py   # one command — local or GPU
+  %sslive
 
-Optional GPU (CRAFT)::
+Optional GPU (same load; CRAFT auto-detected for ▶ Run)::
 
-  %run path/to/CRAFT.py
+  %run /path/to/gpudev/CRAFT.py
   %gpu
-  %sslive                 # ▶ Run → remote GPU when connected
+  # re-%run sslive only if magics vanished; else just %sslive
 
 If you %run under %gpu, this file executes on the remote kernel where
-dialoghelper does not exist — that causes this error.
+dialoghelper does not exist — that causes this error. Stay on %local to load.
 If %sslive is missing after a bad order:  register_sslive()
 """.strip()
 
@@ -286,10 +282,12 @@ Authoring intent:
 - slides summarize or reorganize material introduced earlier
 - material before `# sslive` is background, not slide structure
 
-Load / open:
+Load / open (one command — CRAFT optional, auto-detected)::
+
   %local
-  %run path/to/sslive.py   # registers %sslive; prints this note
-  %sslive                  # open deck; ▶ Run = host IPython or CRAFT GPU
+  %run /path/to/sslive/sslive.py   # registers %sslive; prints this note
+  %sslive                          # open deck
+  # ▶ Run → CRAFT GPU when %gpu is connected, else host IPython
 """.strip()
 
 
@@ -1699,11 +1697,43 @@ def host_ipython_ready() -> tuple[bool, str]:
     return True, "host IPython"
 
 
+def craft_env_status() -> str:
+    """Return ``connected`` | ``present`` | ``absent`` (same idea as tidy3/plot3).
+
+    * **connected** — live remote kernel for ▶ Run
+    * **present** — CRAFT client / hooks visible, but not fully connected yet
+    * **absent** — pure local (host IPython for ▶ Run)
+    """
+    ok, _msg = craft_gpu_ready()
+    if ok:
+        return "connected"
+    if get_craft_exec_mgr() is not None:
+        return "present"
+    if get_ipython is None:
+        return "absent"
+    try:
+        ns = get_ipython().user_ns or {}
+    except Exception:
+        return "absent"
+    if callable(ns.get("remote_run_")) or "register_local_magic" in ns:
+        return "present"
+    try:
+        import gpudev_craft  # noqa: F401
+
+        return "present"
+    except Exception:
+        pass
+    for key in ("_craft_cfg", "CRAFT", "remote_run", "gpu_mode"):
+        if key in ns:
+            return "present"
+    return "absent"
+
+
 def exec_backend() -> tuple[str, str]:
     """Active execute backend: ``gpu`` | ``local`` | ``offline``.
 
     * **gpu** — CRAFT remote kernel (preferred when connected)
-    * **local** — host IPython (standalone slides demo, no CRAFT)
+    * **local** — host IPython (standalone or CRAFT not yet ``%gpu``)
     * **offline** — neither available
     """
     ok, msg = craft_gpu_ready()
@@ -1711,6 +1741,9 @@ def exec_backend() -> tuple[str, str]:
         return "gpu", msg or "connected"
     ip_ok, ip_msg = host_ipython_ready()
     if ip_ok:
+        env = craft_env_status()
+        if env == "present":
+            return "local", "host · CRAFT present (run %gpu for remote ▶ Run)"
         # Prefer a short reason that CRAFT is optional, not an error
         return "local", "host · no CRAFT (slides demo)"
     return "offline", msg if not ok else ip_msg
@@ -8088,8 +8121,11 @@ def _bootstrap_on_load() -> None:
     Usage is printed **first** and on every load so a registration error
     cannot swallow the authoring note. ``%run`` and ``import`` under IPython
     both emit the note (force on ``%run`` / ``__main__``).
+
+    One load path for local and GPU: CRAFT is detected from the environment;
+    ▶ Run picks GPU when connected and host IPython otherwise.
     """
-    # %run → __name__ == "__main__"; import sslive → "sslive"
+    # %run → __name__ == "__main__"; import sslive / runpy → "sslive"
     name = str(globals().get("__name__", "") or "")
     is_run = name in ("__main__", "builtins") or name.endswith("sslive")
     in_ipy = False
@@ -8097,6 +8133,17 @@ def _bootstrap_on_load() -> None:
         in_ipy = get_ipython is not None and get_ipython() is not None
     except Exception:
         in_ipy = False
+
+    print(f"sslive: loader v{__version__} starting…", flush=True)
+    try:
+        env = craft_env_status()
+        backend, bmsg = exec_backend()
+        print(
+            f"sslive: environment = {env} · ▶ Run backend = {backend} ({bmsg})",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"sslive: environment probe failed ({e})", flush=True)
 
     # Always try to surface usage when this file is executed in a notebook.
     # force=True on %run so re-%run refreshes LLM context every time.
@@ -8107,12 +8154,30 @@ def _bootstrap_on_load() -> None:
         print_usage(force=False)
 
     if not in_ipy:
+        print(
+            "sslive: WARNING — no IPython shell; run with %run inside SolveIt "
+            "to register %sslive",
+            flush=True,
+        )
         return
     try:
-        _ok = _register_sslive_magic(quiet=True)
+        _ok = _register_sslive_magic(quiet=False)
         if not _ok and _SESSION.get("_magic_reg_err"):
             print(f"sslive: magic registration issue: {_SESSION['_magic_reg_err']}")
             print("sslive: use  await sslive()  or  register_sslive()")
+        else:
+            env = craft_env_status()
+            print(
+                f"sslive {__version__} ready "
+                f"(one load · CRAFT {env}; ▶ Run auto-selects gpu|local)",
+                flush=True,
+            )
+            print(
+                "  %sslive  /  %sslive_export talk.html\n"
+                "  await sslive()  ·  register_sslive() after kernel surgery\n"
+                "  GPU: same %run; connect CRAFT + %gpu for remote ▶ Run",
+                flush=True,
+            )
     except Exception as e:
         print(f"sslive: could not auto-register %sslive ({e}); use await sslive()")
 
@@ -8169,6 +8234,7 @@ __all__ = [
     "export_html_a",
     "get_craft_exec_mgr",
     "exec_backend",
+    "craft_env_status",
     "craft_gpu_ready",
     "host_ipython_ready",
 ]

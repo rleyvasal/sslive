@@ -6,24 +6,37 @@ Live slides for [SolveIt](https://solve.it.com). Optional [gpudev](https://githu
 
 More detail: **[DOCS.md](DOCS.md)**.
 
-## Quick start (slides only — no CRAFT)
+## Quick start — one command
 
 ```text
 %local
-%run /path/to/sslive/sslive.py    # host — registers %sslive
-%sslive                           # open deck; ▶ Run uses host IPython
+%run /app/data/gpudevd/sslive/sslive.py   # or %run /path/to/sslive/sslive.py
+%sslive                                   # open deck
 ```
 
-Works as a **standalone slides demo**. Pure Python and magics run on the SolveIt host.
+Same load works **with or without CRAFT**. CRAFT is auto-detected:
 
-## With CRAFT GPU
+| Environment | ▶ Run uses |
+|-------------|------------|
+| No CRAFT | Host IPython |
+| CRAFT loaded, no `%gpu` yet | Host IPython (badge: CRAFT present) |
+| CRAFT + `%gpu` connected | Remote GPU |
+
+Optional GPU (no second sslive recipe):
 
 ```text
 %local
+%run /app/data/gpudevd/sslive/sslive.py
 %run /path/to/gpudev/CRAFT.py
-%run /path/to/sslive/sslive.py
 %gpu
-%sslive                           # ▶ Run → remote GPU when connected
+%sslive
+```
+
+Aliases (all run the same loader):
+
+```text
+%run /path/to/sslive/load.py
+%run /path/to/gpudev/addons/sslive.py
 ```
 
 | Magic / call | Role |
@@ -40,7 +53,7 @@ Works as a **standalone slides demo**. Pure Python and magics run on the SolveIt
   ├─ deck UI, layout, export     →  SolveIt host
   └─ ▶ Run / Shift+Enter
         ├─ CRAFT remote GPU      →  when %gpu + _exec_mgr live
-        └─ host IPython          →  standalone / no CRAFT
+        └─ host IPython          →  standalone / CRAFT not connected
 ```
 
 | Piece | Where |
@@ -50,6 +63,13 @@ Works as a **standalone slides demo**. Pure Python and magics run on the SolveIt
 | Code ▶ Run (standalone) | **Host IPython** |
 
 Status badge: `gpu · ready`, `local · ready`, or `offline · …`.
+
+On load you should see something like:
+
+```text
+sslive: environment = absent|present|connected · ▶ Run backend = local|gpu (…)
+sslive 0.1.0 ready (one load · CRAFT …)
+```
 
 ## Deck content
 
@@ -100,26 +120,6 @@ Layout is stored in a separate skipped note `#| sslive-layout` (not LLM context)
 
 ```text
 %sslive_export talk.html
-%sslive_export talk.html title=Demo
 ```
 
-Portable file: frozen code + last outputs + layout. Use **Plotly** / matplotlib (or `%pointcloud_plotly` from pcviz) for viz that travels offline-ish; plain `%pointcloud` is live-only.
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| `dialoghelper not available` | `%local` → `%run sslive.py` first (not under bare `%gpu`) |
-| `%sslive` not found | Re-`%run` on host, or `register_sslive()` |
-| Badge `local · ready` | Expected without CRAFT — ▶ Run still works on host |
-| Want GPU Run | Load CRAFT on host, `%gpu`, re-open `%sslive` |
-| Force GPU-only open | `await sslive(require_gpu=True)` |
-
-## Repo layout
-
-```text
-sslive/
-  sslive.py    # implementation
-  README.md    # this file
-  DOCS.md      # architecture, layout model, changelog
-```
+Portable HTML snapshot of the deck (layout + content). See **DOCS.md** for architecture and layout model.

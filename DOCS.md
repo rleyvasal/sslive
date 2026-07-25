@@ -13,18 +13,19 @@ Companion to [README.md](README.md). Architecture, layout model, and history.
 | `%sslive`, layout, dialoghelper, export | SolveIt **host** (local magics) |
 | Cell execution (▶ Run) | **CRAFT remote** when connected; else **host IPython** |
 
-Standalone (slides demo — no CRAFT):
+**One load** (CRAFT optional — auto-detected for ▶ Run):
 
 ```text
-%local → %run sslive.py → %sslive
+%local → %run sslive/sslive.py → %sslive
 ```
 
-With GPU:
+Optional GPU (same sslive load):
 
 ```text
-%local → %run CRAFT.py → %run sslive.py → %gpu → %sslive
+%local → %run sslive/sslive.py → %run CRAFT.py → %gpu → %sslive
 ```
 
+`craft_env_status()` returns `connected` | `present` | `absent`.
 `LiveExecutor` / `exec_backend()` returns `gpu` | `local` | `offline`. Badge and spinner text follow that mode.
 
 ### Data model
