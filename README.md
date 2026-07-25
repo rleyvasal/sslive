@@ -85,6 +85,8 @@ plots…
 
 Do **not** make every slide a `#` heading — that produces only title-style slides. Prefer `##` for body slides.
 
+**Math:** always use LaTeX with `$…$` (inline) or `$$…$$` (display). Plain ASCII formulas do not render.
+
 Layout is stored in a separate skipped note `#| sslive-layout` (not LLM context). On `%run sslive.py`, `SSLIVE_USAGE` is printed for the LLM. Legacy marker `#| s` is still recognized.
 
 ## Edit mode

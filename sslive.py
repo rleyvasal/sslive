@@ -248,6 +248,17 @@ Rules:
 5. Do **not** put every slide under `#` — reserve `#` for title slides;
    write ordinary slides as `## Heading`.
 
+Math (required — otherwise formulas stay plain text):
+- ALWAYS write math with LaTeX and $ / $$ delimiters so sslive can render it.
+- Inline: $E=mc^2$, $\\alpha$, $d_k$
+- Display (centered block, preferred for key formulas):
+
+      $$\\mathrm{Attention}(Q,K,V)=\\mathrm{softmax}\\Big(\\frac{QK^\\top}{\\sqrt{d_k}}\\Big)V$$
+
+- Do NOT write formulas as bare ASCII like:
+      Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V
+  That will not render as math.
+
 Example structure (note cells unless marked code):
 
     # sslive
@@ -259,9 +270,13 @@ Example structure (note cells unless marked code):
     why this matters…
     [code cell]
 
-    ## Method
-    steps…
-    [code cell]
+    ## The famous attention formula
+    $$\\mathrm{Attention}(Q,K,V)=\\mathrm{softmax}(QK^\\top/\\sqrt{d_k})V$$
+
+    Intuition:
+    - $Q$ = what I am looking for
+    - $K$ = what each token offers
+    - $V$ = the information carried by each token
 
     ## Results
     plots / tables…
@@ -3331,31 +3346,45 @@ def generate_presenter_html(
     .slide.active {{ display:flex; }}
     .slide.hidden {{ display:none; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
-    /* note typography in em off .note-block so one font-size override (layout
-       overlay `fs`) scales headings + body proportionally; defaults unchanged
-       (28px base: 2.5714em≈72px h1, 1.7143em≈48px h2 — the old rem values) */
-    .note-block {{ font-size:1.75rem; }}
-    .slide-h1, .note-block h1 {{ font-size:2.5714em; font-weight:700; margin:0 0 1rem; }}
-    .slide-h2, .note-block h2 {{ font-size:1.7143em; font-weight:700; margin:0 0 1rem; }}
-    .note-block h3 {{ font-size:1.3em; font-weight:700; margin:0 0 0.75rem; }}
-    .slide-p, .note-block p {{ font-size:1em; line-height:1.5; margin:0.5rem 0; color:{theme.get("fg", "#eee")}; }}
-    .note-block ul, .note-block ol {{ font-size:1em; line-height:1.5; margin:0.5rem 0; padding-left:1.4em; }}
-    .note-block li {{ margin:0.2em 0; }}
-    /* S2-D fine pieces: tighter consecutive list items, math / image / table boxes */
-    .note-block[data-type="list_item"] {{ margin:0.15rem 0; }}
-    .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.4em; }}
-    .note-block[data-type="math"] {{ margin:0.6rem 0; }}
-    .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow-x:auto; }}
-    .note-block .math-inline {{ display:inline; }}
+    /* Regular slides: larger type for projection; title slides keep centered chrome */
+    .slide:not(.title-slide) {{ padding:56px 88px; gap:20px; }}
+    /* note typography in em off .note-block so layout overlay `fs` scales all text */
+    .note-block {{ font-size:2.15rem; }}  /* ~34px body on 1920 stage */
+    .title-slide .note-block {{ font-size:2.0rem; }}
+    .slide-h1, .note-block h1 {{ font-size:2.45em; font-weight:700; margin:0 0 0.85rem;
+      line-height:1.15; letter-spacing:-0.01em; }}
+    .slide-h2, .note-block h2 {{ font-size:1.85em; font-weight:700; margin:0 0 0.9rem;
+      line-height:1.2; letter-spacing:-0.01em; }}
+    .note-block h3 {{ font-size:1.25em; font-weight:700; margin:0 0 0.65rem; }}
+    /* Center slide titles on regular slides (## Heading / # Title piece) */
+    .slide:not(.title-slide) .slide-h1,
+    .slide:not(.title-slide) .slide-h2,
+    .slide:not(.title-slide) .note-block[data-type="heading"],
+    .slide:not(.title-slide) .note-block[data-type="heading"] h1,
+    .slide:not(.title-slide) .note-block[data-type="heading"] h2 {{
+      text-align:center; width:100%; align-self:stretch; }}
+    .title-slide .slide-h1, .title-slide .slide-h2,
+    .title-slide .note-block[data-type="heading"] {{ text-align:center; width:100%; }}
+    .slide-p, .note-block p {{ font-size:1.05em; line-height:1.55; margin:0.55rem 0;
+      color:{theme.get("fg", "#eee")}; }}
+    .note-block ul, .note-block ol {{ font-size:1.05em; line-height:1.55; margin:0.55rem 0;
+      padding-left:1.35em; }}
+    .note-block li {{ margin:0.35em 0; }}
+    .note-block[data-type="list_item"] {{ margin:0.28rem 0; }}
+    .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.35em; }}
+    .note-block[data-type="math"] {{ margin:0.85rem 0; }}
+    .note-block .math-block {{ text-align:center; margin:0.65em 0; overflow-x:auto;
+      font-size:1.2em; }}
+    .note-block .math-inline {{ display:inline; font-size:1.05em; }}
     .note-block[data-type="image"], .note-block .note-image {{ margin:0.5rem 0; }}
     .note-block .note-image {{ margin:0; }}
     .note-block .note-image img, .note-block[data-type="image"] img {{
       max-width:100%; height:auto; display:block; border-radius:6px; }}
     .note-block[data-type="table"] {{ overflow-x:auto; margin:0.5rem 0; }}
-    .note-block table {{ border-collapse:collapse; width:100%; font-size:0.9em; }}
-    .note-block th, .note-block td {{ border:1px solid #374151; padding:0.35em 0.6em; text-align:left; }}
+    .note-block table {{ border-collapse:collapse; width:100%; font-size:0.95em; }}
+    .note-block th, .note-block td {{ border:1px solid #374151; padding:0.4em 0.7em; text-align:left; }}
     .note-block th {{ background:#1f2937; }}
-    .note-block code {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.8em;
+    .note-block code {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.85em;
       background:{theme.get("code_bg", "#1f2937")}; border:1px solid #374151; border-radius:4px;
       padding:0.08em 0.35em; }}
     .note-block pre {{ background:#111827; border:1px solid #374151; border-radius:6px;
@@ -3364,7 +3393,6 @@ def generate_presenter_html(
     .note-block img {{ max-width:100%; }}
     .sslive-html {{ width:100%; max-width:100%; }}
     .sslive-html-viz {{ display:block; width:100%; max-width:100%; }}
-    /* Plotly host: full content-column width, large default height */
     .sslive-plotly-host {{ width:100% !important; max-width:100%; box-sizing:border-box;
       position:relative; overflow:hidden; border-radius:8px; background:#0b1220; }}
     .sslive-plotly-host .js-plotly-plot,
@@ -3382,8 +3410,7 @@ def generate_presenter_html(
     .note-block a {{ color:#60a5fa; }}
     .note-block blockquote {{ border-left:3px solid #4b5563; margin:0.5rem 0;
       padding:0 0 0 0.8em; color:{theme.get("muted", "#9ca3af")}; }}
-    .note-block .math-block {{ text-align:center; margin:0.8em 0; }}
-    .note-block math {{ font-size:1.1em; }}
+    .note-block math {{ font-size:1.15em; }}
     /* Code box: toolbar + one-line bar; editing uses #live-code-pop (floating) */
     .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
       padding:8px 12px; outline:none; flex:0 0 auto; align-self:stretch; max-width:100%;
@@ -5014,21 +5041,37 @@ def generate_export_html(
     .slide.active {{ display:flex; }}
     .slide.hidden {{ display:none; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
-    .note-block {{ font-size:1.75rem; }}
-    .slide-h1, .note-block h1 {{ font-size:2.5714em; font-weight:700; margin:0 0 1rem; }}
-    .slide-h2, .note-block h2 {{ font-size:1.7143em; font-weight:700; margin:0 0 1rem; }}
-    .note-block h3 {{ font-size:1.3em; font-weight:700; margin:0 0 0.75rem; }}
-    .slide-p, .note-block p {{ font-size:1em; line-height:1.5; margin:0.5rem 0; color:{theme.get("fg", "#eee")}; }}
-    .note-block ul, .note-block ol {{ font-size:1em; line-height:1.5; margin:0.5rem 0; padding-left:1.4em; }}
-    .note-block li {{ margin:0.2em 0; }}
-    .note-block[data-type="list_item"] {{ margin:0.15rem 0; }}
-    .note-block[data-type="math"] {{ margin:0.6rem 0; }}
-    .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow-x:auto; }}
-    .note-block .math-inline {{ display:inline; }}
+    .slide:not(.title-slide) {{ padding:56px 88px; gap:20px; }}
+    .note-block {{ font-size:2.15rem; }}
+    .title-slide .note-block {{ font-size:2.0rem; }}
+    .slide-h1, .note-block h1 {{ font-size:2.45em; font-weight:700; margin:0 0 0.85rem;
+      line-height:1.15; letter-spacing:-0.01em; }}
+    .slide-h2, .note-block h2 {{ font-size:1.85em; font-weight:700; margin:0 0 0.9rem;
+      line-height:1.2; letter-spacing:-0.01em; }}
+    .note-block h3 {{ font-size:1.25em; font-weight:700; margin:0 0 0.65rem; }}
+    .slide:not(.title-slide) .slide-h1,
+    .slide:not(.title-slide) .slide-h2,
+    .slide:not(.title-slide) .note-block[data-type="heading"],
+    .slide:not(.title-slide) .note-block[data-type="heading"] h1,
+    .slide:not(.title-slide) .note-block[data-type="heading"] h2 {{
+      text-align:center; width:100%; align-self:stretch; }}
+    .title-slide .slide-h1, .title-slide .slide-h2,
+    .title-slide .note-block[data-type="heading"] {{ text-align:center; width:100%; }}
+    .slide-p, .note-block p {{ font-size:1.05em; line-height:1.55; margin:0.55rem 0;
+      color:{theme.get("fg", "#eee")}; }}
+    .note-block ul, .note-block ol {{ font-size:1.05em; line-height:1.55; margin:0.55rem 0;
+      padding-left:1.35em; }}
+    .note-block li {{ margin:0.35em 0; }}
+    .note-block[data-type="list_item"] {{ margin:0.28rem 0; }}
+    .note-block[data-type="math"] {{ margin:0.85rem 0; }}
+    .note-block .math-block {{ text-align:center; margin:0.65em 0; overflow-x:auto;
+      font-size:1.2em; }}
+    .note-block .math-inline {{ display:inline; font-size:1.05em; }}
     .note-block img, .note-block[data-type="image"] img {{
       max-width:100%; height:auto; display:block; border-radius:6px; }}
-    .note-block table {{ border-collapse:collapse; width:100%; font-size:0.9em; }}
-    .note-block th, .note-block td {{ border:1px solid #374151; padding:0.35em 0.6em; text-align:left; }}
+    .note-block table {{ border-collapse:collapse; width:100%; font-size:0.95em; }}
+    .note-block th, .note-block td {{ border:1px solid #374151; padding:0.4em 0.7em; text-align:left; }}
+    .note-block math {{ font-size:1.15em; }}
     .sslive-html {{ width:100%; max-width:100%; }}
     .sslive-plotly-host {{ width:100% !important; max-width:100%; box-sizing:border-box;
       position:relative; overflow:hidden; border-radius:8px; background:#0b1220; }}
