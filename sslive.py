@@ -3174,6 +3174,129 @@ def parse_note_to_elements(
     return _parse_note_to_elements_basic(source, cell_id)
 
 
+def _heading_level_from_html(html: str) -> int:
+    h = (html or "").lower()
+    for level in (1, 2, 3, 4, 5, 6):
+        if f"<h{level}" in h:
+            return level
+    return 2
+
+
+def _render_note_piece_html(kind: str, content: str, prev_html: str = "") -> str:
+    """Rebuild a note-piece HTML fragment from plain text after in-slide edit."""
+    text = content or ""
+    esc = html_module.escape(text)
+    esc_br = esc.replace("\n", "<br/>")
+    kind = (kind or "paragraph").lower()
+    if kind == "heading":
+        level = _heading_level_from_html(prev_html)
+        level = min(max(level, 1), 3)
+        cls = " slide-h1" if level == 1 else (" slide-h2" if level == 2 else "")
+        return f"<h{level} class=\"{cls.strip()}\">{esc}</h{level}>"
+    if kind == "list_item":
+        return _wrap_list_item_html(f"<p>{esc_br}</p>")
+    if kind == "math":
+        raw = text.strip()
+        if not (
+            raw.startswith("$$")
+            or (raw.startswith("$") and raw.endswith("$"))
+            or raw.startswith("\\[")
+            or raw.startswith("\\(")
+        ):
+            raw = f"$$\n{raw}\n$$"
+        return _math_to_mathml(raw)
+    if kind == "quote":
+        body = "".join(f"<p>{html_module.escape(ln)}</p>" for ln in text.splitlines() or [""])
+        return f"<blockquote>{body}</blockquote>"
+    if kind == "code":
+        return f"<pre><code>{esc}</code></pre>"
+    if kind == "image":
+        # Keep previous html if content is not markdown; otherwise re-render
+        if (content or "").strip().startswith("![") or "<img" in (content or "").lower():
+            return _image_payload_to_html(content)
+        return prev_html or _image_payload_to_html(content)
+    # paragraph / default
+    return f"<p class='slide-p'>{esc_br}</p>"
+
+
+def _serialize_note_element(el: "Element") -> str:
+    """Turn one note Element back into markdown-ish source for the notebook."""
+    content = (el.content or "").strip()
+    kind = (el.kind or "paragraph").lower()
+    if kind == "heading":
+        level = _heading_level_from_html(el.html)
+        level = min(max(level, 1), 3)
+        return f"{'#' * level} {content}".rstrip()
+    if kind == "list_item":
+        if not content:
+            return "-"
+        lines = content.splitlines()
+        out_lines = [f"- {lines[0]}"]
+        for ln in lines[1:]:
+            out_lines.append(f"  {ln}" if ln.strip() else "")
+        return "\n".join(out_lines)
+    if kind == "math":
+        c = content
+        if c.startswith("$$") or c.startswith("$") or c.startswith("\\[") or c.startswith("\\("):
+            return c
+        return f"$$\n{c}\n$$"
+    if kind == "quote":
+        if not content:
+            return ">"
+        return "\n".join(f"> {ln}" for ln in content.splitlines())
+    if kind == "code":
+        return f"```\n{content}\n```"
+    if kind == "image":
+        return content or "![image]()"
+    if kind == "table":
+        # Prefer original content if it already looks like a table; else leave as-is
+        return content
+    return content
+
+
+def rebuild_note_source(deck: "Deck", cell_id: str) -> str:
+    """Reassemble a note cell's dialog source from its ordered elements."""
+    cell = deck.cells.get(cell_id)
+    if cell is None or cell.kind != "note":
+        raise KeyError(f"note cell {cell_id!r} not found")
+    chunks: list[str] = []
+    for el_id in cell.element_ids:
+        el = deck.elements.get(el_id)
+        if el is None:
+            continue
+        piece = _serialize_note_element(el)
+        if piece.strip() or el.kind == "list_item":
+            chunks.append(piece)
+    return "\n\n".join(chunks).rstrip() + ("\n" if chunks else "")
+
+
+def apply_note_piece_edit(deck: "Deck", el_id: str, text: str) -> tuple[str, str] | None:
+    """Update one note piece from in-slide text edit; return ``(cell_id, source)``.
+
+    Rebuilds the full note cell source so SolveIt dialog write-back matches the
+    deck (same idea as code textarea → dialog).
+    """
+    el = deck.elements.get(el_id)
+    if el is None:
+        return None
+    cell = deck.cells.get(el.cell_id)
+    if cell is None or cell.kind != "note":
+        return None
+    # Images / tables: only accept plain edits when content is simple text
+    kind = (el.kind or "paragraph").lower()
+    if kind in ("image", "table", "html") and not (text or "").strip():
+        return None
+    new_text = text if text is not None else ""
+    # Normalize list item text (strip a leading bullet the browser may include)
+    if kind == "list_item":
+        new_text = re.sub(r"^\s*([-*+]|\d+\.)\s+", "", new_text.strip())
+    el.content = new_text
+    el.html = _render_note_piece_html(kind, new_text, el.html)
+    source = rebuild_note_source(deck, cell.id)
+    cell.source = source
+    return cell.id, source
+
+
 def _parse_note_to_elements_basic(source: str, cell_id: str) -> list[dict]:
     """Line-heuristic fallback when mistletoe is unavailable."""
     out: list[dict] = []
@@ -3316,9 +3439,12 @@ def _slide_html(deck: Deck, slide: Slide, *, active: bool = False) -> str:
                 style = _el_style(spec)
                 kind = html_module.escape(el.kind or "paragraph")
                 body = el.html if el.html else _note_to_html(el.content or cell.source)
+                # data-content: plain source for in-slide text edit → notebook write-back
+                plain = html_module.escape(el.content or "", quote=True)
                 parts.append(
                     f'<div id="{eid}" class="note-block" data-el-id="{eid}" '
-                    f'data-type="{kind}" data-cell-id="{html_module.escape(cid)}"'
+                    f'data-type="{kind}" data-cell-id="{html_module.escape(cid)}" '
+                    f'data-content="{plain}"'
                     f'{_reveal_attr(spec)}{_style_attr(style)}>{body}</div>'
                 )
         else:
@@ -3554,6 +3680,17 @@ def generate_presenter_html(
     body.editing .el-editsel.el-primary {{ outline-color:#60a5fa; box-shadow:0 0 0 1px rgba(96,165,250,0.45); }}
     body.editing img {{ -webkit-user-drag:none; user-drag:none; }}
     body.editing .code-toolbar {{ cursor:move; }}
+    /* In-slide note text edit (double-click) → writes back to notebook source */
+    body.editing .note-block[data-type="heading"],
+    body.editing .note-block[data-type="paragraph"],
+    body.editing .note-block[data-type="list_item"],
+    body.editing .note-block[data-type="quote"],
+    body.editing .note-block[data-type="math"] {{
+      cursor: grab; }}
+    body.editing .note-block.note-text-editing {{
+      cursor: text !important; outline: 2px solid #34d399 !important; outline-offset: 2px;
+      min-height: 1.2em; background: rgba(16, 185, 129, 0.06); }}
+    body.editing .note-block.note-text-editing * {{ cursor: text !important; }}
     #edit-toolbar input[type=color] {{
       width:28px; height:24px; padding:0; border:1px solid #4b5563; border-radius:4px;
       background:#1f2937; cursor:pointer; }}
@@ -4145,7 +4282,12 @@ def generate_presenter_html(
       document.getElementById('edit-btn')?.classList.toggle('on', editing);
       // Keep parent index fresh so a layout-save rebuild can restore this slide
       try {{ window.parent.__sslive_slide_index = currentSlide; }} catch (e) {{}}
-      if (!editing) selectEl(null);
+      if (!editing) {{
+        // Commit any open note text edit before leaving ✎
+        const open = document.querySelector('.note-block.note-text-editing');
+        if (open) commitNoteTextEdit(open);
+        selectEl(null);
+      }}
       applyFragments();  // show all while editing; restore hide when done
       // Leaving edit mode: persist layout once (host drains patches + save_layout)
       if (was && !editing) {{
@@ -4154,6 +4296,111 @@ def generate_presenter_html(
           window.parent.postMessage({{ type: 'sslive_layout_flush', t: Date.now() }}, '*');
         }} catch (e) {{}}
       }}
+    }}
+
+    // ── Note text edit (contenteditable) → notebook source write-back ──
+    const NOTE_EDIT_KINDS = {{
+      heading: 1, paragraph: 1, list_item: 1, quote: 1, math: 1
+    }};
+    function notePlainText(el) {{
+      if (!el) return '';
+      const type = el.dataset.type || '';
+      if (type === 'list_item') {{
+        const li = el.querySelector('li');
+        return ((li ? li.innerText : el.innerText) || '').replace(/^\\s*([-*+]|\\d+\\.)\\s+/, '').trim();
+      }}
+      if (type === 'heading') {{
+        const h = el.querySelector('h1,h2,h3,h4,h5,h6');
+        return ((h ? h.innerText : el.innerText) || '').trim();
+      }}
+      if (type === 'math') {{
+        // Prefer stored latex source; fall back to visible text
+        const stored = (el.dataset.content || '').trim();
+        if (stored) return stored;
+        return (el.innerText || '').trim();
+      }}
+      return (el.innerText || '').trim();
+    }}
+    function escapeNoteHtml(s) {{
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }}
+    function applyNoteTextLocal(el, text) {{
+      const kind = el.dataset.type || 'paragraph';
+      const t = text == null ? '' : String(text);
+      el.dataset.content = t;
+      if (kind === 'list_item') {{
+        el.innerHTML = '<ul class="note-list"><li class="note-li">'
+          + escapeNoteHtml(t).replace(/\\n/g, '<br/>') + '</li></ul>';
+      }} else if (kind === 'heading') {{
+        const prev = el.querySelector('h1,h2,h3,h4,h5,h6');
+        const tag = (prev && prev.tagName) ? prev.tagName.toLowerCase() : 'h2';
+        const cls = tag === 'h1' ? 'slide-h1' : (tag === 'h2' ? 'slide-h2' : '');
+        el.innerHTML = '<' + tag + (cls ? ' class="' + cls + '"' : '') + '>'
+          + escapeNoteHtml(t) + '</' + tag + '>';
+      }} else if (kind === 'math') {{
+        el.innerHTML = '<div class="math-block">' + escapeNoteHtml(t) + '</div>';
+      }} else if (kind === 'quote') {{
+        const lines = t.split('\\n');
+        el.innerHTML = '<blockquote>' + lines.map(function (ln) {{
+          return '<p>' + escapeNoteHtml(ln) + '</p>';
+        }}).join('') + '</blockquote>';
+      }} else {{
+        el.innerHTML = '<p class="slide-p">' + escapeNoteHtml(t).replace(/\\n/g, '<br/>') + '</p>';
+      }}
+    }}
+    function postNoteTextEdit(el, text) {{
+      const elId = el.dataset.elId || el.id;
+      const cellId = el.dataset.cellId || '';
+      const kind = el.dataset.type || '';
+      try {{ window.parent.__sslive_slide_index = currentSlide; }} catch (e) {{}}
+      try {{
+        window.parent.postMessage({{
+          type: 'sslive_note_edit',
+          el_id: elId,
+          cell_id: cellId,
+          text: text,
+          kind: kind,
+          slide_index: currentSlide,
+          t: Date.now()
+        }}, '*');
+      }} catch (e) {{}}
+    }}
+    function beginNoteTextEdit(el) {{
+      if (!editing || !el || !NOTE_EDIT_KINDS[el.dataset.type || '']) return;
+      // One editor at a time
+      document.querySelectorAll('.note-block.note-text-editing').forEach(function (o) {{
+        if (o !== el) commitNoteTextEdit(o);
+      }});
+      el.dataset.origContent = notePlainText(el);
+      el.contentEditable = 'true';
+      el.classList.add('note-text-editing');
+      el.focus({{ preventScroll: true }});
+      try {{
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }} catch (e) {{}}
+    }}
+    function commitNoteTextEdit(el) {{
+      if (!el || el.contentEditable !== 'true') return;
+      const text = notePlainText(el);
+      el.contentEditable = 'false';
+      el.classList.remove('note-text-editing');
+      applyNoteTextLocal(el, text);
+      postNoteTextEdit(el, text);
+      placeRsBox();
+      placeToolbar();
+    }}
+    function cancelNoteTextEdit(el) {{
+      if (!el || el.contentEditable !== 'true') return;
+      const orig = el.dataset.origContent;
+      el.contentEditable = 'false';
+      el.classList.remove('note-text-editing');
+      if (orig != null) applyNoteTextLocal(el, orig);
     }}
 
     function paintSelection() {{
@@ -4641,9 +4888,32 @@ def generate_presenter_html(
       return {{}};
     }}
 
+    // Double-click a note piece in edit mode → edit text (writes back to notebook)
+    document.addEventListener('dblclick', (e) => {{
+      if (!editing) return;
+      if (e.target.closest('#edit-toolbar, #info-pop, #nav, #live-code-pop')) return;
+      const nb = e.target.closest('.note-block');
+      if (!nb || !NOTE_EDIT_KINDS[nb.dataset.type || '']) return;
+      e.preventDefault();
+      e.stopPropagation();
+      selectEl(nb);
+      beginNoteTextEdit(nb);
+    }}, true);
+
     document.addEventListener('pointerdown', (e) => {{
       if (!editing || e.button !== 0) return;
       if (e.target.closest('#edit-toolbar, #info-pop, #nav, #chrome')) return;
+      // Clicks inside a contenteditable note: type, don't drag
+      const editingNote = e.target.closest('.note-block.note-text-editing');
+      if (editingNote) {{
+        e.stopPropagation();
+        return;
+      }}
+      // Click outside open text editor → commit
+      const openNote = document.querySelector('.note-block.note-text-editing');
+      if (openNote && !openNote.contains(e.target)) {{
+        commitNoteTextEdit(openNote);
+      }}
       const rh = e.target.closest('#rs-box .rs-handle, .rs-handle');
       if (rh) {{
         if (!editSels.length) return;
@@ -4734,6 +5004,7 @@ def generate_presenter_html(
       if (el) {{
         if (multiKey) selectEl(el, {{ toggle: true }});
         else if (!isSelected(el)) selectEl(el);
+        // Drag to move; double-click (separate handler) edits text
         beginDrag(el, e);
         return;
       }}
@@ -4913,6 +5184,23 @@ def generate_presenter_html(
         if (e.key === 'ArrowUp')    nudgeSel(0, -step);
         if (e.key === 'ArrowDown')  nudgeSel(0, step);
         placeRsBox();
+        return;
+      }}
+      // Note text edit: Enter commits (Shift+Enter = newline); Esc cancels
+      const noteEd = e.target && e.target.closest && e.target.closest('.note-block.note-text-editing');
+      if (editing && noteEd) {{
+        if (e.key === 'Escape') {{
+          e.preventDefault();
+          cancelNoteTextEdit(noteEd);
+          return;
+        }}
+        if (e.key === 'Enter' && !e.shiftKey) {{
+          e.preventDefault();
+          commitNoteTextEdit(noteEd);
+          return;
+        }}
+        // Don't let arrows nudge while typing
+        e.stopPropagation();
         return;
       }}
       // Escape clears multi-selection while editing (not fullscreen)
@@ -5331,6 +5619,7 @@ def generate_presenter_html(
       <li><kbd>Shift</kbd>+<kbd>Enter</kbd> · run code</li>
       <li><kbd>e</kbd> · edit layout on/off (saves on exit)</li>
       <li><kbd>Shift</kbd>/<kbd>⌘</kbd>+click · multi-select</li>
+      <li>Double-click note · edit text (saves to notebook)</li>
       <li><kbd>Alt</kbd>+arrows · nudge 10px · drag · move group</li>
       <li><kbd>f</kbd> · fullscreen</li>
       <li><kbd>Esc</kbd> · clear selection / leave fullscreen</li>
@@ -6887,9 +7176,9 @@ async def _sync_and_run(cell_id: str, source: str, *, slide_index: int | None = 
 
 
 async def sync_dialog() -> int:
-    """Write current deck code sources into SolveIt dialog cells.
+    """Write current deck sources (code + notes) into SolveIt dialog cells.
 
-    Also flushes sources queued during fullscreen Runs.
+    Also flushes sources queued during fullscreen Runs / note text edits.
     Uses ``hold_dialog_focus`` so SolveIt does not jump to each updated cell.
     """
     deck = _SESSION.get("deck")
@@ -6898,22 +7187,31 @@ async def sync_dialog() -> int:
     pending = _SESSION.get("pending_dialog_sync") or {}
     for cid, src in pending.items():
         if cid in deck.cells:
-            _apply_source_to_deck(cid, src)
+            if deck.cells[cid].kind == "code":
+                _apply_source_to_deck(cid, src)
+            else:
+                deck.cells[cid].source = src
     _SESSION["pending_dialog_sync"] = {}
+
+    # Code cells + note cells that have element pieces
+    ids = list(deck.ordered_code_ids)
+    for cid, cell in deck.cells.items():
+        if cell.kind == "note" and cid not in ids:
+            ids.append(cid)
 
     n = 0
     async with hold_dialog_focus(
-        ms=2000 + 500 * max(1, len(deck.ordered_code_ids)),
+        ms=2000 + 500 * max(1, len(ids)),
         refocus=True,
         soft=True,
         settle=0.12,
     ):
-        for cid in deck.ordered_code_ids:
+        for cid in ids:
             src = deck.cells[cid].source
             if await write_back_cell(cid, src):
                 n += 1
                 print(f"sslive: dialog sync {cid} ({len(src)} chars)")
-    print(f"sslive: synced {n}/{len(deck.ordered_code_ids)} code cells → dialog")
+    print(f"sslive: synced {n}/{len(ids)} cells → dialog")
     return n
 
 
@@ -6959,6 +7257,24 @@ if (!window.__sslive_layout_bridge_v1) {
     window.__sslive_layout_q.push({
       el_id: String(d.el_id),
       patch: d.patch || {},
+      slide_index: d.slide_index,
+      t: d.t || Date.now()
+    });
+  });
+}
+// Note text edit queue (in-slide contenteditable → notebook source)
+if (!window.__sslive_note_bridge_v1) {
+  window.__sslive_note_bridge_v1 = true;
+  window.__sslive_note_q = window.__sslive_note_q || [];
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || d.type !== 'sslive_note_edit' || !d.el_id) return;
+    if (d.slide_index != null) window.__sslive_slide_index = d.slide_index;
+    window.__sslive_note_q.push({
+      el_id: String(d.el_id),
+      cell_id: d.cell_id == null ? '' : String(d.cell_id),
+      text: d.text == null ? '' : String(d.text),
+      kind: d.kind == null ? '' : String(d.kind),
       slide_index: d.slide_index,
       t: d.t || Date.now()
     });
@@ -7091,33 +7407,40 @@ def _item_dicts(seq: Any, fields: tuple[str, ...]) -> list[dict]:
     return out
 
 
-async def _drain_slide_queue() -> tuple[list[dict], list[dict], bool]:
-    """Pull pending (runs, layout patches, flush flag) from the parent page.
+async def _drain_slide_queue() -> tuple[list[dict], list[dict], bool, list[dict]]:
+    """Pull pending runs, layout patches, flush flag, and note text edits.
 
-    One js_eval round-trip drains ``__sslive_q``, ``__sslive_layout_q``, and
-    ``__sslive_layout_flush`` (set when leaving edit mode).
+    One js_eval round-trip drains ``__sslive_q``, ``__sslive_layout_q``,
+    ``__sslive_note_q``, and ``__sslive_layout_flush`` (leave-edit).
     """
     if js_eval is None and js_eval_a is None:
-        return [], [], False
+        return [], [], False, []
     try:
         res = await _call_js_eval(
             "const r = (window.__sslive_q || []).slice(); "
             "window.__sslive_q = []; "
             "const l = (window.__sslive_layout_q || []).slice(); "
             "window.__sslive_layout_q = []; "
+            "const n = (window.__sslive_note_q || []).slice(); "
+            "window.__sslive_note_q = []; "
             "const f = !!window.__sslive_layout_flush; "
             "window.__sslive_layout_flush = false; "
-            "return {runs: r, layouts: l, flush: f};"
+            "return {runs: r, layouts: l, notes: n, flush: f};"
         )
         q = _parse_js_eval_result(res)
         if q is None:
-            return [], [], False
+            return [], [], False, []
         flush = False
-        if isinstance(q, dict) and ("runs" in q or "layouts" in q or "flush" in q):
+        notes_raw = None
+        if isinstance(q, dict) and (
+            "runs" in q or "layouts" in q or "flush" in q or "notes" in q
+        ):
             runs_raw, layouts_raw = q.get("runs"), q.get("layouts")
+            notes_raw = q.get("notes")
             flush = bool(q.get("flush"))
         elif hasattr(q, "runs") or hasattr(q, "layouts"):
             runs_raw, layouts_raw = getattr(q, "runs", None), getattr(q, "layouts", None)
+            notes_raw = getattr(q, "notes", None)
             flush = bool(getattr(q, "flush", False))
         else:  # old bridge on the page: bare run list
             runs_raw, layouts_raw = q, None
@@ -7125,12 +7448,13 @@ async def _drain_slide_queue() -> tuple[list[dict], list[dict], bool]:
             _item_dicts(runs_raw, ("cell_id", "source", "slide_index")),
             _item_dicts(layouts_raw, ("el_id", "patch", "t", "slide_index")),
             flush,
+            _item_dicts(notes_raw, ("el_id", "cell_id", "text", "kind", "slide_index")),
         )
     except Exception as e:
         if _SESSION.get("_bridge_err") != str(e):
             _SESSION["_bridge_err"] = str(e)
             print(f"sslive: bridge poll error: {e}")
-        return [], [], False
+        return [], [], False, []
 
 
 def _apply_slide_layout_patches(items: list[dict]) -> int:
@@ -7180,14 +7504,74 @@ def _apply_slide_layout_patches(items: list[dict]) -> int:
     return n
 
 
+def _apply_note_text_edits(items: list[dict]) -> dict[str, str]:
+    """Apply in-slide note text edits to the deck; return ``{cell_id: source}``.
+
+    Does not write the dialog — caller queues ``pending_dialog_sync`` / flush.
+    """
+    deck: Deck | None = _SESSION.get("deck")
+    if deck is None or not items:
+        return {}
+    updated: dict[str, str] = {}
+    for it in items:
+        el_id = str(it.get("el_id") or "")
+        if not el_id:
+            continue
+        sidx = it.get("slide_index")
+        if sidx is not None:
+            try:
+                _SESSION["slide_index"] = max(0, int(sidx))
+            except (TypeError, ValueError):
+                pass
+        try:
+            res = apply_note_piece_edit(
+                deck, el_id, str(it.get("text") if it.get("text") is not None else "")
+            )
+        except Exception as e:
+            _SESSION["_note_edit_err"] = f"{el_id}: {e}"
+            continue
+        if not res:
+            continue
+        cid, src = res
+        updated[cid] = src
+        _queue_dialog_sync(cid, src)
+    if updated:
+        _SESSION["_note_edit_cells"] = list(updated.keys())
+    return updated
+
+
+async def _flush_note_dialog_writes(cells: dict[str, str], *, refocus: bool = True) -> int:
+    """Write rebuilt note cell sources into the SolveIt dialog."""
+    if not cells:
+        return 0
+    # Merge with any other pending code/note sources
+    pending = dict(_SESSION.get("pending_dialog_sync") or {})
+    pending.update(cells)
+    for cid, src in cells.items():
+        pending[cid] = src
+    _SESSION["pending_dialog_sync"] = {}
+    n = 0
+    async with hold_dialog_focus(
+        ms=2000 + 500 * max(1, len(pending)),
+        refocus=refocus,
+        soft=True,
+        settle=0.12 if refocus else 0.0,
+    ):
+        for cid, src in pending.items():
+            if await write_back_cell(cid, src):
+                n += 1
+    return n
+
+
 async def _bridge_poll_loop() -> None:
-    """Background: apply in-slide Run requests + edit-mode layout patches."""
+    """Background: apply in-slide Run, layout patches, and note text edits."""
     while _SESSION.get("bridge_active"):
         try:
-            pending, layout_patches, want_flush = await _drain_slide_queue()
+            pending, layout_patches, want_flush, note_edits = await _drain_slide_queue()
             # layout first: a Run in the same batch re-renders the output
             # block and must see the just-dragged position
             _apply_slide_layout_patches(layout_patches)
+            note_cells = _apply_note_text_edits(note_edits)
             # Edit-mode exit → persist layout (quiet: no focus/restore thrash).
             # While fullscreen, flush defers the dialog write until FS ends.
             if want_flush:
@@ -7195,6 +7579,14 @@ async def _bridge_poll_loop() -> None:
                     await flush_layout_save(quiet=True)
                 except Exception as e:
                     _SESSION["_layout_flush_err"] = str(e)
+                # Also flush note text → dialog when leaving edit
+                if note_cells or _SESSION.get("pending_dialog_sync"):
+                    try:
+                        await _flush_note_dialog_writes(
+                            note_cells or {}, refocus=True
+                        )
+                    except Exception as e:
+                        _SESSION["_note_flush_err"] = str(e)
             elif _SESSION.get("_layout_pending_fs_flush") or _SESSION.get(
                 "_layout_dirty"
             ):
@@ -7207,6 +7599,13 @@ async def _bridge_poll_loop() -> None:
                             await flush_layout_save(quiet=True)
                 except Exception as e:
                     _SESSION["_layout_flush_err"] = str(e)
+            elif note_cells and _SESSION.get("auto_sync_dialog", True):
+                # Debounced write-back of note text (like code after Run)
+                try:
+                    await asyncio.sleep(0.15)
+                    await _flush_note_dialog_writes(note_cells, refocus=True)
+                except Exception as e:
+                    _SESSION["_note_flush_err"] = str(e)
             for item in pending:
                 if not isinstance(item, dict):
                     continue
@@ -7254,8 +7653,14 @@ async def pump_slide_runs(max_items: int = 20) -> int:
     """Manually drain in-slide Run queue (if background poll is not running)."""
     n = 0
     for _ in range(max_items):
-        pending, layout_patches, want_flush = await _drain_slide_queue()
+        pending, layout_patches, want_flush, note_edits = await _drain_slide_queue()
         _apply_slide_layout_patches(layout_patches)
+        note_cells = _apply_note_text_edits(note_edits)
+        if note_cells:
+            try:
+                await _flush_note_dialog_writes(note_cells, refocus=False)
+            except Exception as e:
+                _SESSION["_note_flush_err"] = str(e)
         if want_flush:
             try:
                 await flush_layout_save()
@@ -8196,6 +8601,8 @@ __all__ = [
     "LiveSession",
     "build_deck",
     "parse_note_to_elements",
+    "rebuild_note_source",
+    "apply_note_piece_edit",
     "sslive",
     "session",
     "register_sslive",
