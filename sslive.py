@@ -1414,9 +1414,10 @@ def _el_style(spec: dict) -> str:
         v = _css_len(spec.get(key))
         if v is not None:
             parts.append(f"{prop}:{v}px")
-    # Explicit height pins a box like Google slides — scroll rather than spill.
+    # Height pin: keep overflow visible so text/math never gets an inner scrollbar.
+    # (CSS forces height:auto on note text kinds; outputs still use height for plots.)
     if spec.get("h") is not None:
-        parts.append("overflow:auto")
+        parts.append("overflow:visible")
     for key, prop in (("z", "z-index"), ("order", "order")):
         try:
             if spec.get(key) is not None:
@@ -3515,16 +3516,27 @@ def generate_presenter_html(
     #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
     #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
     .slide {{ width:1920px; height:1080px; padding:48px 72px; display:none; flex-direction:column;
-      justify-content:flex-start; align-items:stretch; overflow:auto; gap:10px; position:relative; }}
+      justify-content:flex-start; align-items:stretch; overflow:hidden; gap:10px; position:relative; }}
     .slide.active {{ display:flex; }}
     .slide.hidden {{ display:none; }}
+    /* Edit mode: allow panning the stage if freeform boxes extend past the frame */
+    body.editing .slide {{ overflow:auto; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
     /* Regular slides: large type, tight vertical rhythm for projection */
     .slide:not(.title-slide) {{ padding:56px 96px; gap:12px; }}
     /* Base ~44px body; headings scale in em so layout `fs` still works.
        Text color lives on .note-block so layout `color` / toolbar recolor
        cascades into p/li/bullets (do not hard-code color on children). */
-    .note-block {{ font-size:2.75rem; color:{theme.get("fg", "#eee")}; }}
+    .note-block {{ font-size:2.75rem; color:{theme.get("fg", "#eee")};
+      overflow:visible; max-width:100%; }}
+    /* Text pieces grow with content — never pin a short box that needs a scrollbar */
+    .note-block[data-type="heading"],
+    .note-block[data-type="paragraph"],
+    .note-block[data-type="list_item"],
+    .note-block[data-type="quote"],
+    .note-block[data-type="math"] {{
+      height:auto !important; max-height:none !important; overflow:visible !important;
+      box-sizing:border-box; }}
     .title-slide .note-block {{ font-size:2.5rem; }}
     .slide-h1, .note-block h1 {{ font-size:2.35em; font-weight:700; margin:0 0 0.35rem;
       line-height:1.12; letter-spacing:-0.02em; color:inherit; }}
@@ -3549,8 +3561,8 @@ def generate_presenter_html(
     .note-block[data-type="list_item"] {{ margin:0.08rem 0; }}
     .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.2em; color:inherit; }}
     .note-block[data-type="math"] {{ margin:0.45rem 0; }}
-    .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow-x:auto;
-      font-size:1.2em; }}
+    .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow:visible;
+      font-size:1.2em; max-width:100%; }}
     .note-block .math-inline {{ display:inline; font-size:1.05em; }}
     .note-block[data-type="image"], .note-block .note-image {{ margin:0.5rem 0; }}
     .note-block .note-image {{ margin:0; }}
@@ -4707,11 +4719,16 @@ def generate_presenter_html(
         el.style.top = s.y + 'px';
         el.style.width = s.w + 'px';
         const patch = {{ x: s.x, y: s.y, w: s.w }};
-        // Code bars stay content-tall (one-line); pin h for notes/outputs only
-        if (!isCode) {{
+        // Code bars: one-line. Note text: width only (height auto — no scrollbar).
+        // Outputs/plots: pin height for the viz box.
+        const isNote = el.classList.contains('note-block');
+        if (!isCode && !isNote) {{
           el.style.height = s.h + 'px';
-          el.style.overflow = 'auto';
+          el.style.overflow = 'hidden';
           patch.h = s.h;
+        }} else if (isNote) {{
+          el.style.height = '';
+          el.style.overflow = 'visible';
         }}
         sendLayoutPatch(s.elId, patch);
       }});
@@ -4839,9 +4856,13 @@ def generate_presenter_html(
           m.el.style.top = ny + 'px';
           m.el.style.width = nw + 'px';
           const isCode = m.el.classList.contains('code-wrap') || m.el.dataset.type === 'code';
-          if (!isCode) {{
+          const isNote = m.el.classList.contains('note-block');
+          if (!isCode && !isNote) {{
             m.el.style.height = nh + 'px';
-            m.el.style.overflow = 'auto';
+            m.el.style.overflow = 'hidden';
+          }} else if (isNote) {{
+            m.el.style.height = '';
+            m.el.style.overflow = 'visible';
           }}
           let fs = null;
           if (scaleFs && m.ofs) {{
@@ -4850,7 +4871,10 @@ def generate_presenter_html(
             m.el.style.fontSize = fs + 'px';
             m.el.style.setProperty('--code-fs', fs + 'px');
           }}
-          return {{ elId: m.elId, x: nx, y: ny, w: nw, h: isCode ? null : nh, fs: fs, isCode }};
+          return {{
+            elId: m.elId, x: nx, y: ny, w: nw,
+            h: (isCode || isNote) ? null : nh, fs: fs, isCode, isNote
+          }};
         }});
       }} else {{
         const el = state.el;
@@ -4867,11 +4891,17 @@ def generate_presenter_html(
         el.style.top = y + 'px';
         if (touchW) el.style.width = w + 'px';
         const isCode = el.classList.contains('code-wrap') || el.dataset.type === 'code';
-        if (touchH && !isCode) {{
+        const isNote = el.classList.contains('note-block');
+        // Outputs keep height; note text always auto-height (no scrollbar)
+        if (touchH && !isCode && !isNote) {{
           el.style.height = h + 'px';
-          el.style.overflow = 'auto';
+          el.style.overflow = 'hidden';
         }}
-        state.touchH = touchH && !isCode;
+        if (isNote) {{
+          el.style.height = '';
+          el.style.overflow = 'visible';
+        }}
+        state.touchH = touchH && !isCode && !isNote;
       }}
       const box = document.getElementById('rs-box');
       if (box) {{
@@ -5440,15 +5470,20 @@ def generate_presenter_html(
           const er = el.getBoundingClientRect();
           const h = Math.max(isCode ? 34 : 24, Math.round(er.height / sc));
           const w = Math.max(40, Math.round(er.width / sc));
-          if (!isCode) {{
+          const isNote = el.classList.contains('note-block');
+          // Note text: never pin height (avoids inner scrollbars); outputs may.
+          if (!isCode && !isNote) {{
             el.style.height = h + 'px';
-            el.style.overflow = 'auto';
+            el.style.overflow = 'hidden';
+          }} else {{
+            el.style.height = '';
+            el.style.overflow = 'visible';
           }}
           sendLayoutPatch(elId, {{
             x: startX,
             y: startY,
             w: w,
-            h: isCode ? null : h,
+            h: (isCode || isNote) ? null : h,
             z: null,
             order: null,
             reveal: null,
@@ -5791,12 +5826,20 @@ def generate_export_html(
     #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
     #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
     .slide {{ width:1920px; height:1080px; padding:48px 72px; display:none; flex-direction:column;
-      justify-content:flex-start; align-items:stretch; overflow:auto; gap:10px; position:relative; }}
+      justify-content:flex-start; align-items:stretch; overflow:hidden; gap:10px; position:relative; }}
     .slide.active {{ display:flex; }}
     .slide.hidden {{ display:none; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
     .slide:not(.title-slide) {{ padding:56px 96px; gap:12px; }}
-    .note-block {{ font-size:2.75rem; color:{theme.get("fg", "#eee")}; }}
+    .note-block {{ font-size:2.75rem; color:{theme.get("fg", "#eee")};
+      overflow:visible; max-width:100%; }}
+    .note-block[data-type="heading"],
+    .note-block[data-type="paragraph"],
+    .note-block[data-type="list_item"],
+    .note-block[data-type="quote"],
+    .note-block[data-type="math"] {{
+      height:auto !important; max-height:none !important; overflow:visible !important;
+      box-sizing:border-box; }}
     .title-slide .note-block {{ font-size:2.5rem; }}
     .slide-h1, .note-block h1 {{ font-size:2.35em; font-weight:700; margin:0 0 0.35rem;
       line-height:1.12; letter-spacing:-0.02em; color:inherit; }}
@@ -5820,8 +5863,8 @@ def generate_export_html(
     .note-block[data-type="list_item"] {{ margin:0.08rem 0; }}
     .note-block[data-type="list_item"] .note-list {{ margin:0; padding-left:1.2em; color:inherit; }}
     .note-block[data-type="math"] {{ margin:0.45rem 0; }}
-    .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow-x:auto;
-      font-size:1.2em; }}
+    .note-block .math-block {{ text-align:center; margin:0.4em 0; overflow:visible;
+      font-size:1.2em; max-width:100%; }}
     .note-block .math-inline {{ display:inline; font-size:1.05em; }}
     .note-block img, .note-block[data-type="image"] img {{
       max-width:100%; height:auto; display:block; border-radius:6px; }}
