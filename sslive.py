@@ -295,11 +295,11 @@ _USAGE_PRINTED = False
 
 
 def print_usage(*, force: bool = False) -> None:
-    """Emit :data:`SSLIVE_USAGE` into the notebook cell output (for the LLM).
+    """Emit :data:`SSLIVE_USAGE` **once** into the notebook cell output (for the LLM).
 
-    Called on every ``%run sslive.py``. Uses **both** stdout and IPython
-    ``display`` — SolveIt sometimes drops bare stream output from ``%run``
-    but keeps rich display payloads.
+    Prefer a single IPython rich display (SolveIt captures it reliably). Fall
+    back to stdout only if display is unavailable — never both (that double-
+    printed the note).
     """
     global _USAGE_PRINTED
     if not force and _USAGE_PRINTED:
@@ -307,21 +307,7 @@ def print_usage(*, force: bool = False) -> None:
     text = SSLIVE_USAGE if SSLIVE_USAGE.endswith("\n") else SSLIVE_USAGE + "\n"
     any_ok = False
 
-    # 1) stdout stream
-    try:
-        import sys
-
-        sys.stdout.write(text)
-        sys.stdout.flush()
-        any_ok = True
-    except Exception:
-        try:
-            print(SSLIVE_USAGE, flush=True)
-            any_ok = True
-        except Exception:
-            pass
-
-    # 2) IPython rich display (reliable in SolveIt dialog cells)
+    # 1) One rich display payload (preferred)
     if display is not None:
         try:
             if IPyHTML is not None:
@@ -340,6 +326,21 @@ def print_usage(*, force: bool = False) -> None:
             any_ok = True
         except Exception:
             pass
+
+    # 2) stdout only if display failed / unavailable
+    if not any_ok:
+        try:
+            import sys
+
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            any_ok = True
+        except Exception:
+            try:
+                print(SSLIVE_USAGE, flush=True)
+                any_ok = True
+            except Exception:
+                pass
 
     # 3) Last resort: InteractiveShell write
     if not any_ok and get_ipython is not None:
@@ -8559,7 +8560,9 @@ def register_sslive() -> bool:
 
 def load_ipython_extension(ip=None) -> None:
     """``%load_ext sslive`` / auto on ``%run`` when possible."""
-    print_usage(force=True)
+    # Usage is already printed by ``_bootstrap_on_load`` on %run; only print
+    # here if the module was imported without bootstrap having run.
+    print_usage(force=False)
     _register_sslive_magic(quiet=True)
 
 
