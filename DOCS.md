@@ -105,12 +105,14 @@ One dialog note (auto-created under the preview):
 
 ```text
 #| sslive-layout
-{ "version": 1, "elements": { "el-code-_abc": {"x":120,"y":80,"w":900}, … } }
+{ "version": 1, "elements": { "el-code-_abc": {"x":120,"y":80,"w":900}, … },
+  "deck": { "theme": "dark", "background": {…} } }
 ```
 
 - `skipped=1` (not LLM / not a slide)
 - Coordinates in design px (1920×1080)
 - Absent keys → document flow
+- `deck.theme` / `deck.background` — gear menu (see below)
 
 ### Interaction
 
@@ -125,7 +127,34 @@ One dialog note (auto-created under the preview):
 ### Save policy
 
 While editing: DOM + in-memory `deck.layout` only.  
-On leave edit / `%sslive` / `flush_layout_save`: write the layout note.  
+On leave edit / `%sslive` / `flush_layout_save`: write the layout note.
+
+### Chrome: pencil vs gear
+
+Nav: **`[✎] [⚙] [‹ n/N ›]`**
+
+| Control | Role |
+|---------|------|
+| **✎** pencil | Freeform layout edit only (drag, multi-select, text edit). Saves on exit. |
+| **⚙** gear | Deck settings: **Dark/Light** theme, **background** color/image/clear, status, shortcuts |
+
+Theme + background persist in the layout note under `layout.deck`:
+
+```json
+{
+  "version": 1,
+  "elements": { "…": {} },
+  "deck": {
+    "theme": "dark",
+    "background": { "color": "#1a1a2e", "image": "data:image/…" }
+  }
+}
+```
+
+- Default open (`theme=None`) restores `layout.deck` (dark if unset).
+- `await sslive(theme="light")` forces light for that open and writes it into the layout.
+- Custom background overrides the theme palette background; **Clear** returns to theme bg.
+- Logo and per-slide backgrounds are deferred.  
 While fullscreen: dialog write may be deferred until FS ends (avoids iframe remount).
 
 ### API

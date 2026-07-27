@@ -180,9 +180,10 @@ class Deck:
     elements: dict[str, Element] = field(default_factory=dict)
     theme: dict = field(default_factory=dict)
     ordered_code_ids: list[str] = field(default_factory=list)
-    # S2 layout overlay: {"version":1, "elements":{el_id: spec}, "deck":{}}.
-    # Kept JSON-shaped (not on Element) so unknown el_ids survive cell deletion
-    # and the whole thing round-trips to the hidden dialog message untouched.
+    # S2 layout overlay: {"version":1, "elements":{el_id: spec},
+    # "deck":{theme, background, …}}. Kept JSON-shaped (not on Element) so
+    # unknown el_ids survive cell deletion and the whole thing round-trips
+    # to the hidden dialog message untouched.
     layout: dict = field(default_factory=lambda: _empty_layout())
 
     def code_source(self, cell_id: str) -> str:
@@ -571,9 +572,16 @@ def _notebook_outputs_to_parts(nb_cell: dict) -> list[OutputPart]:
 async def build_deck(
     dialog_cells: list[dict] | None = None,
     notebook_path: str | Path | None = None,
-    theme: dict | None = None,
+    theme: str | dict | None = None,
 ) -> Deck:
-    """Load authoring source into Deck. Does not write back."""
+    """Load authoring source into Deck. Does not write back.
+
+    ``theme``:
+      * ``None`` — restore from layout note (default dark).
+      * ``"dark"`` / ``"light"`` — force that palette + write into layout.deck.
+      * ``dict`` — custom palette (legacy); does not rewrite layout theme name
+        unless the dict includes ``name``.
+    """
     if dialog_cells is None:
         dialog_cells = await get_slides_cells_from_dialog()
     if notebook_path is None and curr_dialog is not None:
@@ -585,7 +593,7 @@ async def build_deck(
         nb_cells, nb_attachments = get_slides_cells_from_notebook(notebook_path, dialog_cells)
 
     groups = group_dialog_cells_by_heading(dialog_cells)
-    deck = Deck(theme=theme or {})
+    deck = Deck(theme=theme_dict_for("dark"))
     el_counter = 0
 
     for s_idx, group in enumerate(groups):
@@ -657,6 +665,28 @@ async def build_deck(
         deck.layout = await load_layout()
     except Exception as e:
         print(f"sslive: layout load failed ({e}) — starting with empty overlay")
+        deck.layout = _empty_layout()
+
+    # Restore deck theme / background from layout note (dark default)
+    try:
+        apply_deck_appearance(
+            deck,
+            theme=deck_theme_name(deck.layout),
+            background=deck_background_spec(deck.layout),
+        )
+    except Exception:
+        deck.theme = theme_dict_for("dark")
+
+    # Explicit theme= on build_deck: string name or legacy palette dict
+    if theme is not None:
+        if isinstance(theme, str):
+            try:
+                apply_deck_appearance(deck, theme=theme)
+            except Exception:
+                pass
+        elif isinstance(theme, dict):
+            deck.theme = dict(theme)
+            deck.theme.setdefault("name", "dark")
 
     return deck
 
@@ -1381,6 +1411,8 @@ def layout_status(deck: "Deck | None" = None) -> dict:
         "last_add_ok": _SESSION.get("_layout_add_ok"),
         "last_ok_ts": _SESSION.get("_layout_save_ok_ts"),
         "ids": list(els.keys())[:24],
+        "theme": deck_theme_name(lay),
+        "background": deck_background_spec(lay),
         "hint": (
             "Look for a Note starting with #| sslive-layout under the %sslive "
             "cell (red eye). If missing: await ensure_layout_note()"
@@ -2791,6 +2823,7 @@ except Exception:  # pragma: no cover
     HTMLResponse = JSONResponse = Response = None  # type: ignore
 
 THEME_DARK = {
+    "name": "dark",
     "bg": "#111827",
     "fg": "#f3f4f6",
     "muted": "#9ca3af",
@@ -2801,6 +2834,135 @@ THEME_DARK = {
     "white-space:pre-wrap;border-radius:6px;margin:0.25rem 0;",
     "output-image": "max-width:100%;max-height:24rem;object-fit:contain;display:block;margin:0.5rem 0;",
 }
+
+THEME_LIGHT = {
+    "name": "light",
+    "bg": "#f8fafc",
+    "fg": "#0f172a",
+    "muted": "#64748b",
+    "code_bg": "#e2e8f0",
+    "output": "background:#e2e8f0;color:#0f172a;padding:0.5rem;font:13px/1.4 ui-monospace,monospace;"
+    "white-space:pre-wrap;word-break:break-word;border-radius:6px;margin:0.25rem 0;",
+    "error": "background:#fecaca;color:#7f1d1d;padding:0.5rem;font:13px/1.4 ui-monospace,monospace;"
+    "white-space:pre-wrap;border-radius:6px;margin:0.25rem 0;",
+    "output-image": "max-width:100%;max-height:24rem;object-fit:contain;display:block;margin:0.5rem 0;",
+}
+
+_THEMES = {"dark": THEME_DARK, "light": THEME_LIGHT}
+
+
+def resolve_theme_name(name: Any) -> str:
+    """Normalize to ``dark`` or ``light`` (default dark)."""
+    n = str(name or "dark").strip().lower()
+    return "light" if n == "light" else "dark"
+
+
+def theme_dict_for(name: Any = None) -> dict:
+    """Copy of a built-in theme palette."""
+    return dict(_THEMES[resolve_theme_name(name)])
+
+
+def deck_meta(layout: dict | None) -> dict:
+    """``layout['deck']`` map (theme, background, …)."""
+    if not isinstance(layout, dict):
+        return {}
+    dk = layout.get("deck")
+    return dict(dk) if isinstance(dk, dict) else {}
+
+
+def deck_theme_name(layout: dict | None) -> str:
+    return resolve_theme_name(deck_meta(layout).get("theme"))
+
+
+def deck_background_spec(layout: dict | None) -> dict | None:
+    """Deck-wide background override: ``{color}`` and/or ``{image}``, or None."""
+    bg = deck_meta(layout).get("background")
+    if not isinstance(bg, dict):
+        return None
+    out: dict[str, str] = {}
+    color = bg.get("color")
+    image = bg.get("image")
+    if isinstance(color, str) and _COLOR_SAFE_RE.match(color.strip()):
+        out["color"] = color.strip()
+    if isinstance(image, str) and image.strip():
+        out["image"] = image.strip()
+    return out or None
+
+
+def apply_deck_appearance(
+    deck: "Deck",
+    *,
+    theme: Any = _UNSET,
+    background: Any = _UNSET,
+) -> dict:
+    """Update ``deck.layout['deck']`` and ``deck.theme`` palette.
+
+    ``background=None`` clears a custom deck background.
+    """
+    if deck.layout is None or not isinstance(deck.layout, dict):
+        deck.layout = _empty_layout()
+    meta = deck_meta(deck.layout)
+    if theme is not _UNSET:
+        meta["theme"] = resolve_theme_name(theme)
+    if background is not _UNSET:
+        if background is None:
+            meta.pop("background", None)
+        elif isinstance(background, dict):
+            cleaned: dict[str, str] = {}
+            c = background.get("color")
+            img = background.get("image")
+            if isinstance(c, str) and _COLOR_SAFE_RE.match(c.strip()):
+                cleaned["color"] = c.strip()
+            if isinstance(img, str) and img.strip():
+                s = img.strip()
+                if s.startswith("data:") and len(s) > 1_500_000:
+                    raise ValueError("background image too large (max ~1MB data URL)")
+                # Allow data: URLs and http(s) only (no javascript:)
+                if s.startswith("data:image/") or s.startswith(
+                    ("https://", "http://")
+                ):
+                    cleaned["image"] = s
+            if cleaned:
+                meta["background"] = cleaned
+            else:
+                meta.pop("background", None)
+        else:
+            raise TypeError("background must be a dict or None")
+    deck.layout["deck"] = meta
+    deck.theme = theme_dict_for(meta.get("theme"))
+    return meta
+
+
+def _css_theme_vars(theme: dict | None) -> str:
+    """Inline ``:root`` CSS custom properties for live theme switching."""
+    t = theme or THEME_DARK
+    return (
+        f"--ss-bg:{t.get('bg', '#111827')};"
+        f"--ss-fg:{t.get('fg', '#f3f4f6')};"
+        f"--ss-muted:{t.get('muted', '#9ca3af')};"
+        f"--ss-code-bg:{t.get('code_bg', '#1f2937')};"
+    )
+
+
+def _deck_custom_bg_css(layout: dict | None) -> str:
+    """Extra body background CSS for a custom deck color/image (or empty)."""
+    bg = deck_background_spec(layout)
+    if not bg:
+        return ""
+    parts: list[str] = []
+    if bg.get("color"):
+        parts.append(f"background-color:{bg['color']} !important;")
+    if bg.get("image"):
+        # JSON-encode so quotes/parens in data URLs are CSS-safe
+        url = json.dumps(bg["image"])
+        parts.append(
+            f"background-image:url({url}) !important;"
+            "background-size:cover !important;"
+            "background-position:center !important;"
+            "background-repeat:no-repeat !important;"
+        )
+    return "".join(parts)
+
 
 _SESSION: dict[str, Any] = {
     "deck": None,
@@ -3536,6 +3698,12 @@ def generate_presenter_html(
     ``backend_mode`` is ``gpu`` | ``local`` | ``offline`` (drives run spinner text).
     """
     theme = deck.theme or THEME_DARK
+    theme_name = resolve_theme_name(theme.get("name") or deck_theme_name(deck.layout))
+    bg_spec = deck_background_spec(deck.layout)
+    css_vars = _css_theme_vars(theme)
+    custom_bg_css = _deck_custom_bg_css(deck.layout)
+    theme_name_js = json.dumps(theme_name)
+    deck_bg_js = json.dumps(bg_spec)
     n_slides = len(deck.slides)
     initial_slide = max(0, min(int(initial_slide), max(0, n_slides - 1)))
     slides_html = "\n".join(
@@ -3559,8 +3727,9 @@ def generate_presenter_html(
 
     css = f"""
     * {{ box-sizing: border-box; }}
-    html, body {{ margin:0; height:100%; background:{theme.get("bg", "#111")}; color:{theme.get("fg", "#eee")};
-      font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; }}
+    :root {{ {css_vars} }}
+    html, body {{ margin:0; height:100%; background:var(--ss-bg, #111827); color:var(--ss-fg, #f3f4f6);
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; {custom_bg_css} }}
     #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
     #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
     .slide {{ width:1920px; height:1080px; padding:48px 72px; display:none; flex-direction:column;
@@ -3575,7 +3744,7 @@ def generate_presenter_html(
     /* Base ~44px body; headings scale in em so layout `fs` still works.
        Text color lives on .note-block so layout `color` / toolbar recolor
        cascades into p/li/bullets (do not hard-code color on children). */
-    .note-block {{ font-size:2.75rem; color:{theme.get("fg", "#eee")};
+    .note-block {{ font-size:2.75rem; color:var(--ss-fg, #f3f4f6);
       overflow:visible; max-width:100%; }}
     /* Text pieces grow with content — never pin a short box that needs a scrollbar */
     .note-block[data-type="heading"],
@@ -3621,7 +3790,7 @@ def generate_presenter_html(
     .note-block th, .note-block td {{ border:1px solid #374151; padding:0.4em 0.7em; text-align:left; }}
     .note-block th {{ background:#1f2937; }}
     .note-block code {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.85em;
-      background:{theme.get("code_bg", "#1f2937")}; border:1px solid #374151; border-radius:4px;
+      background:var(--ss-code-bg, #1f2937); border:1px solid #374151; border-radius:4px;
       padding:0.08em 0.35em; }}
     .note-block pre {{ background:#111827; border:1px solid #374151; border-radius:6px;
       padding:0.6em 0.8em; overflow-x:auto; }}
@@ -3645,10 +3814,10 @@ def generate_presenter_html(
     .sslive-html canvas, .sslive-html video {{ max-width:100%; height:auto; }}
     .note-block a {{ color:#60a5fa; }}
     .note-block blockquote {{ border-left:3px solid #4b5563; margin:0.5rem 0;
-      padding:0 0 0 0.8em; color:{theme.get("muted", "#9ca3af")}; }}
+      padding:0 0 0 0.8em; color:var(--ss-muted, #9ca3af); }}
     .note-block math {{ font-size:1.15em; }}
     /* Code box: toolbar + one-line bar; editing uses #live-code-pop (floating) */
-    .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
+    .code-wrap {{ border:1px solid #374151; border-radius:8px; background:var(--ss-code-bg, #1f2937);
       padding:8px 12px; outline:none; flex:0 0 auto; align-self:stretch; max-width:100%;
       box-sizing:border-box; }}
     .code-wrap.selected {{ border-color:#60a5fa; box-shadow:0 0 0 2px rgba(96,165,250,0.35); }}
@@ -3658,7 +3827,7 @@ def generate_presenter_html(
       padding:6px 14px; font-size:14px; font-weight:600; }}
     .run-btn:hover {{ background:#1d4ed8; }}
     .run-btn:disabled {{ opacity:0.5; cursor:wait; }}
-    .cell-id {{ font-size:11px; color:{theme.get("muted", "#9ca3af")}; font-family:ui-monospace,monospace; }}
+    .cell-id {{ font-size:11px; color:var(--ss-muted, #9ca3af); font-family:ui-monospace,monospace; }}
     .hint {{ font-size:11px; color:#6b7280; }}
     .code-ta {{ width:100%; box-sizing:border-box; margin:0; resize:none;
       font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45;
@@ -3700,7 +3869,7 @@ def generate_presenter_html(
       border-radius:0 0 8px 0; opacity:0.85;
     }}
     #live-code-pop .live-code-pop-rs:hover {{ opacity:1; }}
-    /* Status lives in the ⓘ panel — no always-on chrome during presentation */
+    /* Status + theme live in the ⚙ gear panel — no always-on chrome */
     #chrome {{ display:none !important; }}
     #status-badge.ok {{ color:#86efac; }} #status-badge.bad {{ color:#fca5a5; }}
     #nav {{ position:fixed; right:16px; bottom:16px; z-index:50; display:flex; gap:10px; align-items:center;
@@ -3712,27 +3881,38 @@ def generate_presenter_html(
     #nav button:hover {{ background:rgba(255,255,255,0.1); }}
     /* ── edit mode (S2-B): outlines + drag affordances ── */
     #edit-btn.on {{ color:#f59e0b; }}
-    #info-btn {{ font-size:18px; opacity:0.9; }}
-    #info-btn[aria-expanded="true"] {{ color:#93c5fd; }}
-    #info-pop {{
+    #gear-btn {{ font-size:18px; opacity:0.9; }}
+    #gear-btn[aria-expanded="true"] {{ color:#93c5fd; }}
+    #gear-pop {{
       position:fixed; right:16px; bottom:58px; z-index:55; display:none;
-      width:min(340px, 92vw); padding:12px 14px; border-radius:10px;
+      width:min(360px, 92vw); padding:12px 14px; border-radius:10px;
       background:rgba(3,7,18,0.96); border:1px solid #4b5563; color:#e5e7eb;
       font:13px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;
       box-shadow:0 10px 28px rgba(0,0,0,0.55); }}
-    #info-pop.open {{ display:block; }}
-    #info-pop h4 {{ margin:0 0 8px; font-size:12px; font-weight:700; color:#93c5fd;
+    #gear-pop.open {{ display:block; }}
+    #gear-pop h4 {{ margin:10px 0 6px; font-size:12px; font-weight:700; color:#93c5fd;
       letter-spacing:0.04em; text-transform:uppercase; }}
-    #info-pop .info-status {{
-      margin:0 0 10px; padding:6px 8px; border-radius:6px; background:#0f172a;
+    #gear-pop h4:first-of-type {{ margin-top:0; }}
+    #gear-pop .info-status {{
+      margin:0 0 6px; padding:6px 8px; border-radius:6px; background:#0f172a;
       border:1px solid #1f2937; font:12px/1.35 ui-monospace,Menlo,monospace; }}
-    #info-pop ul {{ margin:0; padding:0 0 0 1.1em; }}
-    #info-pop li {{ margin:0.25em 0; }}
-    #info-pop kbd {{ font:12px/1.2 ui-monospace,Menlo,monospace; background:#1f2937;
+    #gear-pop ul {{ margin:0; padding:0 0 0 1.1em; }}
+    #gear-pop li {{ margin:0.25em 0; }}
+    #gear-pop kbd {{ font:12px/1.2 ui-monospace,Menlo,monospace; background:#1f2937;
       border:1px solid #4b5563; border-radius:4px; padding:1px 5px; color:#f8fafc; }}
-    #info-pop .info-close {{ float:right; background:transparent; border:0; color:#9ca3af;
+    #gear-pop .gear-close {{ float:right; background:transparent; border:0; color:#9ca3af;
       cursor:pointer; font-size:16px; padding:0 2px; line-height:1; }}
-    #info-pop .info-close:hover {{ color:#fff; }}
+    #gear-pop .gear-close:hover {{ color:#fff; }}
+    #gear-pop .gear-row {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:0 0 4px; }}
+    #gear-pop .gear-btn {{
+      background:#1f2937; border:1px solid #4b5563; color:#e5e7eb; border-radius:6px;
+      padding:5px 10px; font-size:12px; cursor:pointer; }}
+    #gear-pop .gear-btn:hover {{ border-color:#60a5fa; color:#93c5fd; }}
+    #gear-pop .gear-btn.on {{ background:#1e3a5f; border-color:#60a5fa; color:#93c5fd; }}
+    #gear-pop .gear-color {{
+      width:36px; height:28px; padding:0; border:1px solid #4b5563; border-radius:6px;
+      background:#1f2937; cursor:pointer; }}
+    #gear-pop .gear-hint {{ font-size:11px; color:#9ca3af; margin:0 0 4px; }}
     body.editing .note-block, body.editing [data-type="output"] {{
       outline:1px dashed rgba(96,165,250,0.5); outline-offset:2px; cursor:move; }}
     body.editing .code-wrap {{ outline:1px dashed rgba(96,165,250,0.5); outline-offset:2px; }}
@@ -3840,7 +4020,91 @@ def generate_presenter_html(
     let fragStep = 0;  // how far into this slide's reveal sequence we are
     const BACKEND_MODE = {backend_mode_js};  // gpu | local | offline
     const RUN_MSG = {run_msg_js};
+    // Deck appearance (gear menu) — live CSS vars + persist via parent bridge
+    const THEME_PALETTES = {{
+      dark:  {{ bg:'#111827', fg:'#f3f4f6', muted:'#9ca3af', code_bg:'#1f2937' }},
+      light: {{ bg:'#f8fafc', fg:'#0f172a', muted:'#64748b', code_bg:'#e2e8f0' }}
+    }};
+    let deckTheme = {theme_name_js};
+    let deckBg = {deck_bg_js};  // null | {{color?, image?}}
     const slides = () => document.querySelectorAll('[data-slide]');
+
+    function applyAppearance() {{
+      const name = (deckTheme === 'light') ? 'light' : 'dark';
+      deckTheme = name;
+      const t = THEME_PALETTES[name] || THEME_PALETTES.dark;
+      const root = document.documentElement;
+      root.style.setProperty('--ss-bg', t.bg);
+      root.style.setProperty('--ss-fg', t.fg);
+      root.style.setProperty('--ss-muted', t.muted);
+      root.style.setProperty('--ss-code-bg', t.code_bg);
+      document.body.classList.toggle('theme-light', name === 'light');
+      // Custom deck background overrides theme bg on body
+      const b = document.body;
+      if (deckBg && deckBg.color) {{
+        b.style.setProperty('background-color', deckBg.color, 'important');
+      }} else {{
+        b.style.removeProperty('background-color');
+      }}
+      if (deckBg && deckBg.image) {{
+        b.style.setProperty('background-image', 'url(' + JSON.stringify(deckBg.image) + ')', 'important');
+        b.style.setProperty('background-size', 'cover', 'important');
+        b.style.setProperty('background-position', 'center', 'important');
+        b.style.setProperty('background-repeat', 'no-repeat', 'important');
+      }} else {{
+        b.style.removeProperty('background-image');
+        b.style.removeProperty('background-size');
+        b.style.removeProperty('background-position');
+        b.style.removeProperty('background-repeat');
+      }}
+      // Gear UI active states
+      document.getElementById('gear-theme-dark')?.classList.toggle('on', name === 'dark');
+      document.getElementById('gear-theme-light')?.classList.toggle('on', name === 'light');
+      const col = document.getElementById('gear-bg-color');
+      if (col && deckBg && deckBg.color && /^#[0-9a-fA-F]{{3,8}}$/.test(deckBg.color)) {{
+        try {{ col.value = deckBg.color.length === 4
+          ? '#' + deckBg.color[1]+deckBg.color[1]+deckBg.color[2]+deckBg.color[2]+deckBg.color[3]+deckBg.color[3]
+          : deckBg.color.slice(0, 7); }} catch (e) {{}}
+      }} else if (col) {{
+        try {{ col.value = t.bg; }} catch (e) {{}}
+      }}
+      const hint = document.getElementById('gear-bg-hint');
+      if (hint) {{
+        if (deckBg && (deckBg.image || deckBg.color)) {{
+          const bits = [];
+          if (deckBg.color) bits.push(deckBg.color);
+          if (deckBg.image) bits.push(deckBg.image.startsWith('data:') ? 'custom image' : 'image');
+          hint.textContent = 'Custom: ' + bits.join(' · ');
+        }} else {{
+          hint.textContent = 'Using theme background';
+        }}
+      }}
+    }}
+    function postDeckPatch(patch) {{
+      try {{ window.parent.__sslive_slide_index = currentSlide; }} catch (e) {{}}
+      try {{
+        window.parent.postMessage({{
+          type: 'sslive_deck',
+          patch: patch,
+          slide_index: currentSlide,
+          t: Date.now()
+        }}, '*');
+        // Persist immediately (gear changes don't require edit mode)
+        window.parent.__sslive_layout_flush = true;
+        window.parent.postMessage({{ type: 'sslive_layout_flush', t: Date.now() }}, '*');
+      }} catch (e) {{}}
+    }}
+    function setDeckTheme(name) {{
+      deckTheme = (name === 'light') ? 'light' : 'dark';
+      applyAppearance();
+      postDeckPatch({{ theme: deckTheme }});
+    }}
+    function setDeckBackground(spec) {{
+      // spec null clears; otherwise {{color?, image?}}
+      deckBg = spec;
+      applyAppearance();
+      postDeckPatch({{ background: deckBg }});
+    }}
 
     function slideEls(slideEl) {{
       if (!slideEl) return [];
@@ -4969,7 +5233,7 @@ def generate_presenter_html(
     // Double-click a note piece in edit mode → edit text (writes back to notebook)
     document.addEventListener('dblclick', (e) => {{
       if (!editing) return;
-      if (e.target.closest('#edit-toolbar, #info-pop, #nav, #live-code-pop')) return;
+      if (e.target.closest('#edit-toolbar, #gear-pop, #nav, #live-code-pop')) return;
       const nb = e.target.closest('.note-block');
       if (!nb || !NOTE_EDIT_KINDS[nb.dataset.type || '']) return;
       e.preventDefault();
@@ -4980,7 +5244,7 @@ def generate_presenter_html(
 
     document.addEventListener('pointerdown', (e) => {{
       if (!editing || e.button !== 0) return;
-      if (e.target.closest('#edit-toolbar, #info-pop, #nav, #chrome')) return;
+      if (e.target.closest('#edit-toolbar, #gear-pop, #nav, #chrome')) return;
       // Clicks inside a contenteditable note: type, don't drag
       const editingNote = e.target.closest('.note-block.note-text-editing');
       if (editingNote) {{
@@ -5312,15 +5576,16 @@ def generate_presenter_html(
     document.getElementById('edit-btn')?.addEventListener('click', (e) => {{
       e.preventDefault(); e.stopPropagation(); setEditing(!editing);
     }});
-    (function wireInfoPop() {{
-      const btn = document.getElementById('info-btn');
-      const pop = document.getElementById('info-pop');
-      const close = document.getElementById('info-pop-close');
+    (function wireGearPop() {{
+      const btn = document.getElementById('gear-btn');
+      const pop = document.getElementById('gear-pop');
+      const close = document.getElementById('gear-pop-close');
       if (!btn || !pop) return;
       function setOpen(on) {{
         pop.classList.toggle('open', !!on);
         pop.setAttribute('aria-hidden', on ? 'false' : 'true');
         btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+        if (on) applyAppearance();
       }}
       btn.addEventListener('click', (e) => {{
         e.preventDefault(); e.stopPropagation();
@@ -5340,6 +5605,54 @@ def generate_presenter_html(
           setOpen(false);
         }}
       }});
+      // Theme toggle
+      document.getElementById('gear-theme-dark')?.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation(); setDeckTheme('dark');
+      }});
+      document.getElementById('gear-theme-light')?.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation(); setDeckTheme('light');
+      }});
+      // Background color
+      const col = document.getElementById('gear-bg-color');
+      col?.addEventListener('input', (e) => {{
+        e.stopPropagation();
+        const v = (col.value || '').trim();
+        if (!v) return;
+        const next = Object.assign({{}}, deckBg || {{}}, {{ color: v }});
+        setDeckBackground(next);
+      }});
+      col?.addEventListener('pointerdown', (e) => e.stopPropagation());
+      // Background image (file → data URL)
+      const file = document.getElementById('gear-bg-file');
+      document.getElementById('gear-bg-image')?.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation(); file?.click();
+      }});
+      file?.addEventListener('change', () => {{
+        const f = file.files && file.files[0];
+        if (!f) return;
+        if (f.size > 1_200_000) {{
+          alert('Background image too large (max ~1MB).');
+          file.value = '';
+          return;
+        }}
+        const reader = new FileReader();
+        reader.onload = () => {{
+          const dataUrl = String(reader.result || '');
+          if (!dataUrl.startsWith('data:image/')) {{
+            alert('Please choose an image file.');
+            return;
+          }}
+          const next = Object.assign({{}}, deckBg || {{}}, {{ image: dataUrl }});
+          setDeckBackground(next);
+        }};
+        reader.readAsDataURL(f);
+        file.value = '';
+      }});
+      document.getElementById('gear-bg-clear')?.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation();
+        setDeckBackground(null);
+      }});
+      applyAppearance();
     }})();
     // Keep floating toolbar glued to the selection on viewport changes
     window.addEventListener('resize', () => {{ placeRsBox(); placeToolbar(); }});
@@ -5692,9 +6005,22 @@ def generate_presenter_html(
     <textarea id="live-code-pop-ta" spellcheck="false"></textarea>
     <div class="live-code-pop-rs" title="Drag to resize"></div>
   </div>
-  <div id="info-pop" role="dialog" aria-label="Status and shortcuts" aria-hidden="true">
-    <button type="button" class="info-close" id="info-pop-close" aria-label="Close">×</button>
-    <h4>sslive</h4>
+  <div id="gear-pop" role="dialog" aria-label="Deck settings" aria-hidden="true">
+    <button type="button" class="gear-close" id="gear-pop-close" aria-label="Close">×</button>
+    <h4>Theme</h4>
+    <div class="gear-row">
+      <button type="button" class="gear-btn" id="gear-theme-dark">Dark</button>
+      <button type="button" class="gear-btn" id="gear-theme-light">Light</button>
+    </div>
+    <h4>Background</h4>
+    <p class="gear-hint" id="gear-bg-hint">Using theme background</p>
+    <div class="gear-row">
+      <label title="Background color"><input type="color" class="gear-color" id="gear-bg-color" value="#111827" /></label>
+      <button type="button" class="gear-btn" id="gear-bg-image">Image…</button>
+      <input type="file" id="gear-bg-file" accept="image/*" hidden />
+      <button type="button" class="gear-btn" id="gear-bg-clear">Clear</button>
+    </div>
+    <h4>Status</h4>
     <div class="info-status"><span id="status-badge" class="ok">{html_module.escape(backend_label)}</span></div>
     <h4>Shortcuts</h4>
     <ul>
@@ -5711,8 +6037,8 @@ def generate_presenter_html(
   </div>
   <div id="nav">
     <button type="button" id="edit-btn" title="Edit layout (e)" aria-label="Edit layout">✎</button>
-    <button type="button" id="info-btn" title="Status &amp; shortcuts" aria-label="Status and shortcuts"
-      aria-expanded="false" aria-controls="info-pop">ⓘ</button>
+    <button type="button" id="gear-btn" title="Theme, background &amp; shortcuts" aria-label="Deck settings"
+      aria-expanded="false" aria-controls="gear-pop">⚙</button>
     <button type="button" id="prev-btn" aria-label="Previous">‹</button>
     <span id="slide-counter">1 / {max(n, 1)}</span>
     <button type="button" id="next-btn" aria-label="Next">›</button>
@@ -5850,6 +6176,8 @@ def generate_export_html(
     """
     del offline  # reserved
     theme = deck.theme or THEME_DARK
+    css_vars = _css_theme_vars(theme)
+    custom_bg_css = _deck_custom_bg_css(deck.layout)
     n_slides = len(deck.slides)
     initial_slide = max(0, min(int(initial_slide), max(0, n_slides - 1)))
     slides_html = "\n".join(
@@ -5869,8 +6197,9 @@ def generate_export_html(
 
     css = f"""
     * {{ box-sizing: border-box; }}
-    html, body {{ margin:0; height:100%; background:{theme.get("bg", "#111")}; color:{theme.get("fg", "#eee")};
-      font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; }}
+    :root {{ {css_vars} }}
+    html, body {{ margin:0; height:100%; background:var(--ss-bg, #111827); color:var(--ss-fg, #f3f4f6);
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; {custom_bg_css} }}
     #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
     #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
     .slide {{ width:1920px; height:1080px; padding:48px 72px; display:none; flex-direction:column;
@@ -5879,7 +6208,7 @@ def generate_export_html(
     .slide.hidden {{ display:none; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
     .slide:not(.title-slide) {{ padding:56px 96px; gap:12px; }}
-    .note-block {{ font-size:2.75rem; color:{theme.get("fg", "#eee")};
+    .note-block {{ font-size:2.75rem; color:var(--ss-fg, #f3f4f6);
       overflow:visible; max-width:100%; }}
     .note-block[data-type="heading"],
     .note-block[data-type="paragraph"],
@@ -5922,12 +6251,12 @@ def generate_export_html(
     .sslive-html {{ width:100%; max-width:100%; }}
     .sslive-plotly-host {{ width:100% !important; max-width:100%; box-sizing:border-box;
       position:relative; overflow:hidden; border-radius:8px; background:#0b1220; }}
-    .code-wrap {{ border:1px solid #374151; border-radius:8px; background:{theme.get("code_bg", "#1f2937")};
+    .code-wrap {{ border:1px solid #374151; border-radius:8px; background:var(--ss-code-bg, #1f2937);
       padding:8px 12px; outline:none; flex:0 0 auto; max-width:100%; align-self:stretch;
       cursor:pointer; box-sizing:border-box; }}
     .code-wrap.code-open {{ border-color:#60a5fa; box-shadow:0 0 0 1px rgba(96,165,250,0.35); }}
     .code-toolbar {{ display:flex; align-items:center; gap:12px; margin-bottom:6px; flex-wrap:wrap; }}
-    .cell-id {{ font-size:11px; color:{theme.get("muted", "#9ca3af")}; font-family:ui-monospace,monospace; }}
+    .cell-id {{ font-size:11px; color:var(--ss-muted, #9ca3af); font-family:ui-monospace,monospace; }}
     .hint {{ font-size:11px; color:#6b7280; }}
     .code-pre {{ width:100%; box-sizing:border-box; margin:0; padding:6px 10px;
       font-family:ui-monospace,SFMono-Regular,Menlo,monospace; line-height:1.45; font-size:14px;
@@ -7371,6 +7700,21 @@ if (!window.__sslive_note_bridge_v1) {
     });
   });
 }
+// Deck appearance queue (gear: theme + custom background)
+if (!window.__sslive_deck_bridge_v1) {
+  window.__sslive_deck_bridge_v1 = true;
+  window.__sslive_deck_q = window.__sslive_deck_q || [];
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || d.type !== 'sslive_deck') return;
+    if (d.slide_index != null) window.__sslive_slide_index = d.slide_index;
+    window.__sslive_deck_q.push({
+      patch: d.patch || {},
+      slide_index: d.slide_index,
+      t: d.t || Date.now()
+    });
+  });
+}
 // Upgrade older bridges that lack the flush flag
 if (window.__sslive_layout_flush === undefined) {
   window.__sslive_layout_flush = false;
@@ -7498,40 +7842,51 @@ def _item_dicts(seq: Any, fields: tuple[str, ...]) -> list[dict]:
     return out
 
 
-async def _drain_slide_queue() -> tuple[list[dict], list[dict], bool, list[dict]]:
-    """Pull pending runs, layout patches, flush flag, and note text edits.
+async def _drain_slide_queue() -> tuple[
+    list[dict], list[dict], bool, list[dict], list[dict]
+]:
+    """Pull pending runs, layout/deck patches, flush flag, and note text edits.
 
     One js_eval round-trip drains ``__sslive_q``, ``__sslive_layout_q``,
-    ``__sslive_note_q``, and ``__sslive_layout_flush`` (leave-edit).
+    ``__sslive_deck_q``, ``__sslive_note_q``, and ``__sslive_layout_flush``.
     """
     if js_eval is None and js_eval_a is None:
-        return [], [], False, []
+        return [], [], False, [], []
     try:
         res = await _call_js_eval(
             "const r = (window.__sslive_q || []).slice(); "
             "window.__sslive_q = []; "
             "const l = (window.__sslive_layout_q || []).slice(); "
             "window.__sslive_layout_q = []; "
+            "const d = (window.__sslive_deck_q || []).slice(); "
+            "window.__sslive_deck_q = []; "
             "const n = (window.__sslive_note_q || []).slice(); "
             "window.__sslive_note_q = []; "
             "const f = !!window.__sslive_layout_flush; "
             "window.__sslive_layout_flush = false; "
-            "return {runs: r, layouts: l, notes: n, flush: f};"
+            "return {runs: r, layouts: l, deck: d, notes: n, flush: f};"
         )
         q = _parse_js_eval_result(res)
         if q is None:
-            return [], [], False, []
+            return [], [], False, [], []
         flush = False
         notes_raw = None
+        deck_raw = None
         if isinstance(q, dict) and (
-            "runs" in q or "layouts" in q or "flush" in q or "notes" in q
+            "runs" in q
+            or "layouts" in q
+            or "flush" in q
+            or "notes" in q
+            or "deck" in q
         ):
             runs_raw, layouts_raw = q.get("runs"), q.get("layouts")
             notes_raw = q.get("notes")
+            deck_raw = q.get("deck")
             flush = bool(q.get("flush"))
         elif hasattr(q, "runs") or hasattr(q, "layouts"):
             runs_raw, layouts_raw = getattr(q, "runs", None), getattr(q, "layouts", None)
             notes_raw = getattr(q, "notes", None)
+            deck_raw = getattr(q, "deck", None)
             flush = bool(getattr(q, "flush", False))
         else:  # old bridge on the page: bare run list
             runs_raw, layouts_raw = q, None
@@ -7540,12 +7895,13 @@ async def _drain_slide_queue() -> tuple[list[dict], list[dict], bool, list[dict]
             _item_dicts(layouts_raw, ("el_id", "patch", "t", "slide_index")),
             flush,
             _item_dicts(notes_raw, ("el_id", "cell_id", "text", "kind", "slide_index")),
+            _item_dicts(deck_raw, ("patch", "t", "slide_index")),
         )
     except Exception as e:
         if _SESSION.get("_bridge_err") != str(e):
             _SESSION["_bridge_err"] = str(e)
             print(f"sslive: bridge poll error: {e}")
-        return [], [], False, []
+        return [], [], False, [], []
 
 
 def _apply_slide_layout_patches(items: list[dict]) -> int:
@@ -7591,6 +7947,46 @@ def _apply_slide_layout_patches(items: list[dict]) -> int:
         ) + orphans
     if n:
         # Memory only until leave-edit / flush_layout_save / %sslive
+        _SESSION["_layout_dirty"] = True
+    return n
+
+
+def _apply_deck_meta_patches(items: list[dict]) -> int:
+    """Apply gear-menu theme/background patches to ``deck.layout['deck']``.
+
+    Marks layout dirty; caller (or a paired flush) persists the note.
+    """
+    deck: Deck | None = _SESSION.get("deck")
+    if deck is None or not items:
+        return 0
+    n = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        sidx = it.get("slide_index")
+        if sidx is not None:
+            try:
+                _SESSION["slide_index"] = max(0, int(sidx))
+            except (TypeError, ValueError):
+                pass
+        patch = it.get("patch") if isinstance(it.get("patch"), dict) else {}
+        if not patch:
+            continue
+        kw: dict[str, Any] = {}
+        if "theme" in patch:
+            kw["theme"] = patch.get("theme")
+        if "background" in patch:
+            # Explicit null clears custom background
+            kw["background"] = patch.get("background")
+        if not kw:
+            continue
+        try:
+            apply_deck_appearance(deck, **kw)
+            _SESSION["theme"] = deck.theme
+            n += 1
+        except Exception as e:
+            _SESSION["_deck_patch_err"] = str(e)
+    if n:
         _SESSION["_layout_dirty"] = True
     return n
 
@@ -7655,15 +8051,22 @@ async def _flush_note_dialog_writes(cells: dict[str, str], *, refocus: bool = Tr
 
 
 async def _bridge_poll_loop() -> None:
-    """Background: apply in-slide Run, layout patches, and note text edits."""
+    """Background: apply in-slide Run, layout/deck patches, and note text edits."""
     while _SESSION.get("bridge_active"):
         try:
-            pending, layout_patches, want_flush, note_edits = await _drain_slide_queue()
+            (
+                pending,
+                layout_patches,
+                want_flush,
+                note_edits,
+                deck_patches,
+            ) = await _drain_slide_queue()
             # layout first: a Run in the same batch re-renders the output
             # block and must see the just-dragged position
             _apply_slide_layout_patches(layout_patches)
+            _apply_deck_meta_patches(deck_patches)
             note_cells = _apply_note_text_edits(note_edits)
-            # Edit-mode exit → persist layout (quiet: no focus/restore thrash).
+            # Edit-mode exit or gear change → persist layout (quiet).
             # While fullscreen, flush defers the dialog write until FS ends.
             if want_flush:
                 try:
@@ -7744,8 +8147,15 @@ async def pump_slide_runs(max_items: int = 20) -> int:
     """Manually drain in-slide Run queue (if background poll is not running)."""
     n = 0
     for _ in range(max_items):
-        pending, layout_patches, want_flush, note_edits = await _drain_slide_queue()
+        (
+            pending,
+            layout_patches,
+            want_flush,
+            note_edits,
+            deck_patches,
+        ) = await _drain_slide_queue()
         _apply_slide_layout_patches(layout_patches)
+        _apply_deck_meta_patches(deck_patches)
         note_cells = _apply_note_text_edits(note_edits)
         if note_cells:
             try:
@@ -8132,7 +8542,7 @@ class LiveSession:
 
 
 async def sslive(
-    theme: str | dict = "dark",
+    theme: str | dict | None = None,
     *,
     height: str = "720px",
     echo_to_dialog: bool = False,
@@ -8155,6 +8565,9 @@ async def sslive(
         %run path/to/sslive.py
         %gpu                      # after CRAFT is loaded
         %sslive                   # ▶ Run → remote GPU when connected
+
+    ``theme``: ``None`` (default) restores dark/light + custom background from
+    the layout note; pass ``"light"`` / ``"dark"`` to force, or a palette dict.
 
     Soft-start: deck always opens when the host is ready. Without CRAFT, Run
     still works on the host (badge shows ``local``). Set ``require_gpu=True``
@@ -8199,7 +8612,6 @@ async def sslive(
     if use_http is None:
         use_http = not _in_solveit()
 
-    theme_dict = theme if isinstance(theme, dict) else dict(THEME_DARK)
     # Only flush layout if a debounced save is actually pending (dirty).
     # Always flushing on re-%sslive rewrote the layout note → focus layout → preview.
     if _SESSION.get("deck") is not None:
@@ -8208,7 +8620,8 @@ async def sslive(
         except Exception as e:
             _SESSION["_layout_flush_err"] = str(e)
     try:
-        deck = await build_deck(theme=theme_dict)
+        # theme=None → layout note (or dark). str/dict → force for this open.
+        deck = await build_deck(theme=theme)
     except RuntimeError as e:
         if "dialoghelper" in str(e).lower():
             print(f"sslive: {e}")
@@ -8218,7 +8631,7 @@ async def sslive(
     _SESSION["deck"] = deck
     _SESSION["executor"] = executor
     _SESSION["echo_to_dialog"] = echo_to_dialog
-    _SESSION["theme"] = theme_dict
+    _SESSION["theme"] = deck.theme or theme_dict_for("dark")
 
     port: int | None = None
     if use_http:
@@ -8388,23 +8801,19 @@ async def run_cell_index(i: int = 0, **kw) -> ExecResult:
 
 
 async def reload_deck(theme: str | dict | None = None) -> Deck:
-    """Rebuild deck from the dialog (after structural edits) and refresh slides."""
+    """Rebuild deck from the dialog (after structural edits) and refresh slides.
+
+    ``theme=None`` keeps the layout-note appearance (dark/light + background).
+    """
     # Don't lose a drag that hasn't hit the debounced dialog write yet
     if _SESSION.get("deck") is not None:
         try:
             await flush_layout_save()
         except Exception as e:
             _SESSION["_layout_flush_err"] = str(e)
-    theme_dict = (
-        theme
-        if isinstance(theme, dict)
-        else (_SESSION.get("theme") or dict(THEME_DARK))
-    )
-    if isinstance(theme, str):
-        theme_dict = dict(THEME_DARK)
-    deck = await build_deck(theme=theme_dict)
+    deck = await build_deck(theme=theme)
     _SESSION["deck"] = deck
-    _SESSION["theme"] = theme_dict
+    _SESSION["theme"] = deck.theme or theme_dict_for("dark")
     if _SESSION.get("executor") is None:
         _SESSION["executor"] = LiveExecutor()
     refresh_presenter()
@@ -8732,6 +9141,12 @@ __all__ = [
     "export_html",
     "export_html_str",
     "export_html_a",
+    "THEME_DARK",
+    "THEME_LIGHT",
+    "theme_dict_for",
+    "apply_deck_appearance",
+    "deck_theme_name",
+    "deck_background_spec",
     "get_craft_exec_mgr",
     "exec_backend",
     "craft_env_status",
