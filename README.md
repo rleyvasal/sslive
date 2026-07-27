@@ -73,13 +73,19 @@ sslive 0.1.0 ready (one load · CRAFT …)
 
 ## Deck content
 
-### Section marker (not a slide)
+### Section range (start → present)
 
 ```text
-# sslive
+# sslive                 ← start (not a slide)
+
+# Title / ## Slide …
+…
+
+%sslive                  ← stop: this cell and everything after are out of the deck
 ```
 
-`# sslive` only marks where the slide section **starts**. It is **not** a slide. Content before it is ignored.
+- **`# sslive`** — section start only; content before it is ignored.  
+- **`%sslive`** / **`%sslive_export`** — first such code cell **terminates** the region (launcher, not a slide). Stay at the bottom of the notebook; no `# /sslive` end marker.
 
 ### After `# sslive`
 

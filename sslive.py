@@ -227,6 +227,15 @@ SSLIVE_USAGE = """
 `# sslive` marks the **start of the slide section**. It is a section marker
 only — **not a slide**. Content before `# sslive` is never part of the deck.
 
+`%sslive` (or `%sslive_export`) at the **bottom** ends the region: that cell
+and everything after it are excluded. No `# /sslive` end marker needed.
+
+    # sslive
+    ## Slide 1
+    …
+    ## Slide 10
+    %sslive          ← present; terminator
+
 After `# sslive`, each slide is introduced by a heading note:
 
 | Heading | Meaning |
@@ -237,11 +246,13 @@ After `# sslive`, each slide is introduced by a heading note:
 
 Rules:
 1. `# sslive` = section marker only (not a slide).
-2. `# Slide title` = starts a new **title** slide.
-3. `## Regular slide` = starts a new **regular** slide (preferred for body slides).
-4. Any following note/code cells belong to the **most recent** `#` or `##`
+2. First code cell starting with `%sslive` / `%sslive_export` = **end** of
+   the deck (that cell + everything after are ignored).
+3. `# Slide title` = starts a new **title** slide.
+4. `## Regular slide` = starts a new **regular** slide (preferred for body slides).
+5. Any following note/code cells belong to the **most recent** `#` or `##`
    heading until the next `#` / `##` heading appears.
-5. Do **not** put every slide under `#` — reserve `#` for title slides;
+6. Do **not** put every slide under `#` — reserve `#` for title slides;
    write ordinary slides as `## Heading`.
 
 Math (required — otherwise formulas stay plain text):
@@ -379,6 +390,26 @@ def _is_slide_region_marker(content: str) -> bool:
     return first == SLIDE_REGION_MARKER or first.lower() == SLIDE_REGION_MARKER
 
 
+def _first_nonempty_line(content: str) -> str:
+    for line in (content or "").splitlines():
+        s = line.strip()
+        if s:
+            return s
+    return ""
+
+
+def _is_sslive_control_cell(m: dict) -> bool:
+    """Terminator: code cell whose first non-empty line is ``%sslive`` / ``%sslive_export``.
+
+    That cell and everything after it are excluded from the deck so users can
+    keep authoring slides above and present with ``%sslive`` at the bottom.
+    """
+    if m.get("msg_type") != "code":
+        return False
+    first = _first_nonempty_line(m.get("content") or "")
+    return bool(re.match(r"%sslive(?:_export)?(?:\s|$)", first))
+
+
 def _is_sslive_infra_msg(m: dict) -> bool:
     """sslive's own machinery — never a slide, whatever its skipped state."""
     c = (m.get("content") or "").strip()
@@ -390,22 +421,30 @@ def _is_sslive_infra_msg(m: dict) -> bool:
             return True
         return False
     if m.get("msg_type") == "code":
-        return bool(
-            c.startswith("%sslive") or re.match(r"(?:await\s+)?sslive\s*\(", c)
-        )
+        if _is_sslive_control_cell(m):
+            return True
+        return bool(re.match(r"(?:await\s+)?sslive\s*\(", _first_nonempty_line(c)))
     return False
 
 
 async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[dict]:
-    """Cells after the ``# sslive`` **section** marker. Requires dialoghelper.
+    """Cells in the slide region: after ``# sslive``, until ``%sslive``.
 
-    ``# sslive`` is a section marker only (not a slide). Everything before it
-    is ignored. After it, ``# Title`` / ``## Heading`` notes start slides;
-    other cells attach to the latest heading (see ``group_dialog_cells_by_heading``).
+    Region rules::
 
-    Skipped (red eye) cells after the marker ARE included: skipped means
-    "out of LLM context", not "out of the deck". Only sslive infra (layout
-    note, launcher, marker) is filtered.
+        # sslive          ← start (not a slide)
+        ## Slide 1
+        …
+        ## Slide N
+        %sslive           ← stop (excluded, and everything after it)
+
+    ``# sslive`` is a section marker only. The first code cell whose first
+    non-empty line is ``%sslive`` or ``%sslive_export`` terminates the region
+    (that cell is not a slide). No explicit ``# /sslive`` end marker needed.
+
+    Skipped (red eye) cells *inside* the region ARE included: skipped means
+    "out of LLM context", not "out of the deck". Infra (layout note, launcher,
+    markers) is filtered.
     """
     if find_msgs is None:
         raise RuntimeError(
@@ -425,12 +464,20 @@ async def get_slides_cells_from_dialog(include_prompts: bool = False) -> list[di
             break
     if marker_idx is None:
         return []
+
+    # End at first %sslive / %sslive_export control cell (exclusive)
+    end_idx = len(all_msgs)
+    for i in range(marker_idx + 1, len(all_msgs)):
+        if _is_sslive_control_cell(all_msgs[i]):
+            end_idx = i
+            break
+
     allowed = ["note", "code"]
     if include_prompts:
         allowed.append("prompt")
     return [
         m
-        for m in all_msgs[marker_idx + 1 :]
+        for m in all_msgs[marker_idx + 1 : end_idx]
         if m.get("msg_type") in allowed and not _is_sslive_infra_msg(m)
     ]
 

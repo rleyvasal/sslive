@@ -44,17 +44,18 @@ Element — id, cell_id, kind, html/content (layout via deck.layout overlay)
 OutputPart — stream|error|image/png|text/html|text/plain
 ```
 
-### Slide section marker and headings
-
-A note whose **first line** is `# sslive` starts the deck **section** (not a slide). Content before it is ignored. Legacy exact body `#| s` still works.
+### Slide section range and headings
 
 | Construct | Role |
 |-----------|------|
-| `# sslive` | Section marker only — **not** a slide |
+| `# sslive` | Section **start** only — **not** a slide; content before ignored |
+| `%sslive` / `%sslive_export` | Section **end** — first code cell whose first non-empty line is this magic; that cell and everything after are **out of the deck** |
 | `# Title` | **Title slide** (`Slide.is_title`) |
 | `## Heading` | **Regular slide** (usual form for body content) |
 | following note/code | Belong to the most recent `#` / `##` until the next heading |
 | `###` and deeper | Body text inside the current slide, not a break |
+
+Legacy exact body `#| s` still starts the region. No `# /sslive` end marker.
 
 ```text
 # sslive
@@ -64,8 +65,10 @@ intro…
 
 ## Motivation               ← regular slide
 …
-## Method                   ← regular slide
+## Method
 …
+
+%sslive                     ← present; terminator
 ```
 
 Prefer `##` for most slides; reserve `#` for the main title. On `%run`, `SSLIVE_USAGE` spells this out for the LLM.
