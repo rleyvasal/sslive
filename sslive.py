@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import html as html_module
 import inspect
 import json
@@ -648,14 +649,17 @@ async def build_deck(
                 # S2-D: fine-grained note pieces (heading / list_item / math / image / …)
                 pieces = parse_note_to_elements(source, cid, nb_attachments)
                 if not pieces:
-                    pieces = [
-                        {
-                            "id": f"el-0-{cid}",
-                            "kind": "paragraph",
-                            "html": "",
-                            "content": source,
-                        }
-                    ]
+                    pieces = _assign_stable_note_ids(
+                        [
+                            {
+                                "id": "",
+                                "kind": "paragraph",
+                                "html": "",
+                                "content": source,
+                            }
+                        ],
+                        cid,
+                    )
                 for p in pieces:
                     el_id = p["id"]
                     deck.elements[el_id] = Element(
@@ -687,6 +691,15 @@ async def build_deck(
             _SESSION["_layout_scrubbed_bg_blob"] = True
     except Exception:
         pass
+
+    # Map legacy el-{i}-{cid} (and hash renames after text edit) onto new ids
+    try:
+        n_mig = _migrate_note_layout_ids(deck)
+        if n_mig:
+            _SESSION["_layout_dirty"] = True
+            _SESSION["_layout_ids_migrated"] = int(n_mig)
+    except Exception as e:
+        _SESSION["_layout_migrate_err"] = str(e)
 
     # Restore deck theme / background from layout note (dark default)
     try:
@@ -3693,6 +3706,187 @@ def _token_plain(token: Any) -> str:
     return "".join(parts)
 
 
+# Legacy note piece ids: el-{index}-{cell_id} (shift when blocks insert/delete).
+_LEGACY_NOTE_EL_RE = re.compile(r"^el-(\d+)-(.+)$")
+# Stable content-hash ids: el-n-{cell_id}-{hash10}[ -disambig]
+_STABLE_NOTE_EL_RE = re.compile(r"^el-n-(.+)-([0-9a-f]{8,16})(?:-(\d+))?$")
+
+
+def _cell_ids_match(a: str | None, b: str | None) -> bool:
+    if a is None or b is None:
+        return False
+    return str(a).lstrip("_") == str(b).lstrip("_")
+
+
+def _note_piece_fingerprint(kind: str, content: str = "", html: str = "") -> str:
+    """Normalized fingerprint for stable ids (kind + text / image path)."""
+    kind = (kind or "paragraph").strip().lower()
+    text = (content or "").strip()
+    if not text and html:
+        text = re.sub(r"<[^>]+>", " ", html or "")
+        text = html_module.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    if kind == "image":
+        src = ""
+        m = _MD_IMG_RE.search(content or "") or _MD_IMG_RE.search(html or "")
+        if m:
+            src = (m.group(2) or "").strip()
+            if " " in src and not src.startswith("data:"):
+                src = src.split()[0].strip("\"'")
+        if not src:
+            sm = re.search(r"""(?i)\bsrc\s*=\s*["']([^"']+)["']""", html or "")
+            if sm:
+                src = html_module.unescape(sm.group(1) or "").strip()
+        if src.startswith("data:"):
+            src = "data-image"
+        text = f"img:{src[:240]}"
+    return f"{kind}|{text}"
+
+
+def _stable_note_el_id(
+    cell_id: str,
+    kind: str,
+    content: str = "",
+    html: str = "",
+    *,
+    used: dict[str, int] | None = None,
+) -> str:
+    """Content-stable id: ``el-n-{cell_id}-{sha1[:10]}`` (+ ``-N`` if collision)."""
+    fp = _note_piece_fingerprint(kind, content, html)
+    h = hashlib.sha1(fp.encode("utf-8")).hexdigest()[:10]
+    base = f"el-n-{cell_id}-{h}"
+    if used is None:
+        return base
+    n = used.get(base, 0)
+    used[base] = n + 1
+    return base if n == 0 else f"{base}-{n}"
+
+
+def _assign_stable_note_ids(pieces: list[dict], cell_id: str) -> list[dict]:
+    """Stamp each piece with a content-stable ``id`` (mutates copies)."""
+    used: dict[str, int] = {}
+    out: list[dict] = []
+    for p in pieces:
+        p = dict(p)
+        kind = p.get("kind") or "paragraph"
+        content = p.get("content") or ""
+        html = p.get("html") or ""
+        p["id"] = _stable_note_el_id(
+            cell_id, kind, content, html, used=used
+        )
+        out.append(p)
+    return out
+
+
+def _layout_key_cell_id(el_id: str) -> str | None:
+    """Extract cell_id from a note/code/output layout key, if recognizable."""
+    if not el_id:
+        return None
+    if el_id.startswith("el-code-"):
+        return el_id[len("el-code-") :]
+    if el_id.startswith("el-output-"):
+        return el_id[len("el-output-") :]
+    m = _STABLE_NOTE_EL_RE.match(el_id)
+    if m:
+        return m.group(1)
+    m = _LEGACY_NOTE_EL_RE.match(el_id)
+    if m:
+        return m.group(2)
+    return None
+
+
+def _is_note_layout_key(el_id: str) -> bool:
+    if not el_id or el_id.startswith("el-code-") or el_id.startswith("el-output-"):
+        return False
+    return bool(_LEGACY_NOTE_EL_RE.match(el_id) or _STABLE_NOTE_EL_RE.match(el_id))
+
+
+def _migrate_note_layout_ids(deck: "Deck") -> int:
+    """Reconcile layout keys after note re-parse.
+
+    1. Exact id match keeps layout.
+    2. Remaining keys for a cell are matched **in source order** to new pieces
+       without layout (covers text edits → new hash, and legacy ``el-i-cid``).
+    3. Leftover **legacy** index keys are dropped (safe after zip).
+
+    Returns number of keys remapped or removed.
+    """
+    if deck is None or not isinstance(deck.layout, dict):
+        return 0
+    els = deck.layout.setdefault("elements", {})
+    if not isinstance(els, dict) or not els:
+        return 0
+
+    # Live note pieces in DOM order per cell
+    by_cell: dict[str, list[str]] = {}
+    for eid, el in (deck.elements or {}).items():
+        if el.kind in ("code", "output"):
+            continue
+        by_cell.setdefault(el.cell_id, []).append(eid)
+
+    changed = 0
+    for cid, new_ids in by_cell.items():
+        # Layout keys that belong to this cell (note pieces only)
+        cell_keys: list[str] = []
+        for k in list(els.keys()):
+            if not _is_note_layout_key(k):
+                continue
+            kcid = _layout_key_cell_id(k)
+            if kcid is not None and _cell_ids_match(kcid, cid):
+                cell_keys.append(k)
+
+        def _sort_key(k: str) -> tuple:
+            m = _LEGACY_NOTE_EL_RE.match(k)
+            if m:
+                return (0, int(m.group(1)), k)
+            # stable: keep relative order via original list position
+            try:
+                return (1, cell_keys.index(k), k)
+            except ValueError:
+                return (1, 0, k)
+
+        cell_keys_sorted = sorted(cell_keys, key=_sort_key)
+
+        claimed: set[str] = set()
+        # Exact matches
+        for nid in new_ids:
+            if nid in els:
+                claimed.add(nid)
+
+        unmatched_new = [nid for nid in new_ids if nid not in claimed]
+        unmatched_old = [k for k in cell_keys_sorted if k not in claimed]
+
+        for nid, old_k in zip(unmatched_new, unmatched_old):
+            if old_k not in els:
+                continue
+            if nid == old_k:
+                claimed.add(nid)
+                continue
+            if nid in els:
+                # New id already has its own layout; drop obsolete key
+                if old_k in els and old_k != nid:
+                    els.pop(old_k, None)
+                    changed += 1
+                continue
+            els[nid] = els.pop(old_k)
+            claimed.add(nid)
+            claimed.add(old_k)
+            changed += 1
+
+        # Drop leftover legacy index keys for this cell (no longer mapped)
+        for k in list(els.keys()):
+            if not _LEGACY_NOTE_EL_RE.match(k):
+                continue
+            kcid = _layout_key_cell_id(k)
+            if kcid is not None and _cell_ids_match(kcid, cid) and k not in new_ids:
+                els.pop(k, None)
+                changed += 1
+
+    if changed:
+        deck.layout["elements"] = els
+    return changed
+
+
 def parse_note_to_elements(
     source: str,
     cell_id: str,
@@ -3700,7 +3894,8 @@ def parse_note_to_elements(
 ) -> list[dict]:
     """Split a note cell into fine-grained elements (S2-D).
 
-    Returns ``[{id, kind, html, content}, ...]`` with ids ``el-{idx}-{cell_id}``.
+    Returns ``[{id, kind, html, content}, ...]`` with **content-stable** ids
+    ``el-n-{cell_id}-{hash}`` (not positional — layout survives insert/reorder).
     """
     source = _resolve_note_attachments(source or "", nb_attachments)
     out: list[dict] = []
@@ -3709,10 +3904,9 @@ def parse_note_to_elements(
         html = (html or "").strip()
         if not html:
             return
-        idx = len(out)
         out.append(
             {
-                "id": f"el-{idx}-{cell_id}",
+                "id": "",  # assigned in _assign_stable_note_ids
                 "kind": kind,
                 "html": html,
                 "content": content or "",
@@ -3776,7 +3970,7 @@ def parse_note_to_elements(
 
                     emit(kind, _restore_math_in_html(html, math_blocks), plain)
             if out:
-                return out
+                return _assign_stable_note_ids(out, cell_id)
         except Exception as e:
             try:
                 _SESSION["_note_parse_err"] = str(e)
@@ -3918,7 +4112,7 @@ def _parse_note_to_elements_basic(source: str, cell_id: str) -> list[dict]:
             return
         out.append(
             {
-                "id": f"el-{len(out)}-{cell_id}",
+                "id": "",  # assigned in _assign_stable_note_ids
                 "kind": kind,
                 "html": html,
                 "content": content,
@@ -3999,7 +4193,7 @@ def _parse_note_to_elements_basic(source: str, cell_id: str) -> list[dict]:
                 emit("paragraph", inner, block)
     if not out and (source or "").strip():
         emit("paragraph", _note_to_html_basic(source), source)
-    return out
+    return _assign_stable_note_ids(out, cell_id)
 
 
 def _code_block_html(cell: Cell, *, style: str = "", extra_attrs: str = "") -> str:
@@ -9096,8 +9290,10 @@ async def sslive(
     _SESSION["echo_to_dialog"] = echo_to_dialog
     _SESSION["theme"] = deck.theme or theme_dict_for("dark")
 
-    # Rewrite layout note if we stripped a multi-MB data-URL background
-    if _SESSION.pop("_layout_scrubbed_bg_blob", False):
+    # Quiet rewrite if we scrubbed a huge bg blob or migrated note layout ids
+    if _SESSION.pop("_layout_scrubbed_bg_blob", False) or _SESSION.pop(
+        "_layout_ids_migrated", 0
+    ):
         try:
             await flush_layout_save(quiet=True, force=True)
         except Exception as e:
@@ -9183,11 +9379,13 @@ async def sslive(
 
         # Layout note is a *different* dialog message — create if missing only.
         # Never touch the launcher cell again (would re-flash the iframe).
+        # refocus=False: ensure_layout on a warm open is a no-op write; focusing
+        # it was a common source of first-open preview flash.
         async def _deferred_layout_only():
             try:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.35)
                 async with hold_dialog_focus(
-                    ms=6000, refocus=True, soft=True, settle=0.08
+                    ms=4000, refocus=False, soft=True, settle=0.0
                 ):
                     await ensure_layout_note(quiet=True)
             except Exception as e:

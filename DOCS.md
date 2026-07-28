@@ -172,7 +172,11 @@ await save_layout() / await flush_layout_save()
 await ensure_layout_note()
 ```
 
-Fragment ids `el-{index}-{cell_id}` can orphan after note re-split if block count changes.
+Note piece ids are **content-stable**: `el-n-{cell_id}-{hash}` from kind + text
+(image path for images). Inserting/reordering blocks no longer shifts layout.
+Legacy `el-{index}-{cell_id}` keys are migrated on load (positional match).
+A single-bullet text edit gets a new hash; layout is remapped by order among
+unmatched pieces when possible.
 
 ---
 
@@ -228,10 +232,10 @@ Does **not** include: live Run, layout edit, host-only viewers without embed.
 
 ### Follow-ups
 
-- Less first-open preview flash
-- Stable note fragment ids
 - Optional offline Plotly / HL bundles
 - Thin package split if the single file grows too large
+- Logo / per-slide backgrounds
+- Asset path picker (list images in notebook dir)
 
 ### Standalone execute (no CRAFT)
 
