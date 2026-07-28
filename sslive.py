@@ -758,7 +758,7 @@ _COLOR_SAFE_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})
 
 
 def _empty_layout() -> dict:
-    return {"version": 1, "elements": {}, "deck": {}}
+    return {"version": 1, "elements": {}, "deck": {}, "slides": {}}
 
 
 def _normalize_layout(data: Any) -> dict:
@@ -772,6 +772,13 @@ def _normalize_layout(data: Any) -> dict:
         dk = data.get("deck")
         if isinstance(dk, dict):
             lay["deck"] = dict(dk)
+        sl = data.get("slides")
+        if isinstance(sl, dict):
+            clean_sl: dict[str, dict] = {}
+            for k, v in sl.items():
+                if isinstance(v, dict):
+                    clean_sl[str(k)] = dict(v)
+            lay["slides"] = clean_sl
     return lay
 
 
@@ -2919,6 +2926,86 @@ def deck_theme_name(layout: dict | None) -> str:
     return resolve_theme_name(deck_meta(layout).get("theme"))
 
 
+# Slide change animations (CSS-only; default none = instant)
+_TRANSITIONS = frozenset({"none", "fade", "slide-x", "slide-y"})
+_TRANSITION_ALIASES = {
+    "horizontal": "slide-x",
+    "slide-h": "slide-x",
+    "h": "slide-x",
+    "vertical": "slide-y",
+    "slide-v": "slide-y",
+    "v": "slide-y",
+    "crossfade": "fade",
+}
+
+
+def resolve_transition(name: Any) -> str:
+    """Normalize to ``none`` | ``fade`` | ``slide-x`` | ``slide-y``."""
+    n = str(name or "none").strip().lower().replace("_", "-")
+    n = _TRANSITION_ALIASES.get(n, n)
+    return n if n in _TRANSITIONS else "none"
+
+
+def deck_transition(layout: dict | None) -> str:
+    return resolve_transition(deck_meta(layout).get("transition"))
+
+
+def deck_logo_ref(layout: dict | None) -> str | None:
+    """Deck logo path/URL (short ref only — not a data blob)."""
+    logo = deck_meta(layout).get("logo")
+    if not isinstance(logo, str):
+        return None
+    s = logo.strip()
+    if not s or s.startswith("data:"):
+        return None
+    if s.startswith(("https://", "http://")):
+        return s
+    return _sanitize_image_path_ref(s) or s
+
+
+def slides_meta_map(layout: dict | None) -> dict[str, dict]:
+    if not isinstance(layout, dict):
+        return {}
+    sl = layout.get("slides")
+    if not isinstance(sl, dict):
+        return {}
+    return {str(k): dict(v) for k, v in sl.items() if isinstance(v, dict)}
+
+
+def slide_meta(layout: dict | None, index: int) -> dict:
+    """Per-slide overrides: background, transition, …"""
+    m = slides_meta_map(layout).get(str(int(index)))
+    return dict(m) if isinstance(m, dict) else {}
+
+
+def slide_background_spec(layout: dict | None, index: int) -> dict | None:
+    """Slide-level bg override only (not deck cascade)."""
+    bg = slide_meta(layout, index).get("background")
+    if not isinstance(bg, dict):
+        return None
+    out: dict[str, str] = {}
+    color = bg.get("color")
+    image = bg.get("image")
+    if isinstance(color, str) and _COLOR_SAFE_RE.match(color.strip()):
+        out["color"] = color.strip()
+    if isinstance(image, str) and image.strip():
+        s = image.strip()
+        if s.startswith("data:"):
+            if len(s) <= _MAX_STORED_DATA_URL:
+                out["image"] = s
+        else:
+            out["image"] = s
+    return out or None
+
+
+def resolve_slide_transition(layout: dict | None, index: int) -> str:
+    """Effective transition for a slide (slide override → deck → none)."""
+    sm = slide_meta(layout, index)
+    if "transition" in sm and sm.get("transition") not in (None, "", "inherit"):
+        return resolve_transition(sm.get("transition"))
+    return deck_transition(layout)
+
+
 def deck_background_spec(layout: dict | None) -> dict | None:
     """Deck-wide background override: ``{color}`` and/or ``{image}``, or None.
 
@@ -3201,17 +3288,48 @@ def _scrub_layout_bg_blobs(layout: dict) -> bool:
     return True
 
 
+def _clean_bg_dict(background: dict | None) -> dict[str, str] | None:
+    """Sanitize a background {{color?, image?}} map for layout storage."""
+    if not isinstance(background, dict):
+        return None
+    cleaned: dict[str, str] = {}
+    c = background.get("color")
+    img = background.get("image")
+    if isinstance(c, str) and _COLOR_SAFE_RE.match(c.strip()):
+        cleaned["color"] = c.strip()
+    if isinstance(img, str) and img.strip():
+        s = img.strip()
+        if s.startswith("data:image/"):
+            if len(s) <= _MAX_STORED_DATA_URL:
+                cleaned["image"] = s
+            else:
+                try:
+                    _SESSION["_bg_data_url_rejected"] = len(s)
+                except Exception:
+                    pass
+        elif s.startswith(("https://", "http://")):
+            cleaned["image"] = s
+        else:
+            path_ref = _sanitize_image_path_ref(s)
+            if path_ref:
+                found = _resolve_image_path(path_ref)
+                cleaned["image"] = found.name if found is not None else path_ref
+    return cleaned or None
+
+
 def apply_deck_appearance(
     deck: "Deck",
     *,
     theme: Any = _UNSET,
     background: Any = _UNSET,
+    transition: Any = _UNSET,
+    logo: Any = _UNSET,
 ) -> dict:
     """Update ``deck.layout['deck']`` and ``deck.theme`` palette.
 
-    ``background=None`` clears a custom deck background.
-    Background ``image`` should be a **host path** or http(s) URL — not a
-    multi-MB data URL (those bloat the layout note).
+    ``background=None`` / ``logo=None`` clear those fields.
+    Background ``image`` and logo should be **host paths** (not multi-MB data URLs).
+    ``transition``: ``none`` | ``fade`` | ``slide-x`` | ``slide-y``.
     """
     if deck.layout is None or not isinstance(deck.layout, dict):
         deck.layout = _empty_layout()
@@ -3222,40 +3340,81 @@ def apply_deck_appearance(
         if background is None:
             meta.pop("background", None)
         elif isinstance(background, dict):
-            cleaned: dict[str, str] = {}
-            c = background.get("color")
-            img = background.get("image")
-            if isinstance(c, str) and _COLOR_SAFE_RE.match(c.strip()):
-                cleaned["color"] = c.strip()
-            if isinstance(img, str) and img.strip():
-                s = img.strip()
-                if s.startswith("data:image/"):
-                    # Refuse to persist large blobs; tiny ones OK
-                    if len(s) <= _MAX_STORED_DATA_URL:
-                        cleaned["image"] = s
-                    else:
-                        try:
-                            _SESSION["_bg_data_url_rejected"] = len(s)
-                        except Exception:
-                            pass
-                elif s.startswith(("https://", "http://")):
-                    cleaned["image"] = s
-                else:
-                    path_ref = _sanitize_image_path_ref(s)
-                    if path_ref:
-                        # Prefer storing the basename if file resolves
-                        found = _resolve_image_path(path_ref)
-                        cleaned["image"] = (
-                            found.name if found is not None else path_ref
-                        )
+            cleaned = _clean_bg_dict(background)
             if cleaned:
                 meta["background"] = cleaned
             else:
                 meta.pop("background", None)
         else:
             raise TypeError("background must be a dict or None")
+    if transition is not _UNSET:
+        if transition is None or str(transition).strip() in ("", "inherit"):
+            meta.pop("transition", None)
+        else:
+            meta["transition"] = resolve_transition(transition)
+    if logo is not _UNSET:
+        if logo is None or str(logo).strip() == "":
+            meta.pop("logo", None)
+        else:
+            s = str(logo).strip()
+            if s.startswith("data:"):
+                try:
+                    _SESSION["_logo_data_url_rejected"] = True
+                except Exception:
+                    pass
+            elif s.startswith(("https://", "http://")):
+                meta["logo"] = s
+            else:
+                path_ref = _sanitize_image_path_ref(s)
+                if path_ref:
+                    found = _resolve_image_path(path_ref)
+                    meta["logo"] = found.name if found is not None else path_ref
     deck.layout["deck"] = meta
     deck.theme = theme_dict_for(meta.get("theme"))
+    return meta
+
+
+def apply_slide_meta(
+    deck: "Deck",
+    index: int,
+    *,
+    background: Any = _UNSET,
+    transition: Any = _UNSET,
+) -> dict:
+    """Update ``layout['slides'][str(index)]`` overrides (color / transition).
+
+    Pass ``background=None`` or ``transition=None`` to clear that override
+    (inherit deck). Returns the slide meta map after update.
+    """
+    if deck.layout is None or not isinstance(deck.layout, dict):
+        deck.layout = _empty_layout()
+    slides = deck.layout.setdefault("slides", {})
+    if not isinstance(slides, dict):
+        slides = {}
+        deck.layout["slides"] = slides
+    key = str(int(index))
+    meta = dict(slides.get(key) or {}) if isinstance(slides.get(key), dict) else {}
+    if background is not _UNSET:
+        if background is None:
+            meta.pop("background", None)
+        elif isinstance(background, dict):
+            cleaned = _clean_bg_dict(background)
+            if cleaned:
+                meta["background"] = cleaned
+            else:
+                meta.pop("background", None)
+        else:
+            raise TypeError("background must be a dict or None")
+    if transition is not _UNSET:
+        if transition is None or str(transition).strip() in ("", "inherit"):
+            meta.pop("transition", None)
+        else:
+            meta["transition"] = resolve_transition(transition)
+    if meta:
+        slides[key] = meta
+    else:
+        slides.pop(key, None)
+    deck.layout["slides"] = slides
     return meta
 
 
@@ -3325,6 +3484,83 @@ def _deck_bg_for_js(layout: dict | None) -> dict | None:
             # keep path even if missing so gear shows what was requested
             out["path"] = img
     return out or None
+
+
+def _slides_meta_for_js(layout: dict | None) -> dict[str, dict]:
+    """Per-slide overrides for the presenter (colors as stored; no huge blobs)."""
+    out: dict[str, dict] = {}
+    for k, meta in slides_meta_map(layout).items():
+        entry: dict[str, Any] = {}
+        bg = meta.get("background")
+        if isinstance(bg, dict):
+            c = bg.get("color")
+            if isinstance(c, str) and _COLOR_SAFE_RE.match(c.strip()):
+                entry["background"] = {"color": c.strip()}
+        if "transition" in meta and meta.get("transition") not in (
+            None,
+            "",
+            "inherit",
+        ):
+            entry["transition"] = resolve_transition(meta.get("transition"))
+        if entry:
+            out[str(k)] = entry
+    return out
+
+
+def _deck_logo_data_url(layout: dict | None) -> str | None:
+    """Resolved logo for ``<img src>`` (downsized data URL or http)."""
+    ref = deck_logo_ref(layout)
+    if not ref:
+        return None
+    if ref.startswith(("https://", "http://")):
+        return ref
+    return _media_ref_to_data_url(ref, max_edge=320, quality=85)
+
+
+def _slide_section_open_tag(
+    deck: "Deck",
+    slide: "Slide",
+    *,
+    active: bool = False,
+) -> str:
+    """``<section …>`` with per-slide bg color + transition data attrs."""
+    cls = "slide title-slide" if slide.is_title else "slide"
+    if active:
+        cls += " active"
+    else:
+        cls += " hidden"
+    idx = int(slide.index)
+    lay = deck.layout if isinstance(deck.layout, dict) else {}
+    sm = slide_meta(lay, idx)
+    # Effective transition for data-attr (inherit encoded as empty)
+    if "transition" in sm and sm.get("transition") not in (None, "", "inherit"):
+        t_attr = resolve_transition(sm.get("transition"))
+    else:
+        t_attr = ""
+    style_parts: list[str] = []
+    bg = slide_background_spec(lay, idx)
+    if bg and bg.get("color"):
+        style_parts.append(f"background-color:{bg['color']}")
+    if bg and bg.get("image"):
+        url = _resolve_bg_image_css_url(bg["image"])
+        if url:
+            style_parts.append(f"background-image:url({url})")
+            style_parts.append("background-size:cover")
+            style_parts.append("background-position:center")
+    style_attr = ""
+    if style_parts:
+        style_attr = f' style="{html_module.escape(";".join(style_parts) + ";")}"'
+    t_html = (
+        f' data-transition="{html_module.escape(t_attr)}"' if t_attr else ""
+    )
+    bg_color = (bg or {}).get("color") or ""
+    bg_html = (
+        f' data-bg-color="{html_module.escape(bg_color)}"' if bg_color else ""
+    )
+    return (
+        f'<section class="{cls}" data-slide="{idx}"'
+        f"{t_html}{bg_html}{style_attr}>"
+    )
 
 
 _SESSION: dict[str, Any] = {
@@ -4386,11 +4622,9 @@ def _slide_html(deck: Deck, slide: Slide, *, active: bool = False) -> str:
                     extra_attrs=_reveal_attr(ospec),
                 )
             )
-    cls = "slide title-slide" if slide.is_title else "slide"
-    hidden = " active" if active else " hidden"
     return (
-        f'<section class="{cls}{hidden}" data-slide="{slide.index}">'
-        f'{"".join(parts)}</section>'
+        f"{_slide_section_open_tag(deck, slide, active=active)}"
+        f"{''.join(parts)}</section>"
     )
 
 
@@ -4414,6 +4648,18 @@ def generate_presenter_html(
     theme_name_js = json.dumps(theme_name)
     # path for gear field + resolved data URL for live CSS (not stored in note)
     deck_bg_js = json.dumps(_deck_bg_for_js(deck.layout))
+    deck_transition_js = json.dumps(deck_transition(deck.layout))
+    slides_meta_js = json.dumps(_slides_meta_for_js(deck.layout))
+    logo_src = _deck_logo_data_url(deck.layout)
+    logo_path = deck_logo_ref(deck.layout) or ""
+    logo_src_js = json.dumps(logo_src or "")
+    logo_path_js = json.dumps(logo_path)
+    logo_img_html = ""
+    if logo_src:
+        logo_img_html = (
+            f'<img id="deck-logo" src="{html_module.escape(logo_src, quote=True)}" '
+            f'alt="" draggable="false" />'
+        )
     n_slides = len(deck.slides)
     initial_slide = max(0, min(int(initial_slide), max(0, n_slides - 1)))
     slides_html = "\n".join(
@@ -4442,13 +4688,83 @@ def generate_presenter_html(
       font-family: system-ui, -apple-system, Segoe UI, sans-serif; overflow:hidden; {custom_bg_css} }}
     #viewport {{ width:100vw; height:100vh; position:relative; overflow:hidden; }}
     #stage {{ position:absolute; left:0; top:0; transform-origin: top left; width:1920px; height:1080px; }}
-    .slide {{ width:1920px; height:1080px; padding:48px 72px; display:none; flex-direction:column;
-      justify-content:flex-start; align-items:stretch; overflow:hidden; gap:10px; position:relative; }}
-    .slide.active {{ display:flex; }}
-    .slide.hidden {{ display:none; }}
+    #slides-container {{ position:relative; width:1920px; height:1080px; overflow:hidden; }}
+    /* Slides stacked for CSS transitions (transform/opacity only) */
+    .slide {{ width:1920px; height:1080px; padding:48px 72px; display:flex; flex-direction:column;
+      justify-content:flex-start; align-items:stretch; overflow:hidden; gap:10px;
+      position:absolute; left:0; top:0; box-sizing:border-box;
+      opacity:0; visibility:hidden; pointer-events:none; z-index:0;
+      transition: none; background-color:transparent; }}
+    .slide.active {{ opacity:1; visibility:visible; pointer-events:auto; z-index:2; }}
+    .slide.hidden {{ opacity:0; visibility:hidden; pointer-events:none; z-index:0; }}
+    .slide.ss-exit, .slide.ss-enter {{ visibility:visible; pointer-events:none; z-index:1; }}
+    .slide.ss-enter {{ z-index:3; }}
+    /* fade */
+    body.ss-fx-fade .slide.ss-exit {{ transition: opacity 0.28s ease; opacity:0; }}
+    body.ss-fx-fade .slide.ss-enter {{ opacity:0; }}
+    body.ss-fx-fade .slide.ss-enter.ss-run {{ transition: opacity 0.28s ease; opacity:1; }}
+    /* slide horizontal */
+    body.ss-fx-slide-x.ss-dir-fwd .slide.ss-exit {{ transition: transform 0.28s ease, opacity 0.28s ease;
+      transform:translateX(-12%); opacity:0; }}
+    body.ss-fx-slide-x.ss-dir-fwd .slide.ss-enter {{ transform:translateX(14%); opacity:0; }}
+    body.ss-fx-slide-x.ss-dir-fwd .slide.ss-enter.ss-run {{ transition: transform 0.28s ease, opacity 0.28s ease;
+      transform:translateX(0); opacity:1; }}
+    body.ss-fx-slide-x.ss-dir-back .slide.ss-exit {{ transition: transform 0.28s ease, opacity 0.28s ease;
+      transform:translateX(12%); opacity:0; }}
+    body.ss-fx-slide-x.ss-dir-back .slide.ss-enter {{ transform:translateX(-14%); opacity:0; }}
+    body.ss-fx-slide-x.ss-dir-back .slide.ss-enter.ss-run {{ transition: transform 0.28s ease, opacity 0.28s ease;
+      transform:translateX(0); opacity:1; }}
+    /* slide vertical */
+    body.ss-fx-slide-y.ss-dir-fwd .slide.ss-exit {{ transition: transform 0.28s ease, opacity 0.28s ease;
+      transform:translateY(-10%); opacity:0; }}
+    body.ss-fx-slide-y.ss-dir-fwd .slide.ss-enter {{ transform:translateY(12%); opacity:0; }}
+    body.ss-fx-slide-y.ss-dir-fwd .slide.ss-enter.ss-run {{ transition: transform 0.28s ease, opacity 0.28s ease;
+      transform:translateY(0); opacity:1; }}
+    body.ss-fx-slide-y.ss-dir-back .slide.ss-exit {{ transition: transform 0.28s ease, opacity 0.28s ease;
+      transform:translateY(10%); opacity:0; }}
+    body.ss-fx-slide-y.ss-dir-back .slide.ss-enter {{ transform:translateY(-12%); opacity:0; }}
+    body.ss-fx-slide-y.ss-dir-back .slide.ss-enter.ss-run {{ transition: transform 0.28s ease, opacity 0.28s ease;
+      transform:translateY(0); opacity:1; }}
+    @media (prefers-reduced-motion: reduce) {{
+      body.ss-fx-fade .slide.ss-exit,
+      body.ss-fx-fade .slide.ss-enter.ss-run,
+      body.ss-fx-slide-x .slide.ss-exit,
+      body.ss-fx-slide-x .slide.ss-enter.ss-run,
+      body.ss-fx-slide-y .slide.ss-exit,
+      body.ss-fx-slide-y .slide.ss-enter.ss-run {{ transition: none !important; }}
+    }}
     /* Edit mode: allow panning the stage if freeform boxes extend past the frame */
     body.editing .slide {{ overflow:auto; }}
+    body.editing .slide.hidden {{ display:none !important; opacity:0; }}
+    body.editing .slide.active {{ display:flex !important; }}
     .title-slide {{ justify-content:center; align-items:center; text-align:center; }}
+    #deck-logo {{
+      position:fixed; right:20px; bottom:58px; z-index:45; max-height:56px; max-width:160px;
+      width:auto; height:auto; object-fit:contain; pointer-events:none; opacity:0.92;
+      filter:drop-shadow(0 2px 6px rgba(0,0,0,0.35)); }}
+    body.editing #deck-logo {{ opacity:0.55; }}
+    #slide-chip {{
+      display:none; position:fixed; left:16px; bottom:16px; z-index:52;
+      align-items:center; gap:8px; flex-wrap:wrap;
+      background:rgba(3,7,18,0.94); border:1px solid #4b5563; color:#e5e7eb;
+      padding:6px 10px; border-radius:8px; font:12px/1.3 system-ui,sans-serif;
+      box-shadow:0 6px 20px rgba(0,0,0,0.5); }}
+    body.editing #slide-chip {{ display:flex; }}
+    #slide-chip .sc-label {{ color:#93c5fd; font-weight:700; font-size:11px;
+      letter-spacing:0.04em; text-transform:uppercase; }}
+    #slide-chip input[type=color] {{
+      width:28px; height:24px; padding:0; border:1px solid #4b5563; border-radius:4px;
+      background:#1f2937; cursor:pointer; }}
+    #slide-chip select {{
+      background:#1f2937; border:1px solid #4b5563; color:#e5e7eb; border-radius:6px;
+      padding:3px 6px; font-size:12px; }}
+    #slide-chip button {{
+      background:#1f2937; border:1px solid #4b5563; color:#e5e7eb; border-radius:6px;
+      padding:3px 8px; font-size:12px; cursor:pointer; }}
+    #slide-chip button:hover {{ border-color:#60a5fa; color:#93c5fd; }}
+    #gear-pop select.gear-select {{
+      background:#0f172a; border:1px solid #4b5563; color:#e5e7eb; border-radius:6px;
+      padding:5px 8px; font-size:12px; }}
     /* Regular slides: large type, tight vertical rhythm for projection */
     .slide:not(.title-slide) {{ padding:56px 96px; gap:12px; }}
     /* Base ~44px body; headings scale in em so layout `fs` still works.
@@ -4742,7 +5058,17 @@ def generate_presenter_html(
     let deckTheme = {theme_name_js};
     // color, path (host filename), image (resolved data URL for CSS only)
     let deckBg = {deck_bg_js};
+    let deckTransition = {deck_transition_js} || 'none';
+    let slidesMeta = {slides_meta_js} || {{}};  // {{ "0": {{ background, transition }} }}
+    let deckLogoPath = {logo_path_js} || '';
+    const FX_MS = 280;
+    let slideAnimating = false;
+    let slideAnimTimer = null;
     const slides = () => document.querySelectorAll('[data-slide]');
+    const prefersReducedMotion = () => {{
+      try {{ return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); }}
+      catch (e) {{ return false; }}
+    }};
 
     function applyAppearance() {{
       const name = (deckTheme === 'light') ? 'light' : 'dark';
@@ -4823,6 +5149,70 @@ def generate_presenter_html(
       deckTheme = (name === 'light') ? 'light' : 'dark';
       applyAppearance();
       postDeckPatch({{ theme: deckTheme }});
+    }}
+    function setDeckTransition(name) {{
+      const n = String(name || 'none').toLowerCase();
+      deckTransition = (['none','fade','slide-x','slide-y'].indexOf(n) >= 0) ? n : 'none';
+      document.querySelectorAll('#gear-fx-none,#gear-fx-fade,#gear-fx-slide-x,#gear-fx-slide-y').forEach((b) => {{
+        b.classList.toggle('on', b.dataset.fx === deckTransition);
+      }});
+      const sel = document.getElementById('gear-fx-select');
+      if (sel) sel.value = deckTransition;
+      postDeckPatch({{ transition: deckTransition }});
+    }}
+    function postSlidePatch(patch) {{
+      try {{ window.parent.__sslive_slide_index = currentSlide; }} catch (e) {{}}
+      try {{
+        window.parent.postMessage({{
+          type: 'sslive_slide',
+          slide_index: currentSlide,
+          patch: patch,
+          t: Date.now()
+        }}, '*');
+        window.parent.__sslive_layout_flush = true;
+        window.parent.postMessage({{ type: 'sslive_layout_flush', t: Date.now() }}, '*');
+      }} catch (e) {{}}
+    }}
+    function slideMetaKey(i) {{ return String(i); }}
+    function getSlideMeta(i) {{
+      return slidesMeta[slideMetaKey(i)] || {{}};
+    }}
+    function setSlideMetaLocal(i, patch) {{
+      const k = slideMetaKey(i);
+      const cur = Object.assign({{}}, slidesMeta[k] || {{}});
+      if (patch.background === null) delete cur.background;
+      else if (patch.background) cur.background = Object.assign({{}}, cur.background || {{}}, patch.background);
+      if (patch.transition === null || patch.transition === 'inherit') delete cur.transition;
+      else if (patch.transition) cur.transition = patch.transition;
+      if (Object.keys(cur).length) slidesMeta[k] = cur;
+      else delete slidesMeta[k];
+    }}
+    function applySlideDomMeta(i) {{
+      const el = slides()[i];
+      if (!el) return;
+      const m = getSlideMeta(i);
+      const color = m.background && m.background.color;
+      if (color) {{
+        el.style.backgroundColor = color;
+        el.dataset.bgColor = color;
+      }} else {{
+        el.style.backgroundColor = '';
+        delete el.dataset.bgColor;
+      }}
+      if (m.transition) el.dataset.transition = m.transition;
+      else {{ delete el.dataset.transition; }}
+    }}
+    function syncSlideChip() {{
+      const m = getSlideMeta(currentSlide);
+      const col = document.getElementById('sc-bg');
+      const fx = document.getElementById('sc-fx');
+      if (col) {{
+        try {{
+          col.value = (m.background && m.background.color && m.background.color.length >= 7)
+            ? m.background.color.slice(0, 7) : '#111827';
+        }} catch (e) {{}}
+      }}
+      if (fx) fx.value = m.transition || '';
     }}
     function persistBackgroundFromGear() {{
       // Persist path (not data URL) + optional color. Host resolves path on rebuild.
@@ -4915,44 +5305,131 @@ def generate_presenter_html(
       }});
     }}
 
-    function showSlide(n, {{ selectFirst, frag }} = {{ selectFirst: true }}) {{
-      closeLiveCodePop({{ sync: true }});
+    function clearFxClasses() {{
+      document.body.classList.remove('ss-fx-fade','ss-fx-slide-x','ss-fx-slide-y','ss-dir-fwd','ss-dir-back');
+      slides().forEach((s) => {{
+        s.classList.remove('ss-exit','ss-enter','ss-run');
+        s.style.transform = '';
+      }});
+    }}
+    function finishSlideAnim() {{
+      if (slideAnimTimer) {{ clearTimeout(slideAnimTimer); slideAnimTimer = null; }}
+      slideAnimating = false;
+      clearFxClasses();
+    }}
+    function resolveFxForSlide(i) {{
+      const el = slides()[i];
+      const t = (el && el.dataset.transition) || '';
+      if (t && t !== 'inherit') return t;
+      const m = getSlideMeta(i);
+      if (m.transition) return m.transition;
+      return deckTransition || 'none';
+    }}
+    function showSlideInstant(n, {{ selectFirst, frag }} = {{ selectFirst: true }}) {{
+      finishSlideAnim();
       const ss = slides();
       if (!ss.length) return;
+      n = Math.max(0, Math.min(n, ss.length - 1));
       ss.forEach((s, i) => {{
         s.classList.toggle('active', i === n);
         s.classList.toggle('hidden', i !== n);
+        s.classList.remove('ss-exit','ss-enter','ss-run');
       }});
-      currentSlide = Math.max(0, Math.min(n, ss.length - 1));
+      currentSlide = n;
       fragStep = (frag == null) ? 0 : frag;
       applyFragments();
-      // tell parent our position (for rebuild recovery)
-      try {{
-        window.parent.__sslive_slide_index = currentSlide;
-      }} catch (e) {{}}
+      try {{ window.parent.__sslive_slide_index = currentSlide; }} catch (e) {{}}
       if (selectFirst) {{
         const first = ss[currentSlide].querySelector('[data-runnable]');
         if (first) selectCell(first.dataset.cellId);
       }}
       placeRsBox();
+      placeToolbar();
+      syncSlideChip();
+    }}
+    function showSlide(n, opts) {{
+      opts = opts || {{}};
+      const selectFirst = opts.selectFirst !== false;
+      const frag = opts.frag;
+      const dir = (opts.dir == null) ? 1 : opts.dir;
+      const instant = !!opts.instant;
+      closeLiveCodePop({{ sync: true }});
+      const ss = slides();
+      if (!ss.length) return;
+      n = Math.max(0, Math.min(n | 0, ss.length - 1));
+      const from = currentSlide;
+      if (from === n) {{
+        fragStep = (frag == null) ? fragStep : frag;
+        applyFragments();
+        syncSlideChip();
+        return;
+      }}
+      let fx = 'none';
+      if (!instant && !editing && !prefersReducedMotion()) {{
+        fx = resolveFxForSlide(n);
+      }}
+      if (fx === 'none' || fx === 'inherit' || !fx) {{
+        showSlideInstant(n, {{ selectFirst, frag }});
+        return;
+      }}
+      // Animated transition between two slides
+      finishSlideAnim();
+      slideAnimating = true;
+      const out = ss[from];
+      const inn = ss[n];
+      if (!out || !inn) {{ showSlideInstant(n, {{ selectFirst, frag }}); return; }}
+      ss.forEach((s) => {{
+        s.classList.remove('active','hidden','ss-exit','ss-enter','ss-run');
+        if (s !== out && s !== inn) s.classList.add('hidden');
+      }});
+      out.classList.add('active', 'ss-exit');
+      inn.classList.add('active', 'ss-enter');
+      inn.classList.remove('hidden');
+      document.body.classList.add('ss-fx-' + fx);
+      document.body.classList.add(dir >= 0 ? 'ss-dir-fwd' : 'ss-dir-back');
+      // double rAF so enter start state paints before .ss-run
+      requestAnimationFrame(() => {{
+        requestAnimationFrame(() => {{
+          inn.classList.add('ss-run');
+          out.classList.add('ss-run');
+        }});
+      }});
+      slideAnimTimer = setTimeout(() => {{
+        out.classList.remove('active','ss-exit','ss-run');
+        out.classList.add('hidden');
+        inn.classList.remove('ss-enter','ss-run');
+        inn.classList.add('active');
+        finishSlideAnim();
+        currentSlide = n;
+        fragStep = (frag == null) ? 0 : frag;
+        applyFragments();
+        try {{ window.parent.__sslive_slide_index = currentSlide; }} catch (e) {{}}
+        if (selectFirst) {{
+          const first = inn.querySelector('[data-runnable]');
+          if (first) selectCell(first.dataset.cellId);
+        }}
+        placeRsBox();
+        placeToolbar();
+        syncSlideChip();
+      }}, FX_MS);
     }}
 
     // → advances reveal steps first, then next slide. ← reverses.
     // Navigation must never toggle edit mode (only ✎ / e do that).
     function goNext() {{
       consumeGotoKeepEdit();
-      if (editing) {{ showSlide(currentSlide + 1); return; }}
+      if (editing) {{ showSlide(currentSlide + 1, {{ instant: true }}); return; }}
       const maxR = maxReveal(slides()[currentSlide]);
       if (fragStep < maxR) {{ fragStep++; applyFragments(); return; }}
-      if (currentSlide < slides().length - 1) showSlide(currentSlide + 1);
+      if (currentSlide < slides().length - 1) showSlide(currentSlide + 1, {{ dir: 1 }});
     }}
     function goPrev() {{
       consumeGotoKeepEdit();
-      if (editing) {{ showSlide(currentSlide - 1); return; }}
+      if (editing) {{ showSlide(currentSlide - 1, {{ instant: true }}); return; }}
       if (fragStep > 0) {{ fragStep--; applyFragments(); return; }}
       if (currentSlide > 0) {{
         const prev = currentSlide - 1;
-        showSlide(prev, {{ selectFirst: false, frag: maxReveal(slides()[prev]) }});
+        showSlide(prev, {{ selectFirst: false, frag: maxReveal(slides()[prev]), dir: -1 }});
       }}
     }}
 
@@ -5380,8 +5857,13 @@ def generate_presenter_html(
         const open = document.querySelector('.note-block.note-text-editing');
         if (open) commitNoteTextEdit(open);
         selectEl(null);
+      }} else {{
+        // Snap any in-flight transition so edit mode sees a stable slide
+        finishSlideAnim();
+        showSlideInstant(currentSlide, {{ selectFirst: false, frag: fragStep }});
       }}
       applyFragments();  // show all while editing; restore hide when done
+      syncSlideChip();
       // Leaving edit mode: persist layout once (host drains patches + save_layout)
       if (was && !editing) {{
         try {{
@@ -6002,7 +6484,7 @@ def generate_presenter_html(
     // Double-click a note piece in edit mode → edit text (writes back to notebook)
     document.addEventListener('dblclick', (e) => {{
       if (!editing) return;
-      if (e.target.closest('#edit-toolbar, #gear-pop, #nav, #live-code-pop')) return;
+      if (e.target.closest('#edit-toolbar, #gear-pop, #slide-chip, #nav, #live-code-pop')) return;
       const nb = e.target.closest('.note-block');
       if (!nb || !NOTE_EDIT_KINDS[nb.dataset.type || '']) return;
       e.preventDefault();
@@ -6013,7 +6495,7 @@ def generate_presenter_html(
 
     document.addEventListener('pointerdown', (e) => {{
       if (!editing || e.button !== 0) return;
-      if (e.target.closest('#edit-toolbar, #gear-pop, #nav, #chrome')) return;
+      if (e.target.closest('#edit-toolbar, #gear-pop, #slide-chip, #nav, #chrome')) return;
       // Clicks inside a contenteditable note: type, don't drag
       const editingNote = e.target.closest('.note-block.note-text-editing');
       if (editingNote) {{
@@ -6209,7 +6691,7 @@ def generate_presenter_html(
     function gotoSlideFromHost(msg) {{
       if (!msg || msg.slide_index == null) return;
       const n = Math.max(0, (+msg.slide_index) | 0);
-      showSlide(n, {{ selectFirst: false, frag: fragStep }});
+      showSlide(n, {{ selectFirst: false, frag: fragStep, instant: true }});
       // Do NOT auto-enter edit mode. keep_edit was re-enabling ✎ whenever
       // arrows rebuilt/restored the slide after a layout save.
       consumeGotoKeepEdit();
@@ -6414,7 +6896,97 @@ def generate_presenter_html(
         if (pathIn) pathIn.value = '';
         setDeckBackground(null);
       }});
+      // Deck transition
+      const fxSel = document.getElementById('gear-fx-select');
+      if (fxSel) {{
+        fxSel.value = deckTransition || 'none';
+        fxSel.addEventListener('change', (e) => {{
+          e.stopPropagation();
+          setDeckTransition(fxSel.value || 'none');
+        }});
+        fxSel.addEventListener('pointerdown', (e) => e.stopPropagation());
+      }}
+      document.querySelectorAll('[data-fx]').forEach((b) => {{
+        b.classList.toggle('on', b.dataset.fx === deckTransition);
+        b.addEventListener('click', (e) => {{
+          e.preventDefault(); e.stopPropagation();
+          setDeckTransition(b.dataset.fx || 'none');
+        }});
+      }});
+      // Logo path
+      const logoIn = document.getElementById('gear-logo-path');
+      if (logoIn) logoIn.value = deckLogoPath || '';
+      document.getElementById('gear-logo-apply')?.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation();
+        const p = ((logoIn && logoIn.value) || '').trim();
+        deckLogoPath = p;
+        postDeckPatch({{ logo: p || null }});
+        // Host rebuilds after flush to resolve logo image
+      }});
+      document.getElementById('gear-logo-clear')?.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation();
+        if (logoIn) logoIn.value = '';
+        deckLogoPath = '';
+        const img = document.getElementById('deck-logo');
+        if (img) img.remove();
+        postDeckPatch({{ logo: null }});
+      }});
+      logoIn?.addEventListener('pointerdown', (e) => e.stopPropagation());
+      logoIn?.addEventListener('keydown', (e) => {{
+        e.stopPropagation();
+        if (e.key === 'Enter') {{
+          e.preventDefault();
+          document.getElementById('gear-logo-apply')?.click();
+        }}
+      }});
       applyAppearance();
+    }})();
+    // Per-slide background + transition (visible in ✎ only)
+    (function wireSlideChip() {{
+      const col = document.getElementById('sc-bg');
+      const fx = document.getElementById('sc-fx');
+      const clear = document.getElementById('sc-bg-clear');
+      col?.addEventListener('input', (e) => {{
+        e.stopPropagation();
+        const v = (col.value || '').trim();
+        if (!v) return;
+        const el = slides()[currentSlide];
+        if (el) {{ el.style.backgroundColor = v; el.dataset.bgColor = v; }}
+        setSlideMetaLocal(currentSlide, {{ background: {{ color: v }} }});
+      }});
+      col?.addEventListener('change', (e) => {{
+        e.stopPropagation();
+        const v = (col.value || '').trim();
+        if (!v) return;
+        setSlideMetaLocal(currentSlide, {{ background: {{ color: v }} }});
+        postSlidePatch({{ background: {{ color: v }} }});
+      }});
+      col?.addEventListener('pointerdown', (e) => e.stopPropagation());
+      clear?.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation();
+        const el = slides()[currentSlide];
+        if (el) {{ el.style.backgroundColor = ''; delete el.dataset.bgColor; }}
+        setSlideMetaLocal(currentSlide, {{ background: null }});
+        postSlidePatch({{ background: null }});
+        syncSlideChip();
+      }});
+      fx?.addEventListener('change', (e) => {{
+        e.stopPropagation();
+        const v = (fx.value || '').trim();
+        if (!v) {{
+          setSlideMetaLocal(currentSlide, {{ transition: null }});
+          postSlidePatch({{ transition: null }});
+          const el = slides()[currentSlide];
+          if (el) delete el.dataset.transition;
+        }} else {{
+          setSlideMetaLocal(currentSlide, {{ transition: v }});
+          postSlidePatch({{ transition: v }});
+          const el = slides()[currentSlide];
+          if (el) el.dataset.transition = v;
+        }}
+      }});
+      fx?.addEventListener('pointerdown', (e) => e.stopPropagation());
+      syncSlideChip();
     }})();
     // Keep floating toolbar glued to the selection on viewport changes
     window.addEventListener('resize', () => {{ placeRsBox(); placeToolbar(); }});
@@ -6693,8 +7265,8 @@ def generate_presenter_html(
       rescale();
     }})();
 
-    // Fresh open: stay on initial_slide. Mid-edit rebuild: apply one-shot goto.
-    showSlide(currentSlide, {{ selectFirst: false }});
+    // Fresh open: stay on initial_slide (instant — no enter animation).
+    showSlide(currentSlide, {{ selectFirst: false, instant: true }});
     try {{
       var pending = window.parent.__sslive_last_result;
       if (pending && pending.type === 'sslive_result') applyRunResult(pending);
@@ -6767,6 +7339,18 @@ def generate_presenter_html(
     <textarea id="live-code-pop-ta" spellcheck="false"></textarea>
     <div class="live-code-pop-rs" title="Drag to resize"></div>
   </div>
+  <div id="slide-chip" aria-label="This slide appearance">
+    <span class="sc-label">Slide</span>
+    <input type="color" id="sc-bg" title="Background color for this slide" value="#111827" />
+    <button type="button" id="sc-bg-clear" title="Use deck background">clear bg</button>
+    <select id="sc-fx" title="Transition into this slide">
+      <option value="">fx: inherit</option>
+      <option value="none">none</option>
+      <option value="fade">fade</option>
+      <option value="slide-x">slide ↔</option>
+      <option value="slide-y">slide ↕</option>
+    </select>
+  </div>
   <div id="gear-pop" role="dialog" aria-label="Deck settings" aria-hidden="true">
     <button type="button" class="gear-close" id="gear-pop-close" aria-label="Close">×</button>
     <h4>Theme</h4>
@@ -6781,6 +7365,23 @@ def generate_presenter_html(
       <input type="text" class="gear-path" id="gear-bg-path" placeholder="bg.jpg" spellcheck="false" />
       <button type="button" class="gear-btn" id="gear-bg-apply" title="Save path (host resolves file)">Apply</button>
       <button type="button" class="gear-btn" id="gear-bg-clear">Clear</button>
+    </div>
+    <h4>Transition</h4>
+    <p class="gear-hint">Default when a slide has no override (✎ chip)</p>
+    <div class="gear-row">
+      <select class="gear-select" id="gear-fx-select" title="Deck transition">
+        <option value="none">none</option>
+        <option value="fade">fade</option>
+        <option value="slide-x">slide horizontal</option>
+        <option value="slide-y">slide vertical</option>
+      </select>
+    </div>
+    <h4>Logo</h4>
+    <p class="gear-hint">Image file in the notebook / data dir (e.g. sslive_logo.png)</p>
+    <div class="gear-row">
+      <input type="text" class="gear-path" id="gear-logo-path" placeholder="sslive_logo.png" spellcheck="false" />
+      <button type="button" class="gear-btn" id="gear-logo-apply">Apply</button>
+      <button type="button" class="gear-btn" id="gear-logo-clear">Clear</button>
     </div>
     <h4>Status</h4>
     <div class="info-status"><span id="status-badge" class="ok">{html_module.escape(backend_label)}</span></div>
@@ -6797,9 +7398,10 @@ def generate_presenter_html(
       <li>Click code · floating editor</li>
     </ul>
   </div>
+  {logo_img_html}
   <div id="nav">
     <button type="button" id="edit-btn" title="Edit layout (e)" aria-label="Edit layout">✎</button>
-    <button type="button" id="gear-btn" title="Theme, background &amp; shortcuts" aria-label="Deck settings"
+    <button type="button" id="gear-btn" title="Theme, background, transition &amp; logo" aria-label="Deck settings"
       aria-expanded="false" aria-controls="gear-pop">⚙</button>
     <button type="button" id="prev-btn" aria-label="Previous">‹</button>
     <span id="slide-counter">1 / {max(n, 1)}</span>
@@ -6899,11 +7501,9 @@ def _slide_html_export(deck: Deck, slide: Slide, *, active: bool = False) -> str
                     portable=True,
                 )
             )
-    cls = "slide title-slide" if slide.is_title else "slide"
-    hidden = " active" if active else " hidden"
     return (
-        f'<section class="{cls}{hidden}" data-slide="{slide.index}">'
-        f'{"".join(parts)}</section>'
+        f"{_slide_section_open_tag(deck, slide, active=active)}"
+        f"{''.join(parts)}</section>"
     )
 
 
@@ -8462,7 +9062,7 @@ if (!window.__sslive_note_bridge_v1) {
     });
   });
 }
-// Deck appearance queue (gear: theme + custom background)
+// Deck appearance queue (gear: theme + custom background + transition + logo)
 if (!window.__sslive_deck_bridge_v1) {
   window.__sslive_deck_bridge_v1 = true;
   window.__sslive_deck_q = window.__sslive_deck_q || [];
@@ -8471,6 +9071,21 @@ if (!window.__sslive_deck_bridge_v1) {
     if (!d || d.type !== 'sslive_deck') return;
     if (d.slide_index != null) window.__sslive_slide_index = d.slide_index;
     window.__sslive_deck_q.push({
+      patch: d.patch || {},
+      slide_index: d.slide_index,
+      t: d.t || Date.now()
+    });
+  });
+}
+// Per-slide appearance (background color, transition override)
+if (!window.__sslive_slide_meta_bridge_v1) {
+  window.__sslive_slide_meta_bridge_v1 = true;
+  window.__sslive_slide_meta_q = window.__sslive_slide_meta_q || [];
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || d.type !== 'sslive_slide') return;
+    if (d.slide_index != null) window.__sslive_slide_index = d.slide_index;
+    window.__sslive_slide_meta_q.push({
       patch: d.patch || {},
       slide_index: d.slide_index,
       t: d.t || Date.now()
@@ -8605,15 +9220,16 @@ def _item_dicts(seq: Any, fields: tuple[str, ...]) -> list[dict]:
 
 
 async def _drain_slide_queue() -> tuple[
-    list[dict], list[dict], bool, list[dict], list[dict]
+    list[dict], list[dict], bool, list[dict], list[dict], list[dict]
 ]:
-    """Pull pending runs, layout/deck patches, flush flag, and note text edits.
+    """Pull pending runs, layout/deck/slide-meta patches, flush, note edits.
 
     One js_eval round-trip drains ``__sslive_q``, ``__sslive_layout_q``,
-    ``__sslive_deck_q``, ``__sslive_note_q``, and ``__sslive_layout_flush``.
+    ``__sslive_deck_q``, ``__sslive_slide_meta_q``, ``__sslive_note_q``,
+    and ``__sslive_layout_flush``.
     """
     if js_eval is None and js_eval_a is None:
-        return [], [], False, [], []
+        return [], [], False, [], [], []
     try:
         res = await _call_js_eval(
             "const r = (window.__sslive_q || []).slice(); "
@@ -8622,33 +9238,39 @@ async def _drain_slide_queue() -> tuple[
             "window.__sslive_layout_q = []; "
             "const d = (window.__sslive_deck_q || []).slice(); "
             "window.__sslive_deck_q = []; "
+            "const sm = (window.__sslive_slide_meta_q || []).slice(); "
+            "window.__sslive_slide_meta_q = []; "
             "const n = (window.__sslive_note_q || []).slice(); "
             "window.__sslive_note_q = []; "
             "const f = !!window.__sslive_layout_flush; "
             "window.__sslive_layout_flush = false; "
-            "return {runs: r, layouts: l, deck: d, notes: n, flush: f};"
+            "return {runs: r, layouts: l, deck: d, slide_meta: sm, notes: n, flush: f};"
         )
         q = _parse_js_eval_result(res)
         if q is None:
-            return [], [], False, [], []
+            return [], [], False, [], [], []
         flush = False
         notes_raw = None
         deck_raw = None
+        slide_meta_raw = None
         if isinstance(q, dict) and (
             "runs" in q
             or "layouts" in q
             or "flush" in q
             or "notes" in q
             or "deck" in q
+            or "slide_meta" in q
         ):
             runs_raw, layouts_raw = q.get("runs"), q.get("layouts")
             notes_raw = q.get("notes")
             deck_raw = q.get("deck")
+            slide_meta_raw = q.get("slide_meta")
             flush = bool(q.get("flush"))
         elif hasattr(q, "runs") or hasattr(q, "layouts"):
             runs_raw, layouts_raw = getattr(q, "runs", None), getattr(q, "layouts", None)
             notes_raw = getattr(q, "notes", None)
             deck_raw = getattr(q, "deck", None)
+            slide_meta_raw = getattr(q, "slide_meta", None)
             flush = bool(getattr(q, "flush", False))
         else:  # old bridge on the page: bare run list
             runs_raw, layouts_raw = q, None
@@ -8658,12 +9280,13 @@ async def _drain_slide_queue() -> tuple[
             flush,
             _item_dicts(notes_raw, ("el_id", "cell_id", "text", "kind", "slide_index")),
             _item_dicts(deck_raw, ("patch", "t", "slide_index")),
+            _item_dicts(slide_meta_raw, ("patch", "t", "slide_index")),
         )
     except Exception as e:
         if _SESSION.get("_bridge_err") != str(e):
             _SESSION["_bridge_err"] = str(e)
             print(f"sslive: bridge poll error: {e}")
-        return [], [], False, [], []
+        return [], [], False, [], [], []
 
 
 def _apply_slide_layout_patches(items: list[dict]) -> int:
@@ -8744,6 +9367,12 @@ def _apply_deck_meta_patches(items: list[dict]) -> int:
             bg = patch.get("background")
             if bg is None or (isinstance(bg, dict) and "image" in bg):
                 _SESSION["_deck_need_refresh"] = True
+        if "transition" in patch:
+            kw["transition"] = patch.get("transition")
+        if "logo" in patch:
+            kw["logo"] = patch.get("logo")
+            # Resolve path → <img> needs rebuild
+            _SESSION["_deck_need_refresh"] = True
         if not kw:
             continue
         try:
@@ -8752,6 +9381,49 @@ def _apply_deck_meta_patches(items: list[dict]) -> int:
             n += 1
         except Exception as e:
             _SESSION["_deck_patch_err"] = str(e)
+    if n:
+        _SESSION["_layout_dirty"] = True
+    return n
+
+
+def _apply_slide_meta_patches(items: list[dict]) -> int:
+    """Apply per-slide background/transition patches from the ✎ slide chip."""
+    deck: Deck | None = _SESSION.get("deck")
+    if deck is None or not items:
+        return 0
+    n = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        sidx = it.get("slide_index")
+        if sidx is None:
+            sidx = _SESSION.get("slide_index") or 0
+        try:
+            idx = max(0, int(sidx))
+        except (TypeError, ValueError):
+            idx = 0
+        try:
+            _SESSION["slide_index"] = idx
+        except Exception:
+            pass
+        patch = it.get("patch") if isinstance(it.get("patch"), dict) else {}
+        if not patch:
+            continue
+        kw: dict[str, Any] = {}
+        if "background" in patch:
+            kw["background"] = patch.get("background")
+            bg = patch.get("background")
+            if isinstance(bg, dict) and bg.get("image"):
+                _SESSION["_deck_need_refresh"] = True
+        if "transition" in patch:
+            kw["transition"] = patch.get("transition")
+        if not kw:
+            continue
+        try:
+            apply_slide_meta(deck, idx, **kw)
+            n += 1
+        except Exception as e:
+            _SESSION["_slide_meta_err"] = str(e)
     if n:
         _SESSION["_layout_dirty"] = True
     return n
@@ -8826,11 +9498,13 @@ async def _bridge_poll_loop() -> None:
                 want_flush,
                 note_edits,
                 deck_patches,
+                slide_meta_patches,
             ) = await _drain_slide_queue()
             # layout first: a Run in the same batch re-renders the output
             # block and must see the just-dragged position
             _apply_slide_layout_patches(layout_patches)
             _apply_deck_meta_patches(deck_patches)
+            _apply_slide_meta_patches(slide_meta_patches)
             note_cells = _apply_note_text_edits(note_edits)
             # Edit-mode exit or gear change → persist layout (quiet).
             # While fullscreen, flush defers the dialog write until FS ends.
@@ -8925,9 +9599,11 @@ async def pump_slide_runs(max_items: int = 20) -> int:
             want_flush,
             note_edits,
             deck_patches,
+            slide_meta_patches,
         ) = await _drain_slide_queue()
         _apply_slide_layout_patches(layout_patches)
         _apply_deck_meta_patches(deck_patches)
+        _apply_slide_meta_patches(slide_meta_patches)
         note_cells = _apply_note_text_edits(note_edits)
         if note_cells:
             try:

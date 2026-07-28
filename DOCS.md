@@ -159,8 +159,30 @@ Theme + background persist in the layout note under `layout.deck`:
 - Huge `data:` backgrounds already saved into the layout note are **scrubbed** on open.
 - Note images `![](photo.jpg)` work the same way: path stays in markdown; host
   inlines a downsized data URL into the slide HTML so srcdoc can show them.
-- Logo and per-slide backgrounds are deferred.  
 While fullscreen: dialog write may be deferred until FS ends (avoids iframe remount).
+
+### Per-slide appearance & transitions
+
+```json
+"deck": {
+  "theme": "dark",
+  "background": { "color": "#111827" },
+  "transition": "none",
+  "logo": "sslive_logo.png"
+},
+"slides": {
+  "2": { "background": { "color": "#1e1b4b" }, "transition": "fade" }
+}
+```
+
+| Control | Scope |
+|---------|--------|
+| ⚙ Transition | Deck default: `none` / `fade` / `slide-x` / `slide-y` (CSS-only, ~280ms) |
+| ⚙ Logo | Path in notebook dir → corner mark (host-resolved, downsized) |
+| ✎ Slide chip | This slide bg color + transition override (`inherit` = deck default) |
+
+Cascade: **slide → deck → theme**. `prefers-reduced-motion` forces instant cuts.
+Edit mode and first paint never animate.
 
 ### API
 
@@ -239,8 +261,8 @@ Does **not** include: live Run, layout edit, host-only viewers without embed.
 
 - Optional offline Plotly / HL bundles
 - Thin package split if the single file grows too large
-- Logo / per-slide backgrounds
 - Asset path picker (list images in notebook dir)
+- Stable slide keys if reordering breaks index-based `slides` meta
 
 ### Standalone execute (no CRAFT)
 
