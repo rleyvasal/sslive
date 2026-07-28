@@ -701,6 +701,17 @@ async def build_deck(
     except Exception as e:
         _SESSION["_layout_migrate_err"] = str(e)
 
+    # New bullets on freeform slides: place below stack (else covered by abs peers)
+    try:
+        n_place = _auto_place_unpositioned_on_freeform_slides(deck)
+        if n_place:
+            _SESSION["_layout_dirty"] = True
+            _SESSION["_layout_auto_placed"] = int(
+                (_SESSION.get("_layout_auto_placed") or 0) + n_place
+            )
+    except Exception as e:
+        _SESSION["_layout_auto_place_err"] = str(e)
+
     # Restore deck theme / background from layout note (dark default)
     try:
         apply_deck_appearance(
@@ -3801,6 +3812,106 @@ def _is_note_layout_key(el_id: str) -> bool:
     return bool(_LEGACY_NOTE_EL_RE.match(el_id) or _STABLE_NOTE_EL_RE.match(el_id))
 
 
+def _estimate_note_el_height(deck: "Deck", el_id: str) -> float:
+    """Rough design-space height for stacking newly placed freeform pieces."""
+    el = (deck.elements or {}).get(el_id)
+    if el is None:
+        return 52.0
+    kind = (el.kind or "paragraph").lower()
+    if kind == "heading":
+        return 72.0
+    if kind == "list_item":
+        # ~1–2 lines at projection size
+        text = (el.content or "").strip()
+        lines = max(1, (len(text) // 70) + 1)
+        return 28.0 + 36.0 * lines
+    if kind == "image":
+        return 360.0
+    if kind == "math":
+        return 80.0
+    if kind in ("code", "table"):
+        return 120.0
+    text = (el.content or "").strip()
+    lines = max(1, text.count("\n") + 1, (len(text) // 80) + 1)
+    return 24.0 + 32.0 * min(lines, 8)
+
+
+def _auto_place_unpositioned_on_freeform_slides(deck: "Deck") -> int:
+    """Place new note pieces that lack x/y when siblings already use freeform.
+
+    After the first freeform drag, pinFlowElements makes every peer absolute.
+    A later-added bullet has no layout entry → stays in document flow at the
+    top of the slide and is **covered** by absolute siblings (looks missing).
+
+    Fix: on each freeform slide, assign absolute x/y/w stacked below the lowest
+    existing box (source order). Returns how many elements were placed.
+    """
+    if deck is None or not isinstance(getattr(deck, "layout", None), dict):
+        return 0
+    n = 0
+    gap = 12.0
+    for slide in deck.slides or []:
+        ids: list[str] = []
+        for cid in slide.cell_ids:
+            cell = deck.cells.get(cid)
+            if cell is None:
+                continue
+            ids.extend(cell.element_ids or [])
+        if not ids:
+            continue
+        specs = [(eid, _layout_spec(deck, eid)) for eid in ids]
+        has_abs = any(
+            sp.get("x") is not None or sp.get("y") is not None for _, sp in specs
+        )
+        if not has_abs:
+            continue
+        default_x = 96.0
+        default_w = 1728.0  # 1920 − 2×96 padding
+        for _, sp in specs:
+            if sp.get("x") is not None:
+                try:
+                    default_x = float(sp["x"])
+                except (TypeError, ValueError):
+                    pass
+                if sp.get("w") is not None:
+                    try:
+                        default_w = float(sp["w"])
+                    except (TypeError, ValueError):
+                        pass
+                break
+        # Walk source order: keep a y cursor under absolute boxes; place gaps.
+        y_cursor = 56.0
+        for eid, sp in specs:
+            is_abs = sp.get("x") is not None or sp.get("y") is not None
+            if is_abs:
+                try:
+                    y = float(sp["y"]) if sp.get("y") is not None else y_cursor
+                except (TypeError, ValueError):
+                    y = y_cursor
+                if sp.get("h") is not None:
+                    try:
+                        h = float(sp["h"])
+                    except (TypeError, ValueError):
+                        h = _estimate_note_el_height(deck, eid)
+                else:
+                    h = _estimate_note_el_height(deck, eid)
+                y_cursor = max(y_cursor, y + h + gap)
+                continue
+            # Unpositioned on a freeform slide → stack below
+            h = _estimate_note_el_height(deck, eid)
+            try:
+                _apply_layout_patch(
+                    deck,
+                    eid,
+                    {"x": default_x, "y": y_cursor, "w": default_w},
+                )
+            except Exception:
+                continue
+            y_cursor += h + gap
+            n += 1
+    return n
+
+
 def _migrate_note_layout_ids(deck: "Deck") -> int:
     """Reconcile layout keys after note re-parse.
 
@@ -4145,9 +4256,11 @@ def _parse_note_to_elements_basic(source: str, cell_id: str) -> list[dict]:
                 emit("image", _image_payload_to_html(block), block)
                 continue
             lines = [ln for ln in block.splitlines() if ln.strip()]
-            if lines and all(re.match(r"^\s*([-*+]|\d+\.)\s+", ln) for ln in lines):
+            # List lines: allow bare "-" / "*" (empty bullet) as well as "- text"
+            _list_ln = re.compile(r"^\s*([-*+]|\d+\.)(\s+|$)")
+            if lines and all(_list_ln.match(ln) for ln in lines):
                 for ln in lines:
-                    item = re.sub(r"^\s*([-*+]|\d+\.)\s+", "", ln.strip())
+                    item = re.sub(r"^\s*([-*+]|\d+\.)\s*", "", ln).strip()
                     ph, maths = _extract_math_placeholders(item)
                     runs = _split_media_runs(ph, maths, text_kind="list_item")
                     if runs:
@@ -4155,8 +4268,10 @@ def _parse_note_to_elements_basic(source: str, cell_id: str) -> list[dict]:
                             emit(k, h, c)
                     else:
                         # Inline math stays in the bullet (placeholders are alnum-safe)
+                        # Empty bullets still emit a visible list item placeholder
+                        body = ph if ph else "\u00a0"
                         inner = _restore_math_in_html(
-                            f"<p>{html_module.escape(ph)}</p>", maths
+                            f"<p>{html_module.escape(body)}</p>", maths
                         )
                         emit("list_item", _wrap_list_item_html(inner), item)
                 continue
@@ -9290,9 +9405,11 @@ async def sslive(
     _SESSION["echo_to_dialog"] = echo_to_dialog
     _SESSION["theme"] = deck.theme or theme_dict_for("dark")
 
-    # Quiet rewrite if we scrubbed a huge bg blob or migrated note layout ids
-    if _SESSION.pop("_layout_scrubbed_bg_blob", False) or _SESSION.pop(
-        "_layout_ids_migrated", 0
+    # Quiet rewrite if layout note was scrubbed / ids migrated / new pieces placed
+    if (
+        _SESSION.pop("_layout_scrubbed_bg_blob", False)
+        or _SESSION.pop("_layout_ids_migrated", 0)
+        or _SESSION.pop("_layout_auto_placed", 0)
     ):
         try:
             await flush_layout_save(quiet=True, force=True)

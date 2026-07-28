@@ -178,6 +178,11 @@ Legacy `el-{index}-{cell_id}` keys are migrated on load (positional match).
 A single-bullet text edit gets a new hash; layout is remapped by order among
 unmatched pieces when possible.
 
+**New content on freeform slides:** after any piece is absolutely positioned,
+new bullets (no layout yet) are auto-stacked **below** the lowest freeform box
+on open. Otherwise they stay in document flow at y≈0 and are covered by
+absolute siblings (looked like “bullet missing”).
+
 ---
 
 ## Code UI (live vs export)
