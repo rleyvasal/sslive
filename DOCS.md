@@ -146,14 +146,19 @@ Theme + background persist in the layout note under `layout.deck`:
   "elements": { "…": {} },
   "deck": {
     "theme": "dark",
-    "background": { "color": "#1a1a2e", "image": "data:image/…" }
+    "background": { "color": "#1a1a2e", "image": "bg.jpg" }
   }
 }
 ```
 
 - Default open (`theme=None`) restores `layout.deck` (dark if unset).
 - `await sslive(theme="light")` forces light for that open and writes it into the layout.
-- Custom background overrides the theme palette background; **Clear** returns to theme bg.
+- **Background image is a path** (notebook / SolveIt data dir), not a base64 blob.
+  Host resolves the file, downsizes (max edge 1920, JPEG ~q82), and inlines into
+  the presenter / export only. Gear: type filename + **Apply** (no local OS picker).
+- Huge `data:` backgrounds already saved into the layout note are **scrubbed** on open.
+- Note images `![](photo.jpg)` work the same way: path stays in markdown; host
+  inlines a downsized data URL into the slide HTML so srcdoc can show them.
 - Logo and per-slide backgrounds are deferred.  
 While fullscreen: dialog write may be deferred until FS ends (avoids iframe remount).
 

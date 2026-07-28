@@ -587,7 +587,20 @@ async def build_deck(
     if notebook_path is None and curr_dialog is not None:
         dinfo = await curr_dialog()
         if isinstance(dinfo, dict) and dinfo.get("name"):
-            notebook_path = Path(dinfo["name"]).name + ".ipynb"
+            # Prefer full path when dialoghelper provides it (SolveIt data dir)
+            name = dinfo.get("name")
+            path_hint = dinfo.get("path") or dinfo.get("filepath") or dinfo.get("file")
+            if path_hint:
+                notebook_path = Path(str(path_hint))
+            else:
+                notebook_path = Path(str(name)).name + ".ipynb"
+                if not str(notebook_path).endswith((".ipynb", ".json")):
+                    notebook_path = Path(str(name)).name + ".ipynb"
+    if notebook_path is not None:
+        try:
+            _SESSION["notebook_path"] = str(notebook_path)
+        except Exception:
+            pass
     nb_cells, nb_attachments = {}, {}
     if notebook_path and Path(notebook_path).exists():
         nb_cells, nb_attachments = get_slides_cells_from_notebook(notebook_path, dialog_cells)
@@ -666,6 +679,14 @@ async def build_deck(
     except Exception as e:
         print(f"sslive: layout load failed ({e}) — starting with empty overlay")
         deck.layout = _empty_layout()
+
+    # Drop multi-MB data-URL backgrounds accidentally saved into the layout note
+    try:
+        if _scrub_layout_bg_blobs(deck.layout):
+            _SESSION["_layout_dirty"] = True
+            _SESSION["_layout_scrubbed_bg_blob"] = True
+    except Exception:
+        pass
 
     # Restore deck theme / background from layout note (dark default)
     try:
@@ -2875,7 +2896,11 @@ def deck_theme_name(layout: dict | None) -> str:
 
 
 def deck_background_spec(layout: dict | None) -> dict | None:
-    """Deck-wide background override: ``{color}`` and/or ``{image}``, or None."""
+    """Deck-wide background override: ``{color}`` and/or ``{image}``, or None.
+
+    ``image`` is a **path/URL reference** (preferred) or a small data URL.
+    Large base64 blobs are stripped on load — resolve paths at render time.
+    """
     bg = deck_meta(layout).get("background")
     if not isinstance(bg, dict):
         return None
@@ -2885,8 +2910,271 @@ def deck_background_spec(layout: dict | None) -> dict | None:
     if isinstance(color, str) and _COLOR_SAFE_RE.match(color.strip()):
         out["color"] = color.strip()
     if isinstance(image, str) and image.strip():
-        out["image"] = image.strip()
+        s = image.strip()
+        # Drop bloated data URLs from the structural layout note
+        if s.startswith("data:"):
+            if len(s) <= _MAX_STORED_DATA_URL:
+                out["image"] = s
+        else:
+            out["image"] = s
     return out or None
+
+
+# Max data-URL chars allowed **in the layout note** (tiny only). Paths preferred.
+_MAX_STORED_DATA_URL = 8_000
+# Max edge (px) when inlining images into the presenter / export HTML.
+_IMG_MAX_EDGE = 1920
+_IMG_JPEG_QUALITY = 82
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"}
+
+
+def _sanitize_image_path_ref(ref: str) -> str | None:
+    """Normalize a user path ref; reject traversal and schemes."""
+    s = (ref or "").strip().replace("\\", "/")
+    if not s or s.startswith("data:") or "://" in s:
+        return None
+    # Drop optional markdown title: path "title"
+    if s[0] in "\"'":
+        return None
+    if " " in s and not Path(s).exists():
+        s = s.split()[0].strip("\"'")
+    parts = Path(s).parts
+    if ".." in parts:
+        return None
+    return s
+
+
+def _image_search_roots() -> list[Path]:
+    """Directories to search for relative image paths (SolveIt host FS)."""
+    roots: list[Path] = []
+    seen: set[str] = set()
+
+    def add(p: Path | str | None) -> None:
+        if p is None:
+            return
+        try:
+            pp = Path(p).expanduser().resolve()
+        except Exception:
+            try:
+                pp = Path(p).expanduser()
+            except Exception:
+                return
+        if not pp.exists():
+            return
+        if pp.is_file():
+            pp = pp.parent
+        key = str(pp)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(pp)
+
+    add(Path.cwd())
+    nb = _SESSION.get("notebook_path")
+    if nb:
+        add(nb)
+    # Common SolveIt / gpudev data roots
+    for d in (
+        "/app/data",
+        "/app/data/gpudevd",
+        "/app/data/gpudevd/sslive",
+        os.environ.get("SSLIVE_ASSET_DIR"),
+        os.environ.get("SOLVEIT_DATA"),
+    ):
+        add(d)
+    return roots
+
+
+def _resolve_image_path(ref: str) -> Path | None:
+    """Resolve a path/filename to an existing image file on the host."""
+    s = _sanitize_image_path_ref(ref)
+    if s is None:
+        # absolute path that exists (sanitize may reject? allow absolute if safe)
+        raw = (ref or "").strip().replace("\\", "/")
+        if raw.startswith("/") and ".." not in Path(raw).parts:
+            p = Path(raw)
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXTS | {""}:
+                return p
+            if p.is_file():
+                return p
+        return None
+    p = Path(s)
+    if p.is_file():
+        return p
+    if p.is_absolute():
+        return p if p.is_file() else None
+    for root in _image_search_roots():
+        cand = root / s
+        try:
+            if cand.is_file():
+                return cand
+            # basename-only search one level deep
+            base = Path(s).name
+            if base and base != s:
+                cand2 = root / base
+                if cand2.is_file():
+                    return cand2
+        except Exception:
+            continue
+    # basename walk of roots (shallow) — helps "Downloads/foo.jpg" style names
+    base = Path(s).name
+    if base:
+        for root in _image_search_roots():
+            try:
+                direct = root / base
+                if direct.is_file():
+                    return direct
+            except Exception:
+                continue
+    return None
+
+
+def _mime_for_path(path: Path) -> str:
+    ext = path.suffix.lower()
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+        ".svg": "image/svg+xml",
+    }.get(ext, "application/octet-stream")
+
+
+def _downsize_image_bytes(
+    raw: bytes,
+    *,
+    max_edge: int = _IMG_MAX_EDGE,
+    quality: int = _IMG_JPEG_QUALITY,
+    src_mime: str | None = None,
+) -> tuple[bytes, str]:
+    """Resize/compress image bytes for slide embed. Falls back to original."""
+    if not raw:
+        return raw, src_mime or "application/octet-stream"
+    # SVG: leave as-is (vector)
+    if (src_mime or "").startswith("image/svg") or raw[:200].lstrip().startswith(
+        (b"<svg", b"<?xml")
+    ):
+        return raw, "image/svg+xml"
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        im = Image.open(BytesIO(raw))
+        im.load()
+        w, h = im.size
+        if max(w, h) > max_edge > 0:
+            scale = max_edge / float(max(w, h))
+            nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+            im = im.resize((nw, nh), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        has_alpha = im.mode in ("RGBA", "LA") or (
+            im.mode == "P" and "transparency" in getattr(im, "info", {})
+        )
+        if has_alpha:
+            if im.mode != "RGBA":
+                im = im.convert("RGBA")
+            im.save(buf, format="PNG", optimize=True)
+            return buf.getvalue(), "image/png"
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        im.save(buf, format="JPEG", quality=int(quality), optimize=True)
+        return buf.getvalue(), "image/jpeg"
+    except Exception as e:
+        try:
+            _SESSION["_img_downsize_err"] = str(e)
+        except Exception:
+            pass
+        return raw, src_mime or "image/jpeg"
+
+
+def _bytes_to_data_url(data: bytes, mime: str) -> str:
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def _media_ref_to_data_url(
+    ref: str,
+    *,
+    max_edge: int = _IMG_MAX_EDGE,
+    quality: int = _IMG_JPEG_QUALITY,
+) -> str | None:
+    """Turn a path / http(s) / data URL into an embeddable data URL (or None).
+
+    Local files are read from the SolveIt host FS and downsized for slides.
+    """
+    s = (ref or "").strip()
+    if not s:
+        return None
+    if s.startswith("data:image/"):
+        # Already embedded — leave as-is (caller should not store large ones)
+        return s
+    if s.startswith(("https://", "http://")):
+        return s  # browser can fetch; no host proxy in v1
+    path = _resolve_image_path(s)
+    if path is None:
+        try:
+            _SESSION["_img_missing"] = s
+        except Exception:
+            pass
+        return None
+    try:
+        raw = path.read_bytes()
+    except Exception as e:
+        try:
+            _SESSION["_img_read_err"] = f"{path}: {e}"
+        except Exception:
+            pass
+        return None
+    mime = _mime_for_path(path)
+    if mime == "image/svg+xml":
+        return _bytes_to_data_url(raw, mime)
+    # Skip downsize for already-small files
+    if len(raw) <= 120_000 and max(path.stat().st_size, 0) <= 120_000:
+        # still may be huge dimensions; try quick open for edge check
+        try:
+            from io import BytesIO
+
+            from PIL import Image
+
+            im = Image.open(BytesIO(raw))
+            if max(im.size) <= max_edge:
+                return _bytes_to_data_url(raw, mime)
+        except Exception:
+            return _bytes_to_data_url(raw, mime)
+    data, out_mime = _downsize_image_bytes(
+        raw, max_edge=max_edge, quality=quality, src_mime=mime
+    )
+    return _bytes_to_data_url(data, out_mime)
+
+
+def _scrub_layout_bg_blobs(layout: dict) -> bool:
+    """Remove huge data-URL backgrounds from layout (return True if changed)."""
+    if not isinstance(layout, dict):
+        return False
+    meta = deck_meta(layout)
+    bg = meta.get("background")
+    if not isinstance(bg, dict):
+        return False
+    img = bg.get("image")
+    if not (
+        isinstance(img, str)
+        and img.startswith("data:")
+        and len(img) > _MAX_STORED_DATA_URL
+    ):
+        return False
+    new_bg: dict[str, str] = {}
+    color = bg.get("color")
+    if isinstance(color, str) and _COLOR_SAFE_RE.match(color.strip()):
+        new_bg["color"] = color.strip()
+    if new_bg:
+        meta["background"] = new_bg
+    else:
+        meta.pop("background", None)
+    layout["deck"] = meta
+    return True
 
 
 def apply_deck_appearance(
@@ -2898,6 +3186,8 @@ def apply_deck_appearance(
     """Update ``deck.layout['deck']`` and ``deck.theme`` palette.
 
     ``background=None`` clears a custom deck background.
+    Background ``image`` should be a **host path** or http(s) URL — not a
+    multi-MB data URL (those bloat the layout note).
     """
     if deck.layout is None or not isinstance(deck.layout, dict):
         deck.layout = _empty_layout()
@@ -2915,13 +3205,25 @@ def apply_deck_appearance(
                 cleaned["color"] = c.strip()
             if isinstance(img, str) and img.strip():
                 s = img.strip()
-                if s.startswith("data:") and len(s) > 1_500_000:
-                    raise ValueError("background image too large (max ~1MB data URL)")
-                # Allow data: URLs and http(s) only (no javascript:)
-                if s.startswith("data:image/") or s.startswith(
-                    ("https://", "http://")
-                ):
+                if s.startswith("data:image/"):
+                    # Refuse to persist large blobs; tiny ones OK
+                    if len(s) <= _MAX_STORED_DATA_URL:
+                        cleaned["image"] = s
+                    else:
+                        try:
+                            _SESSION["_bg_data_url_rejected"] = len(s)
+                        except Exception:
+                            pass
+                elif s.startswith(("https://", "http://")):
                     cleaned["image"] = s
+                else:
+                    path_ref = _sanitize_image_path_ref(s)
+                    if path_ref:
+                        # Prefer storing the basename if file resolves
+                        found = _resolve_image_path(path_ref)
+                        cleaned["image"] = (
+                            found.name if found is not None else path_ref
+                        )
             if cleaned:
                 meta["background"] = cleaned
             else:
@@ -2944,8 +3246,23 @@ def _css_theme_vars(theme: dict | None) -> str:
     )
 
 
+def _resolve_bg_image_css_url(image_ref: str | None) -> str | None:
+    """CSS-safe url(...) argument for a background image ref (or None)."""
+    if not image_ref:
+        return None
+    s = image_ref.strip()
+    if s.startswith("data:image/") or s.startswith(("https://", "http://")):
+        return json.dumps(s)
+    data_url = _media_ref_to_data_url(s, max_edge=_IMG_MAX_EDGE)
+    return json.dumps(data_url) if data_url else None
+
+
 def _deck_custom_bg_css(layout: dict | None) -> str:
-    """Extra body background CSS for a custom deck color/image (or empty)."""
+    """Extra body background CSS for a custom deck color/image (or empty).
+
+    Local image paths are resolved on the host and inlined (downsized) so the
+    srcdoc iframe does not need notebook-relative URLs.
+    """
     bg = deck_background_spec(layout)
     if not bg:
         return ""
@@ -2953,15 +3270,37 @@ def _deck_custom_bg_css(layout: dict | None) -> str:
     if bg.get("color"):
         parts.append(f"background-color:{bg['color']} !important;")
     if bg.get("image"):
-        # JSON-encode so quotes/parens in data URLs are CSS-safe
-        url = json.dumps(bg["image"])
-        parts.append(
-            f"background-image:url({url}) !important;"
-            "background-size:cover !important;"
-            "background-position:center !important;"
-            "background-repeat:no-repeat !important;"
-        )
+        url = _resolve_bg_image_css_url(bg["image"])
+        if url:
+            parts.append(
+                f"background-image:url({url}) !important;"
+                "background-size:cover !important;"
+                "background-position:center !important;"
+                "background-repeat:no-repeat !important;"
+            )
     return "".join(parts)
+
+
+def _deck_bg_for_js(layout: dict | None) -> dict | None:
+    """Gear/JS state: color + path for editing, resolved ``image`` for CSS."""
+    bg = deck_background_spec(layout)
+    if not bg:
+        return None
+    out: dict[str, str] = {}
+    if bg.get("color"):
+        out["color"] = bg["color"]
+    img = bg.get("image")
+    if img:
+        out["path"] = img if not img.startswith("data:") else ""
+        if img.startswith("data:image/") or img.startswith(("https://", "http://")):
+            out["image"] = img
+        else:
+            data_url = _media_ref_to_data_url(img, max_edge=_IMG_MAX_EDGE)
+            if data_url:
+                out["image"] = data_url
+            # keep path even if missing so gear shows what was requested
+            out["path"] = img
+    return out or None
 
 
 _SESSION: dict[str, Any] = {
@@ -3141,6 +3480,34 @@ def _resolve_note_attachments(content: str, nb_attachments: dict | None) -> str:
     return _ATTACH_RE.sub(repl, content)
 
 
+def _resolve_local_md_images(content: str) -> str:
+    """Rewrite relative/local ``![](file.jpg)`` to host-resolved data URLs.
+
+    SolveIt note previews resolve notebook-dir paths; the slide iframe (srcdoc)
+    cannot. Inlining a downsized data URL makes images appear on slides and in
+    standalone export without bloating the markdown source (rewrite is runtime
+    only — cell source stays as the short path).
+    """
+    if not content or "![" not in content:
+        return content
+
+    def repl(m: "re.Match[str]") -> str:
+        alt, src = m.group(1), (m.group(2) or "").strip()
+        if not src:
+            return m.group(0)
+        # Optional markdown title: url "title"
+        if src[0] not in "<" and " " in src:
+            src = src.split()[0].strip("\"'")
+        if src.startswith(("data:", "http://", "https://", "attachment:")):
+            return m.group(0)
+        data_url = _media_ref_to_data_url(src, max_edge=_IMG_MAX_EDGE)
+        if not data_url:
+            return m.group(0)
+        return f"![{alt}]({data_url})"
+
+    return _MD_IMG_RE.sub(repl, content)
+
+
 def _note_to_html_md(content: str) -> str:
     """Full note render: mistletoe markdown + latex2mathml (sslides pipeline)."""
     content, math_blocks = _extract_math_placeholders(content or "")
@@ -3189,16 +3556,50 @@ def _note_to_html_basic(source: str) -> str:
     return h
 
 
+def _rewrite_img_srcs_for_slides(html: str) -> str:
+    """Resolve relative ``src`` on ``<img>`` tags to host data URLs for srcdoc."""
+
+    def repl(m: "re.Match[str]") -> str:
+        prefix, src, suffix = m.group(1), m.group(2), m.group(3)
+        src_u = html_module.unescape(src).strip()
+        if not src_u or src_u.startswith(
+            ("data:", "http://", "https://", "blob:", "//")
+        ):
+            return m.group(0)
+        data_url = _media_ref_to_data_url(src_u, max_edge=_IMG_MAX_EDGE)
+        if not data_url:
+            return m.group(0)
+        return prefix + html_module.escape(data_url, quote=True) + suffix
+
+    return re.sub(
+        r"""(?is)(<img\b[^>]*?\bsrc\s*=\s*["'])([^"']+)(["'])""",
+        repl,
+        html or "",
+    )
+
+
 def _image_payload_to_html(payload: str) -> str:
+    """Markdown/HTML image fragment → figure HTML with host-resolved ``src``."""
     payload = (payload or "").strip()
     if payload.lower().startswith("<img"):
-        return f'<figure class="note-image">{payload}</figure>'
-    m = _MD_IMG_RE.match(payload)
-    if m:
-        alt, src = m.group(1), m.group(2)
         return (
             f'<figure class="note-image">'
-            f'<img src="{html_module.escape(src, quote=True)}" '
+            f"{_rewrite_img_srcs_for_slides(payload)}"
+            f"</figure>"
+        )
+    m = _MD_IMG_RE.match(payload)
+    if m:
+        alt, src = m.group(1), (m.group(2) or "").strip()
+        if src and " " in src and not src.startswith("data:"):
+            src = src.split()[0].strip("\"'")
+        resolved = src
+        if src and not src.startswith(
+            ("data:", "http://", "https://", "attachment:")
+        ):
+            resolved = _media_ref_to_data_url(src, max_edge=_IMG_MAX_EDGE) or src
+        return (
+            f'<figure class="note-image">'
+            f'<img src="{html_module.escape(resolved, quote=True)}" '
             f'alt="{html_module.escape(alt, quote=True)}" draggable="false"/>'
             f"</figure>"
         )
@@ -3699,11 +4100,11 @@ def generate_presenter_html(
     """
     theme = deck.theme or THEME_DARK
     theme_name = resolve_theme_name(theme.get("name") or deck_theme_name(deck.layout))
-    bg_spec = deck_background_spec(deck.layout)
     css_vars = _css_theme_vars(theme)
     custom_bg_css = _deck_custom_bg_css(deck.layout)
     theme_name_js = json.dumps(theme_name)
-    deck_bg_js = json.dumps(bg_spec)
+    # path for gear field + resolved data URL for live CSS (not stored in note)
+    deck_bg_js = json.dumps(_deck_bg_for_js(deck.layout))
     n_slides = len(deck.slides)
     initial_slide = max(0, min(int(initial_slide), max(0, n_slides - 1)))
     slides_html = "\n".join(
@@ -3912,6 +4313,10 @@ def generate_presenter_html(
     #gear-pop .gear-color {{
       width:36px; height:28px; padding:0; border:1px solid #4b5563; border-radius:6px;
       background:#1f2937; cursor:pointer; }}
+    #gear-pop .gear-path {{
+      flex:1 1 140px; min-width:120px; background:#0f172a; border:1px solid #4b5563;
+      color:#e5e7eb; border-radius:6px; padding:5px 8px; font:12px/1.3 ui-monospace,Menlo,monospace; }}
+    #gear-pop .gear-path:focus {{ border-color:#60a5fa; outline:none; }}
     #gear-pop .gear-hint {{ font-size:11px; color:#9ca3af; margin:0 0 4px; }}
     body.editing .note-block, body.editing [data-type="output"] {{
       outline:1px dashed rgba(96,165,250,0.5); outline-offset:2px; cursor:move; }}
@@ -4026,7 +4431,8 @@ def generate_presenter_html(
       light: {{ bg:'#f8fafc', fg:'#0f172a', muted:'#64748b', code_bg:'#e2e8f0' }}
     }};
     let deckTheme = {theme_name_js};
-    let deckBg = {deck_bg_js};  // null | {{color?, image?}}
+    // color, path (host filename), image (resolved data URL for CSS only)
+    let deckBg = {deck_bg_js};
     const slides = () => document.querySelectorAll('[data-slide]');
 
     function applyAppearance() {{
@@ -4046,8 +4452,11 @@ def generate_presenter_html(
       }} else {{
         b.style.removeProperty('background-color');
       }}
-      if (deckBg && deckBg.image) {{
-        b.style.setProperty('background-image', 'url(' + JSON.stringify(deckBg.image) + ')', 'important');
+      // Prefer resolved data URL (host); never treat bare path as CSS url in srcdoc
+      const imgUrl = deckBg && deckBg.image && String(deckBg.image).match(/^(data:|https?:)/)
+        ? deckBg.image : null;
+      if (imgUrl) {{
+        b.style.setProperty('background-image', 'url(' + JSON.stringify(imgUrl) + ')', 'important');
         b.style.setProperty('background-size', 'cover', 'important');
         b.style.setProperty('background-position', 'center', 'important');
         b.style.setProperty('background-repeat', 'no-repeat', 'important');
@@ -4068,15 +4477,22 @@ def generate_presenter_html(
       }} else if (col) {{
         try {{ col.value = t.bg; }} catch (e) {{}}
       }}
+      const pathIn = document.getElementById('gear-bg-path');
+      if (pathIn) {{
+        const p = (deckBg && deckBg.path) ? String(deckBg.path) : '';
+        if (pathIn !== document.activeElement) pathIn.value = p;
+      }}
       const hint = document.getElementById('gear-bg-hint');
       if (hint) {{
-        if (deckBg && (deckBg.image || deckBg.color)) {{
+        if (deckBg && (deckBg.image || deckBg.color || deckBg.path)) {{
           const bits = [];
           if (deckBg.color) bits.push(deckBg.color);
-          if (deckBg.image) bits.push(deckBg.image.startsWith('data:') ? 'custom image' : 'image');
-          hint.textContent = 'Custom: ' + bits.join(' · ');
+          if (deckBg.path) bits.push(deckBg.path);
+          else if (deckBg.image && String(deckBg.image).startsWith('data:')) bits.push('image (embedded)');
+          else if (deckBg.image) bits.push(String(deckBg.image).slice(0, 40));
+          hint.textContent = bits.length ? ('Custom: ' + bits.join(' · ')) : 'Using theme background';
         }} else {{
-          hint.textContent = 'Using theme background';
+          hint.textContent = 'Path is relative to the notebook / SolveIt data dir';
         }}
       }}
     }}
@@ -4099,11 +4515,55 @@ def generate_presenter_html(
       applyAppearance();
       postDeckPatch({{ theme: deckTheme }});
     }}
-    function setDeckBackground(spec) {{
-      // spec null clears; otherwise {{color?, image?}}
-      deckBg = spec;
+    function persistBackgroundFromGear() {{
+      // Persist path (not data URL) + optional color. Host resolves path on rebuild.
+      const pathIn = document.getElementById('gear-bg-path');
+      const col = document.getElementById('gear-bg-color');
+      const path = ((pathIn && pathIn.value) || '').trim();
+      const color = (col && col.value) ? col.value.trim() : '';
+      if (!path && !color) {{
+        deckBg = null;
+        applyAppearance();
+        postDeckPatch({{ background: null }});
+        return;
+      }}
+      const next = {{}};
+      if (color) next.color = color;
+      if (path) next.image = path;  // host path / filename only
+      // Keep previous resolved image until host rebuilds (color-only still live)
+      if (path && deckBg && deckBg.path === path && deckBg.image) {{
+        next.image = path;
+        deckBg = Object.assign({{}}, deckBg, {{ path: path, color: color || deckBg.color }});
+      }} else if (path) {{
+        deckBg = Object.assign({{}}, deckBg || {{}}, {{ path: path, color: color || (deckBg && deckBg.color) || undefined }});
+        // clear stale resolved URL so we don't show wrong image while waiting
+        if (deckBg.path !== path) delete deckBg.image;
+        deckBg.path = path;
+        if (color) deckBg.color = color;
+      }} else {{
+        deckBg = {{ color: color }};
+      }}
       applyAppearance();
-      postDeckPatch({{ background: deckBg }});
+      postDeckPatch({{ background: next }});
+    }}
+    function setDeckBackground(spec) {{
+      // spec null clears; otherwise {{color?, image?}} where image is host path
+      if (spec == null) {{
+        deckBg = null;
+        applyAppearance();
+        postDeckPatch({{ background: null }});
+        return;
+      }}
+      const next = {{}};
+      if (spec.color) next.color = spec.color;
+      if (spec.image && !String(spec.image).startsWith('data:')) next.image = spec.image;
+      deckBg = Object.assign({{}}, deckBg || {{}}, {{
+        color: spec.color || undefined,
+        path: (spec.image && !String(spec.image).startsWith('data:')) ? spec.image : (deckBg && deckBg.path) || '',
+        image: (spec.image && String(spec.image).match(/^(data:|https?:)/)) ? spec.image : (deckBg && deckBg.image)
+      }});
+      applyAppearance();
+      postDeckPatch({{ background: Object.keys(next).length ? next : null }});
     }}
 
     function slideEls(slideEl) {{
@@ -5612,44 +6072,37 @@ def generate_presenter_html(
       document.getElementById('gear-theme-light')?.addEventListener('click', (e) => {{
         e.preventDefault(); e.stopPropagation(); setDeckTheme('light');
       }});
-      // Background color
+      // Background color (live) — persist path+color together
       const col = document.getElementById('gear-bg-color');
       col?.addEventListener('input', (e) => {{
         e.stopPropagation();
         const v = (col.value || '').trim();
         if (!v) return;
-        const next = Object.assign({{}}, deckBg || {{}}, {{ color: v }});
-        setDeckBackground(next);
+        deckBg = Object.assign({{}}, deckBg || {{}}, {{ color: v }});
+        applyAppearance();
+      }});
+      col?.addEventListener('change', (e) => {{
+        e.stopPropagation();
+        persistBackgroundFromGear();
       }});
       col?.addEventListener('pointerdown', (e) => e.stopPropagation());
-      // Background image (file → data URL)
-      const file = document.getElementById('gear-bg-file');
-      document.getElementById('gear-bg-image')?.addEventListener('click', (e) => {{
-        e.preventDefault(); e.stopPropagation(); file?.click();
-      }});
-      file?.addEventListener('change', () => {{
-        const f = file.files && file.files[0];
-        if (!f) return;
-        if (f.size > 1_200_000) {{
-          alert('Background image too large (max ~1MB).');
-          file.value = '';
-          return;
+      // Background image: host path (notebook / SolveIt dir) — not local OS file picker
+      const pathIn = document.getElementById('gear-bg-path');
+      pathIn?.addEventListener('pointerdown', (e) => e.stopPropagation());
+      pathIn?.addEventListener('keydown', (e) => {{
+        e.stopPropagation();
+        if (e.key === 'Enter') {{
+          e.preventDefault();
+          persistBackgroundFromGear();
         }}
-        const reader = new FileReader();
-        reader.onload = () => {{
-          const dataUrl = String(reader.result || '');
-          if (!dataUrl.startsWith('data:image/')) {{
-            alert('Please choose an image file.');
-            return;
-          }}
-          const next = Object.assign({{}}, deckBg || {{}}, {{ image: dataUrl }});
-          setDeckBackground(next);
-        }};
-        reader.readAsDataURL(f);
-        file.value = '';
+      }});
+      document.getElementById('gear-bg-apply')?.addEventListener('click', (e) => {{
+        e.preventDefault(); e.stopPropagation();
+        persistBackgroundFromGear();
       }});
       document.getElementById('gear-bg-clear')?.addEventListener('click', (e) => {{
         e.preventDefault(); e.stopPropagation();
+        if (pathIn) pathIn.value = '';
         setDeckBackground(null);
       }});
       applyAppearance();
@@ -6013,11 +6466,11 @@ def generate_presenter_html(
       <button type="button" class="gear-btn" id="gear-theme-light">Light</button>
     </div>
     <h4>Background</h4>
-    <p class="gear-hint" id="gear-bg-hint">Using theme background</p>
+    <p class="gear-hint" id="gear-bg-hint">Path is relative to the notebook / SolveIt data dir</p>
     <div class="gear-row">
       <label title="Background color"><input type="color" class="gear-color" id="gear-bg-color" value="#111827" /></label>
-      <button type="button" class="gear-btn" id="gear-bg-image">Image…</button>
-      <input type="file" id="gear-bg-file" accept="image/*" hidden />
+      <input type="text" class="gear-path" id="gear-bg-path" placeholder="bg.jpg" spellcheck="false" />
+      <button type="button" class="gear-btn" id="gear-bg-apply" title="Save path (host resolves file)">Apply</button>
       <button type="button" class="gear-btn" id="gear-bg-clear">Clear</button>
     </div>
     <h4>Status</h4>
@@ -7978,6 +8431,10 @@ def _apply_deck_meta_patches(items: list[dict]) -> int:
         if "background" in patch:
             # Explicit null clears custom background
             kw["background"] = patch.get("background")
+            # Path / clear needs presenter rebuild so host can inline the image
+            bg = patch.get("background")
+            if bg is None or (isinstance(bg, dict) and "image" in bg):
+                _SESSION["_deck_need_refresh"] = True
         if not kw:
             continue
         try:
@@ -8081,6 +8538,12 @@ async def _bridge_poll_loop() -> None:
                         )
                     except Exception as e:
                         _SESSION["_note_flush_err"] = str(e)
+                # Gear background path → rebuild so host inlines the image
+                if _SESSION.pop("_deck_need_refresh", False):
+                    try:
+                        refresh_presenter()
+                    except Exception as e:
+                        _SESSION["_deck_refresh_err"] = str(e)
             elif _SESSION.get("_layout_pending_fs_flush") or _SESSION.get(
                 "_layout_dirty"
             ):
@@ -8632,6 +9095,13 @@ async def sslive(
     _SESSION["executor"] = executor
     _SESSION["echo_to_dialog"] = echo_to_dialog
     _SESSION["theme"] = deck.theme or theme_dict_for("dark")
+
+    # Rewrite layout note if we stripped a multi-MB data-URL background
+    if _SESSION.pop("_layout_scrubbed_bg_blob", False):
+        try:
+            await flush_layout_save(quiet=True, force=True)
+        except Exception as e:
+            _SESSION["_layout_flush_err"] = str(e)
 
     port: int | None = None
     if use_http:
